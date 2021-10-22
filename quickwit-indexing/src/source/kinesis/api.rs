@@ -25,13 +25,13 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use rusoto_kinesis::{
     CreateStreamInput, DeleteStreamInput, DescribeStreamSummaryInput, GetRecordsInput,
-    GetRecordsOutput, GetShardIteratorInput, Kinesis, ListShardsInput, ListStreamsInput, Shard,
-    StreamDescriptionSummary,
+    GetRecordsOutput, GetShardIteratorInput, Kinesis, ListShardsInput, ListStreamsInput,
+    MergeShardsInput, Shard, SplitShardInput, StreamDescriptionSummary,
 };
 
 /// Creates a Kinesis data stream.
 /// https://docs.aws.amazon.com/kinesis/latest/APIReference/API_CreateStream.html
-async fn create_stream<K: Kinesis>(
+pub(crate) async fn create_stream<K: Kinesis>(
     kinesis_client: &K,
     stream_name: &str,
     num_shards: usize,
@@ -50,7 +50,10 @@ async fn create_stream<K: Kinesis>(
 
 /// Deletes a Kinesis data stream. Only streams in `ACTIVE` state can be deleted.
 /// https://docs.aws.amazon.com/kinesis/latest/APIReference/API_DeleteStream.html
-async fn delete_stream<K: Kinesis>(kinesis_client: &K, stream_name: &str) -> anyhow::Result<()> {
+pub(crate) async fn delete_stream<K: Kinesis>(
+    kinesis_client: &K,
+    stream_name: &str,
+) -> anyhow::Result<()> {
     let request = DeleteStreamInput {
         stream_name: stream_name.to_string(),
         ..Default::default()
@@ -79,7 +82,7 @@ async fn describe_stream<K: Kinesis>(
 
 /// Gets records from a Kinesis data stream's shard.
 /// https://docs.aws.amazon.com/kinesis/latest/APIReference/API_GetRecords.html
-async fn get_records<K: Kinesis>(
+pub(crate) async fn get_records<K: Kinesis>(
     kinesis_client: &K,
     shard_iterator: String,
 ) -> anyhow::Result<GetRecordsOutput> {
@@ -97,7 +100,7 @@ async fn get_records<K: Kinesis>(
 /// Gets a Kinesis shard iterator. A shard iterator expires 5 minutes after it is returned
 /// to the requester.
 /// https://docs.aws.amazon.com/kinesis/latest/APIReference/API_GetShardIterator.html
-async fn get_shard_iterator<K: Kinesis>(
+pub(crate) async fn get_shard_iterator<K: Kinesis>(
     kinesis_client: &K,
     stream_name: &str,
     shard_id: &str,
@@ -124,7 +127,7 @@ async fn get_shard_iterator<K: Kinesis>(
 /// Lists the shards in a stream and provides information about each shard. This operation has a
 /// limit of 1000 transactions per second per data stream.
 /// https://docs.aws.amazon.com/kinesis/latest/APIReference/API_ListShards.html
-async fn list_shards<K: Kinesis>(
+pub(crate) async fn list_shards<K: Kinesis>(
     kinesis_client: &K,
     stream_name: &str,
     limit_per_request: Option<usize>,
@@ -154,7 +157,7 @@ async fn list_shards<K: Kinesis>(
 
 /// Lists the Kinesis data streams.
 /// https://docs.aws.amazon.com/kinesis/latest/APIReference/API_ListStreams.html
-async fn list_streams<K: Kinesis>(
+pub(crate) async fn list_streams<K: Kinesis>(
     kinesis_client: &K,
     mut exclusive_start_stream_name: Option<String>,
     limit_per_request: Option<usize>,
@@ -176,9 +179,41 @@ async fn list_streams<K: Kinesis>(
     Ok(stream_names)
 }
 
+pub(crate) async fn merge_shards<K: Kinesis>(
+    kinesis_client: &K,
+    stream_name: &str,
+    shard_id: &str,
+    adjacent_shard_id: &str,
+) -> anyhow::Result<()> {
+    let request = MergeShardsInput {
+        stream_name: stream_name.to_string(),
+        shard_to_merge: shard_id.to_string(),
+        adjacent_shard_to_merge: adjacent_shard_id.to_string(),
+    };
+    // TODO: Implement retry.
+    kinesis_client.merge_shards(request).await?;
+    Ok(())
+}
+
+pub(crate) async fn split_shard<K: Kinesis>(
+    kinesis_client: &K,
+    stream_name: &str,
+    shard_id: &str,
+    starting_hash_key: &str,
+) -> anyhow::Result<()> {
+    let request = SplitShardInput {
+        stream_name: stream_name.to_string(),
+        shard_to_split: shard_id.to_string(),
+        new_starting_hash_key: starting_hash_key.to_string(),
+    };
+    // TODO: Implement retry.
+    kinesis_client.split_shard(request).await?;
+    Ok(())
+}
+
 /// Waits for a Kinesis data stream's status to satisfy the specified predicate. Returns an error
 /// after the specified `timeout` duration has passed.
-async fn wait_for_stream_status<K, P>(
+pub(crate) async fn wait_for_stream_status<K, P>(
     kinesis_client: &K,
     stream_name: &str,
     stream_status_predicate: P,
@@ -217,105 +252,14 @@ where
 
 #[cfg(all(test, feature = "kinesis-external-service"))]
 mod kinesis_localstack_tests {
-    use std::collections::HashMap;
-
     use quickwit_common::rand::append_random_suffix;
-    use rusoto_core::Region;
     use rusoto_kinesis::{KinesisClient, PutRecordsInput, PutRecordsRequestEntry};
 
     use super::*;
-
-    fn get_localstack_client() -> KinesisClient {
-        KinesisClient::new(Region::Custom {
-            name: "localstack".to_string(),
-            endpoint: "http://localhost:4566".to_string(),
-        })
-    }
-
-    fn make_shard_id(id: usize) -> String {
-        format!("shardId-{:0>12}", id)
-    }
-
-    fn parse_shard_id<S: AsRef<str>>(shard_id: S) -> Option<usize> {
-        shard_id
-            .as_ref()
-            .strip_prefix("shardId-")
-            .and_then(|shard_id| shard_id.parse::<usize>().ok())
-    }
-
-    async fn put_records_into_shards<'a, K, I>(
-        kinesis_client: &K,
-        stream_name: &str,
-        records: I,
-    ) -> anyhow::Result<HashMap<usize, Vec<String>>>
-    where
-        K: Kinesis,
-        I: IntoIterator<Item = (usize, &'a str)>,
-    {
-        let shard_hash_keys: HashMap<usize, String> =
-            list_shards(kinesis_client, &stream_name, None)
-                .await?
-                .into_iter()
-                .map(|shard| {
-                    (
-                        parse_shard_id(shard.shard_id).unwrap(),
-                        shard.hash_key_range.starting_hash_key,
-                    )
-                })
-                .collect();
-
-        let put_records_request_entries = records
-            .into_iter()
-            .map(|(shard_id, record)| PutRecordsRequestEntry {
-                explicit_hash_key: shard_hash_keys.get(&shard_id).cloned(),
-                partition_key: "Overridden by hash key".to_string(),
-                data: bytes::Bytes::from(record.to_string().into_bytes()),
-            })
-            .collect();
-
-        let request = PutRecordsInput {
-            stream_name: stream_name.to_string(),
-            records: put_records_request_entries,
-        };
-        let response = kinesis_client.put_records(request).await?;
-
-        let mut sequence_numbers = HashMap::new();
-        for record in response.records {
-            sequence_numbers
-                .entry(record.shard_id.and_then(parse_shard_id).unwrap())
-                .or_insert_with(Vec::new)
-                .push(record.sequence_number.unwrap());
-        }
-        Ok(sequence_numbers)
-    }
-
-    async fn setup<S: AsRef<str>>(
-        test_name: S,
-        num_shards: usize,
-    ) -> anyhow::Result<(KinesisClient, String)> {
-        let stream_name = append_random_suffix(test_name.as_ref());
-        let kinesis_client = get_localstack_client();
-        create_stream(&kinesis_client, &stream_name, num_shards).await?;
-        wait_for_active_stream(&kinesis_client, &stream_name).await?;
-        Ok((kinesis_client, stream_name))
-    }
-
-    async fn teardown<K: Kinesis>(kinesis_client: &K, stream_name: &str) {
-        let _delete_res = delete_stream(kinesis_client, stream_name).await;
-    }
-
-    async fn wait_for_active_stream<K: Kinesis>(
-        kinesis_client: &K,
-        stream_name: &str,
-    ) -> anyhow::Result<()> {
-        wait_for_stream_status(
-            kinesis_client,
-            stream_name,
-            |stream_status| stream_status == "ACTIVE",
-            Duration::from_secs(1),
-        )
-        .await
-    }
+    use crate::source::kinesis::helpers::tests::{
+        get_localstack_client, make_shard_id, put_records_into_shards, setup, teardown,
+        wait_for_active_stream,
+    };
 
     #[tokio::test]
     async fn test_create_stream() -> anyhow::Result<()> {
