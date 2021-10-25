@@ -82,6 +82,7 @@ impl<K: Kinesis + Send + Sync + 'static> ShardConsumer<K> {
         while let Some(shard_iterator) = shard_iterator_opt {
             interval.tick().await;
             let response = get_records(&self.kinesis_client, shard_iterator).await?;
+            println!("Response: {:?}", response);
 
             if !response.records.is_empty() {
                 let message = ShardConsumerMessage::Records {
@@ -89,21 +90,25 @@ impl<K: Kinesis + Send + Sync + 'static> ShardConsumer<K> {
                     records: response.records,
                     lag_millis: response.millis_behind_latest,
                 };
+                println!("Message: {:?}", message);
                 self.sink.send(message).await?;
             }
             if let Some(children) = response.child_shards {
                 let shard_ids = children.into_iter().map(|child| child.shard_id).collect();
                 let message = ShardConsumerMessage::ShardSplit(shard_ids);
+                println!("{:?}", message);
                 self.sink.send(message).await?;
             }
             if self.eof_enabled && response.millis_behind_latest.unwrap_or(-1) == 0 {
                 let message = ShardConsumerMessage::ShardEOF(self.shard_id.clone());
+                println!("{:?}", message);
                 self.sink.send(message).await?;
                 return Ok(());
             };
             shard_iterator_opt = response.next_shard_iterator;
         }
         let message = ShardConsumerMessage::ShardClosed(self.shard_id.clone());
+        println!("{:?}", message);
         self.sink.send(message).await?;
         Ok(())
     }
@@ -194,22 +199,28 @@ mod kinesis_localstack_tests {
         let (kinesis_client, stream_name) = setup("test-shard-closed", 2).await?;
         let shard_id_0 = make_shard_id(0);
         let shard_id_1 = make_shard_id(1);
+        merge_shards(&kinesis_client, &stream_name, &shard_id_0, &shard_id_1).await?;
         let (tx, mut rx) = mpsc::channel(10);
+        {
         let shard_consumer = ShardConsumer::new(
             stream_name.clone(),
-            shard_id_1.clone(),
+            shard_id_0.clone(),
             None,
             false,
             kinesis_client.clone(),
             tx.clone(),
         );
         let shard_consumer_handle = shard_consumer.spawn();
-        merge_shards(&kinesis_client, &stream_name, &shard_id_0, &shard_id_1).await?;
         let shard_consumer_message = rx.recv().await.unwrap();
         assert!(
-            matches!(shard_consumer_message, ShardConsumerMessage::ShardClosed(closed_shard_id) if closed_shard_id == shard_id_1)
+            matches!(shard_consumer_message, ShardConsumerMessage::ShardSplit(shard_ids) if shard_ids.len() == 1 && shard_ids[0] == make_shard_id(2))
+        );
+        let shard_consumer_message = rx.recv().await.unwrap();
+        assert!(
+            matches!(shard_consumer_message, ShardConsumerMessage::ShardClosed(closed_shard_id) if closed_shard_id == shard_id_0)
         );
         assert!(shard_consumer_handle.await.is_ok());
+        }
         teardown(&kinesis_client, &stream_name).await;
         Ok(())
     }
