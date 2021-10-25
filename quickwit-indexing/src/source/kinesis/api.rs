@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use rusoto_kinesis::{
-    CreateStreamInput, DeleteStreamInput, DescribeStreamSummaryInput, GetRecordsInput,
-    GetRecordsOutput, GetShardIteratorInput, Kinesis, ListShardsInput, ListStreamsInput,
-    MergeShardsInput, Shard, SplitShardInput, StreamDescriptionSummary,
+    CreateStreamInput, DeleteStreamInput, DescribeStreamInput, GetRecordsInput, GetRecordsOutput,
+    GetShardIteratorInput, Kinesis, ListShardsInput, ListStreamsInput, MergeShardsInput, Shard,
+    SplitShardInput, StreamDescription,
 };
 
 /// Creates a Kinesis data stream.
@@ -71,13 +71,14 @@ pub(crate) async fn delete_stream<K: Kinesis>(
 async fn describe_stream<K: Kinesis>(
     kinesis_client: &K,
     stream_name: &str,
-) -> anyhow::Result<StreamDescriptionSummary> {
-    let request = DescribeStreamSummaryInput {
+) -> anyhow::Result<StreamDescription> {
+    let request = DescribeStreamInput {
         stream_name: stream_name.to_string(),
+        ..Default::default()
     };
     // TODO: Implement retry.
-    let response = kinesis_client.describe_stream_summary(request).await?;
-    Ok(response.stream_description_summary)
+    let response = kinesis_client.describe_stream(request).await?;
+    Ok(response.stream_description)
 }
 
 /// Gets records from a Kinesis data stream's shard.
@@ -253,7 +254,6 @@ where
 #[cfg(all(test, feature = "kinesis-external-service"))]
 mod kinesis_localstack_tests {
     use quickwit_common::rand::append_random_suffix;
-    use rusoto_kinesis::{KinesisClient, PutRecordsInput, PutRecordsRequestEntry};
 
     use super::*;
     use crate::source::kinesis::helpers::tests::{
@@ -269,7 +269,7 @@ mod kinesis_localstack_tests {
         wait_for_active_stream(&kinesis_client, &stream_name).await?;
         let description_summary = describe_stream(&kinesis_client, &stream_name).await?;
         assert_eq!(description_summary.stream_name, stream_name);
-        assert_eq!(description_summary.open_shard_count, 1);
+        assert_eq!(description_summary.stream_status, "ACTIVE");
         teardown(&kinesis_client, &stream_name).await;
         Ok(())
     }

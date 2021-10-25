@@ -31,7 +31,11 @@ pub(crate) mod tests {
     };
 
     pub fn get_localstack_client() -> KinesisClient {
-        KinesisClient::new(Region::UsEast1)
+        // KinesisClient::new(Region::UsEast1)
+        KinesisClient::new(Region::Custom {
+            name: "localstack".to_string(),
+            endpoint: "http://localhost:4566".to_string(),
+        })
     }
 
     pub fn make_shard_id(id: usize) -> String {
@@ -96,8 +100,7 @@ pub(crate) mod tests {
         let stream_name = append_random_suffix(test_name.as_ref());
         let kinesis_client = get_localstack_client();
         create_stream(&kinesis_client, &stream_name, num_shards).await?;
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-        // wait_for_active_stream(&kinesis_client, &stream_name).await?;
+        wait_for_active_stream(&kinesis_client, &stream_name).await?;
         Ok((kinesis_client, stream_name))
     }
 
@@ -113,7 +116,7 @@ pub(crate) mod tests {
             kinesis_client,
             stream_name,
             |stream_status| stream_status == "ACTIVE",
-            Duration::from_secs(1),
+            Duration::from_secs(30),
         )
         .await
     }
