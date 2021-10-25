@@ -26,14 +26,14 @@ use crate::source::kinesis::api::{get_records, get_shard_iterator};
 
 #[derive(Debug)]
 enum ShardConsumerMessage {
-    ShardClosed(String),
-    ShardEOF(String),
+    NewShards(Vec<String>),
     Records {
         shard_id: String,
         records: Vec<Record>,
         lag_millis: Option<i64>,
     },
-    ShardSplit(Vec<String>),
+    ShardClosed(String),
+    ShardEOF(String),
 }
 
 struct ShardConsumer<K: Kinesis> {
@@ -94,10 +94,16 @@ impl<K: Kinesis + Send + Sync + 'static> ShardConsumer<K> {
                 self.sink.send(message).await?;
             }
             if let Some(children) = response.child_shards {
-                let shard_ids = children.into_iter().map(|child| child.shard_id).collect();
-                let message = ShardConsumerMessage::ShardSplit(shard_ids);
-                println!("{:?}", message);
-                self.sink.send(message).await?;
+                let shard_ids: Vec<String> = children
+                    .into_iter()
+                    .filter(|child| child.parent_shards.first() == Some(&self.shard_id))
+                    .map(|child| child.shard_id)
+                    .collect();
+                if !shard_ids.is_empty() {
+                    let message = ShardConsumerMessage::NewShards(shard_ids);
+                    println!("{:?}", message);
+                    self.sink.send(message).await?;
+                }
             }
             if self.eof_enabled && response.millis_behind_latest.unwrap_or(-1) == 0 {
                 let message = ShardConsumerMessage::ShardEOF(self.shard_id.clone());
@@ -124,6 +130,30 @@ mod kinesis_localstack_tests {
     };
 
     #[tokio::test]
+    async fn test_shard_eof() -> anyhow::Result<()> {
+        let (kinesis_client, stream_name) = setup("test-shard-eof", 1).await?;
+        let shard_id = make_shard_id(0);
+        let (tx, mut rx) = mpsc::channel(10);
+        let shard_consumer = ShardConsumer::new(
+            stream_name.clone(),
+            shard_id.clone(),
+            None,
+            true,
+            kinesis_client.clone(),
+            tx.clone(),
+        );
+        let shard_consumer_handle = shard_consumer.spawn();
+        let shard_consumer_message = rx.recv().await.unwrap();
+        assert!(matches!(
+            shard_consumer_message,
+            ShardConsumerMessage::ShardEOF(eof_shard_id) if eof_shard_id == shard_id
+        ));
+        assert!(shard_consumer_handle.await.is_ok());
+        teardown(&kinesis_client, &stream_name).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_start_at_horizon() -> anyhow::Result<()> {
         let (kinesis_client, stream_name) = setup("test-start-at-horizon", 1).await?;
         put_records_into_shards(
@@ -142,17 +172,17 @@ mod kinesis_localstack_tests {
             kinesis_client.clone(),
             tx.clone(),
         );
-        let handle = shard_consumer.spawn();
+        let shard_consumer_handle = shard_consumer.spawn();
         let message = rx.recv().await.unwrap();
         assert!(
-            matches!(message, ShardConsumerMessage::Records { shard_id, records, lag_millis } if records.len() == 2)
+            matches!(message, ShardConsumerMessage::Records { shard_id, records, lag_millis: _ } if records.len() == 2)
         );
         let message = rx.recv().await.unwrap();
         assert!(matches!(
             message,
-            ShardConsumerMessage::ShardEOF(eof_shard_id)
+            ShardConsumerMessage::ShardEOF(eof_shard_id) if eof_shard_id == shard_id
         ));
-        assert!(handle.await.is_ok());
+        assert!(shard_consumer_handle.await.is_ok());
         teardown(&kinesis_client, &stream_name).await;
         Ok(())
     }
@@ -187,7 +217,7 @@ mod kinesis_localstack_tests {
         let message = rx.recv().await.unwrap();
         assert!(matches!(
             message,
-            ShardConsumerMessage::ShardEOF(eof_shard_id)
+            ShardConsumerMessage::ShardEOF(eof_shard_id) if eof_shard_id == shard_id
         ));
         assert!(handle.await.is_ok());
         teardown(&kinesis_client, &stream_name).await;
@@ -195,69 +225,57 @@ mod kinesis_localstack_tests {
     }
 
     #[tokio::test]
-    async fn test_shard_closed() -> anyhow::Result<()> {
-        let (kinesis_client, stream_name) = setup("test-shard-closed", 2).await?;
+    async fn test_merge_shards() -> anyhow::Result<()> {
+        let (kinesis_client, stream_name) = setup("test-merge-shards", 2).await?;
         let shard_id_0 = make_shard_id(0);
         let shard_id_1 = make_shard_id(1);
         merge_shards(&kinesis_client, &stream_name, &shard_id_0, &shard_id_1).await?;
         let (tx, mut rx) = mpsc::channel(10);
         {
-        let shard_consumer = ShardConsumer::new(
-            stream_name.clone(),
-            shard_id_0.clone(),
-            None,
-            false,
-            kinesis_client.clone(),
-            tx.clone(),
-        );
-        let shard_consumer_handle = shard_consumer.spawn();
-        let shard_consumer_message = rx.recv().await.unwrap();
-        assert!(
-            matches!(shard_consumer_message, ShardConsumerMessage::ShardSplit(shard_ids) if shard_ids.len() == 1 && shard_ids[0] == make_shard_id(2))
-        );
-        let shard_consumer_message = rx.recv().await.unwrap();
-        assert!(
-            matches!(shard_consumer_message, ShardConsumerMessage::ShardClosed(closed_shard_id) if closed_shard_id == shard_id_0)
-        );
-        assert!(shard_consumer_handle.await.is_ok());
+            let shard_consumer = ShardConsumer::new(
+                stream_name.clone(),
+                shard_id_0.clone(),
+                None,
+                false,
+                kinesis_client.clone(),
+                tx.clone(),
+            );
+            let shard_consumer_handle = shard_consumer.spawn();
+            let shard_consumer_message = rx.recv().await.unwrap();
+            assert!(
+                matches!(shard_consumer_message, ShardConsumerMessage::NewShards(shard_ids) if shard_ids == vec![make_shard_id(2)])
+            );
+            let shard_consumer_message = rx.recv().await.unwrap();
+            assert!(
+                matches!(shard_consumer_message, ShardConsumerMessage::ShardClosed(shard_id) if shard_id == shard_id_1)
+            );
+            assert!(shard_consumer_handle.await.is_ok());
+        }
+        {
+            let shard_consumer = ShardConsumer::new(
+                stream_name.clone(),
+                shard_id_1.clone(),
+                None,
+                false,
+                kinesis_client.clone(),
+                tx.clone(),
+            );
+            let shard_consumer_handle = shard_consumer.spawn();
+            let shard_consumer_message = rx.recv().await.unwrap();
+            assert!(
+                matches!(shard_consumer_message, ShardConsumerMessage::ShardClosed(shard_id) if shard_id == shard_id_1)
+            );
+            assert!(shard_consumer_handle.await.is_ok());
         }
         teardown(&kinesis_client, &stream_name).await;
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_shard_eof() -> anyhow::Result<()> {
-        let (kinesis_client, stream_name) = setup("test-shard-eof", 1).await?;
+    async fn test_split_shard() -> anyhow::Result<()> {
+        let (kinesis_client, stream_name) = setup("test-split-shard", 1).await?;
         let shard_id = make_shard_id(0);
-        let (tx, mut rx) = mpsc::channel(10);
-        let shard_consumer = ShardConsumer::new(
-            stream_name.clone(),
-            shard_id.clone(),
-            None,
-            true,
-            kinesis_client.clone(),
-            tx.clone(),
-        );
-        let shard_consumer_handle = shard_consumer.spawn();
-        let shard_consumer_message = rx.recv().await.unwrap();
-        assert!(
-            matches!(shard_consumer_message, ShardConsumerMessage::ShardEOF(eof_shard_id) if eof_shard_id == shard_id)
-        );
-        assert!(shard_consumer_handle.await.is_ok());
-        teardown(&kinesis_client, &stream_name).await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_shard_split() -> anyhow::Result<()> {
-        let (kinesis_client, stream_name) = setup("test-shard-split", 1).await?;
-        let sequence_numbers = put_records_into_shards(
-            &kinesis_client,
-            &stream_name,
-            [(0, "Record #00"), (0, "Record #01")],
-        )
-        .await?;
-        let shard_id = make_shard_id(0);
+        split_shard(&kinesis_client, &stream_name, &shard_id, "42").await?;
         let (tx, mut rx) = mpsc::channel(10);
         let shard_consumer = ShardConsumer::new(
             stream_name.clone(),
@@ -268,26 +286,10 @@ mod kinesis_localstack_tests {
             tx.clone(),
         );
         let shard_consumer_handle = shard_consumer.spawn();
-        split_shard(
-            &kinesis_client,
-            &stream_name,
-            &shard_id,
-            "1111111111111111111111",
-        )
-        .await?;
         let shard_consumer_message = rx.recv().await.unwrap();
         assert!(matches!(
             shard_consumer_message,
-            ShardConsumerMessage::Records {
-                shard_id,
-                records,
-                lag_millis
-            }
-        ));
-        let shard_consumer_message = rx.recv().await.unwrap();
-        assert!(matches!(
-            shard_consumer_message,
-            ShardConsumerMessage::ShardSplit(shard_ids)
+            ShardConsumerMessage::NewShards(shard_ids) if shard_ids == vec![make_shard_id(1), make_shard_id(2)]
         ));
         assert!(shard_consumer_handle.await.is_ok());
         teardown(&kinesis_client, &stream_name).await;
