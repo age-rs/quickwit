@@ -165,7 +165,12 @@ impl AsyncActor for Publisher {
         // its end of life should also means the end of life of never stopping actors.
         // After all, when the publisher is stopped, there shouldn't be anything to process.
         // It's fine if the garbage collector is already dead.
-        let _ = ctx.send_exit_with_success_blocking(&self.garbage_collector_mailbox);
+        let _ = ctx
+            .send_exit_with_success(&self.garbage_collector_mailbox)
+            .await;
+        let _ = ctx
+            .send_exit_with_success(&self.merge_planner_mailbox)
+            .await;
         Ok(())
     }
 }
