@@ -19,14 +19,16 @@
 
 pub(crate) mod serialize;
 
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use bytes::Bytes;
 use quickwit_common::is_false;
 use quickwit_common::uri::Uri;
 use quickwit_proto::metastore::SourceType;
+use quickwit_proto::types::SourceId;
+use regex::Regex;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -34,7 +36,7 @@ pub use serialize::load_source_config_from_user_config;
 // For backward compatibility.
 use serialize::VersionedSourceConfig;
 
-use crate::{enable_ingest_v2, TestableForRegression};
+use crate::{disable_ingest_v1, enable_ingest_v2};
 
 /// Reserved source ID for the `quickwit index ingest` CLI command.
 pub const CLI_SOURCE_ID: &str = "_ingest-cli-source";
@@ -53,35 +55,16 @@ pub const RESERVED_SOURCE_IDS: &[&str] =
 #[serde(into = "VersionedSourceConfig")]
 #[serde(try_from = "VersionedSourceConfig")]
 pub struct SourceConfig {
-    pub source_id: String,
+    pub source_id: SourceId,
 
-    /// Maximum number of indexing pipelines spawned for the source on a given indexer.
-    /// The maximum is reached only if there is enough `desired_num_pipelines` to run.
-    /// The value is only used by sources that Quickwit knows how to distribute across
-    /// pipelines/nodes, that is for Kafka sources only.
-    /// Example:
-    /// - `max_num_pipelines_per_indexer=2`
-    /// - `desired_num_pipelines=1`
-    /// => Only one pipeline will run on one indexer.
-    pub max_num_pipelines_per_indexer: NonZeroUsize,
-    /// Number of desired indexing pipelines to run on a cluster for the source.
-    /// This number could not be reach if there is not enough indexers.
-    /// The value is only used by sources that Quickwit knows how to distribute across
-    /// pipelines/nodes, that is for Kafka sources only.
-    /// Example:
-    /// - `max_num_pipelines_per_indexer=1`
-    /// - `desired_num_pipelines=2`
-    /// - 1 indexer
-    /// => Only one pipeline will start on the sole indexer.
-    pub desired_num_pipelines: NonZeroUsize,
+    /// Number of indexing pipelines to run on a cluster for the source.
+    pub num_pipelines: NonZeroUsize,
 
     // Denotes if this source is enabled.
     pub enabled: bool,
 
     pub source_params: SourceParams,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "transform")]
     pub transform_config: Option<TransformConfig>,
 
     // Denotes the input data format.
@@ -93,13 +76,14 @@ impl SourceConfig {
     pub fn source_type(&self) -> SourceType {
         match self.source_params {
             SourceParams::File(_) => SourceType::File,
-            SourceParams::GcpPubSub(_) => SourceType::GcpPubsub,
             SourceParams::Ingest => SourceType::IngestV2,
             SourceParams::IngestApi => SourceType::IngestV1,
             SourceParams::IngestCli => SourceType::Cli,
             SourceParams::Kafka(_) => SourceType::Kafka,
             SourceParams::Kinesis(_) => SourceType::Kinesis,
+            SourceParams::PubSub(_) => SourceType::PubSub,
             SourceParams::Pulsar(_) => SourceType::Pulsar,
+            SourceParams::Stdin => SourceType::Stdin,
             SourceParams::Vec(_) => SourceType::Vec,
             SourceParams::Void(_) => SourceType::Void,
         }
@@ -109,13 +93,14 @@ impl SourceConfig {
     pub fn params(&self) -> JsonValue {
         match &self.source_params {
             SourceParams::File(params) => serde_json::to_value(params),
-            SourceParams::GcpPubSub(params) => serde_json::to_value(params),
+            SourceParams::PubSub(params) => serde_json::to_value(params),
             SourceParams::Ingest => serde_json::to_value(()),
             SourceParams::IngestApi => serde_json::to_value(()),
             SourceParams::IngestCli => serde_json::to_value(()),
             SourceParams::Kafka(params) => serde_json::to_value(params),
             SourceParams::Kinesis(params) => serde_json::to_value(params),
             SourceParams::Pulsar(params) => serde_json::to_value(params),
+            SourceParams::Stdin => serde_json::to_value(()),
             SourceParams::Vec(params) => serde_json::to_value(params),
             SourceParams::Void(params) => serde_json::to_value(params),
         }
@@ -126,8 +111,7 @@ impl SourceConfig {
     pub fn cli() -> Self {
         Self {
             source_id: CLI_SOURCE_ID.to_string(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(1).expect("1 should be non-zero"),
-            desired_num_pipelines: NonZeroUsize::new(1).expect("1 should be non-zero"),
+            num_pipelines: NonZeroUsize::MIN,
             enabled: true,
             source_params: SourceParams::IngestCli,
             transform_config: None,
@@ -139,8 +123,7 @@ impl SourceConfig {
     pub fn ingest_v2() -> Self {
         Self {
             source_id: INGEST_V2_SOURCE_ID.to_string(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(1).expect("1 should be non-zero"),
-            desired_num_pipelines: NonZeroUsize::new(1).expect("1 should be non-zero"),
+            num_pipelines: NonZeroUsize::MIN,
             enabled: enable_ingest_v2(),
             source_params: SourceParams::Ingest,
             transform_config: None,
@@ -152,9 +135,8 @@ impl SourceConfig {
     pub fn ingest_api_default() -> Self {
         Self {
             source_id: INGEST_API_SOURCE_ID.to_string(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(1).expect("1 should be non-zero"),
-            desired_num_pipelines: NonZeroUsize::new(1).expect("1 should be non-zero"),
-            enabled: true,
+            num_pipelines: NonZeroUsize::MIN,
+            enabled: !disable_ingest_v1(),
             source_params: SourceParams::IngestApi,
             transform_config: None,
             input_format: SourceInputFormat::Json,
@@ -165,8 +147,7 @@ impl SourceConfig {
     pub fn for_test(source_id: &str, source_params: SourceParams) -> Self {
         Self {
             source_id: source_id.to_string(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(1).expect("1 should be non-zero"),
-            desired_num_pipelines: NonZeroUsize::new(1).expect("1 should be non-zero"),
+            num_pipelines: NonZeroUsize::MIN,
             enabled: true,
             source_params,
             transform_config: None,
@@ -175,12 +156,12 @@ impl SourceConfig {
     }
 }
 
-impl TestableForRegression for SourceConfig {
+#[cfg(any(test, feature = "testsuite"))]
+impl crate::TestableForRegression for SourceConfig {
     fn sample_for_regression() -> Self {
         SourceConfig {
             source_id: "kafka-source".to_string(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(2).unwrap(),
-            desired_num_pipelines: NonZeroUsize::new(2).unwrap(),
+            num_pipelines: NonZeroUsize::new(2).unwrap(),
             enabled: true,
             source_params: SourceParams::Kafka(KafkaSourceParams {
                 topic: "kafka-topic".to_string(),
@@ -206,9 +187,17 @@ impl TestableForRegression for SourceConfig {
 pub enum SourceInputFormat {
     #[default]
     Json,
-    OtlpTraceJson,
-    #[serde(alias = "otlp_trace_proto")]
-    OtlpTraceProtobuf,
+    OtlpLogsJson,
+    #[serde(alias = "otlp_logs_proto")]
+    OtlpLogsProtobuf,
+    #[serde(alias = "otlp_trace_json")]
+    OtlpTracesJson,
+    #[serde(
+        alias = "otlp_trace_proto",
+        alias = "otlp_trace_protobuf",
+        alias = "otlp_traces_proto"
+    )]
+    OtlpTracesProtobuf,
     #[serde(alias = "plain")]
     PlainText,
 }
@@ -228,8 +217,8 @@ impl FromStr for SourceInputFormat {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "source_type", content = "params", rename_all = "snake_case")]
 pub enum SourceParams {
+    #[schema(value_type = FileSourceParamsForSerde)]
     File(FileSourceParams),
-    GcpPubSub(GcpPubSubSourceParams),
     Ingest,
     #[serde(rename = "ingest-api")]
     IngestApi,
@@ -237,18 +226,25 @@ pub enum SourceParams {
     IngestCli,
     Kafka(KafkaSourceParams),
     Kinesis(KinesisSourceParams),
+    #[serde(rename = "pubsub")]
+    PubSub(PubSubSourceParams),
     Pulsar(PulsarSourceParams),
+    Stdin,
     Vec(VecSourceParams),
     Void(VoidSourceParams),
 }
 
 impl SourceParams {
-    pub fn file<P: AsRef<Path>>(filepath: P) -> Self {
-        Self::File(FileSourceParams::file(filepath))
+    pub fn file_from_uri(uri: Uri) -> Self {
+        Self::File(FileSourceParams::Filepath(uri))
+    }
+
+    pub fn file_from_str<P: AsRef<str>>(filepath: P) -> anyhow::Result<Self> {
+        Uri::from_str(filepath.as_ref()).map(Self::file_from_uri)
     }
 
     pub fn stdin() -> Self {
-        Self::File(FileSourceParams::stdin())
+        Self::Stdin
     }
 
     pub fn void() -> Self {
@@ -256,41 +252,110 @@ impl SourceParams {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct FileSourceParams {
-    /// Path of the file to read. Assume stdin if None.
-    #[schema(value_type = String)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    #[serde(deserialize_with = "absolute_filepath_from_str")]
-    pub filepath: Option<PathBuf>, //< If None read from stdin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSourceMessageType {
+    /// See <https://docs.aws.amazon.com/AmazonS3/latest/userguide/notification-content-structure.html>
+    S3Notification,
+    /// A string with the URI of the file (e.g `s3://bucket/key`)
+    RawUri,
 }
 
-/// Deserializing as an URI first to validate the input.
-///
-/// TODO: we might want to replace `PathBuf` with `Uri` directly in
-/// `FileSourceParams`
-fn absolute_filepath_from_str<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
-where D: Deserializer<'de> {
-    let filepath_opt: Option<String> = Deserialize::deserialize(deserializer)?;
-    if let Some(filepath) = filepath_opt {
-        let uri = Uri::from_str(&filepath).map_err(D::Error::custom)?;
-        Ok(Some(PathBuf::from(uri.as_str())))
-    } else {
-        Ok(None)
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct FileSourceSqs {
+    pub queue_url: String,
+    pub message_type: FileSourceMessageType,
+    #[serde(default = "default_deduplication_window_duration_secs")]
+    pub deduplication_window_duration_secs: u32,
+    #[serde(default = "default_deduplication_window_max_messages")]
+    pub deduplication_window_max_messages: u32,
+    #[serde(default = "default_deduplication_cleanup_interval_secs")]
+    pub deduplication_cleanup_interval_secs: u32,
+}
+
+fn default_deduplication_window_duration_secs() -> u32 {
+    3600
+}
+
+fn default_deduplication_window_max_messages() -> u32 {
+    100_000
+}
+
+fn default_deduplication_cleanup_interval_secs() -> u32 {
+    60
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileSourceNotification {
+    Sqs(FileSourceSqs),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FileSourceParamsForSerde {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    notifications: Vec<FileSourceNotification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filepath: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    try_from = "FileSourceParamsForSerde",
+    into = "FileSourceParamsForSerde"
+)]
+pub enum FileSourceParams {
+    Notifications(FileSourceNotification),
+    Filepath(Uri),
+}
+
+impl TryFrom<FileSourceParamsForSerde> for FileSourceParams {
+    type Error = Cow<'static, str>;
+
+    fn try_from(mut value: FileSourceParamsForSerde) -> Result<Self, Self::Error> {
+        if value.filepath.is_some() && !value.notifications.is_empty() {
+            return Err(
+                "File source parameters `notifications` and `filepath` are mutually exclusive"
+                    .into(),
+            );
+        }
+        if let Some(filepath) = value.filepath {
+            let uri = Uri::from_str(&filepath).map_err(|err| err.to_string())?;
+            Ok(FileSourceParams::Filepath(uri))
+        } else if value.notifications.len() == 1 {
+            Ok(FileSourceParams::Notifications(
+                value.notifications.remove(0),
+            ))
+        } else if value.notifications.len() > 1 {
+            return Err("Only one notification can be specified for now".into());
+        } else {
+            return Err(
+                "Either `notifications` or `filepath` must be specified as file source parameters"
+                    .into(),
+            );
+        }
+    }
+}
+
+impl From<FileSourceParams> for FileSourceParamsForSerde {
+    fn from(value: FileSourceParams) -> Self {
+        match value {
+            FileSourceParams::Filepath(uri) => Self {
+                filepath: Some(uri.to_string()),
+                notifications: vec![],
+            },
+            FileSourceParams::Notifications(notification) => Self {
+                filepath: None,
+                notifications: vec![notification],
+            },
+        }
     }
 }
 
 impl FileSourceParams {
-    pub fn file<P: AsRef<Path>>(filepath: P) -> Self {
-        FileSourceParams {
-            filepath: Some(filepath.as_ref().to_path_buf()),
-        }
-    }
-
-    pub fn stdin() -> Self {
-        FileSourceParams { filepath: None }
+    pub fn from_filepath<P: AsRef<str>>(filepath: P) -> anyhow::Result<Self> {
+        Uri::from_str(filepath.as_ref()).map(Self::Filepath)
     }
 }
 
@@ -316,7 +381,7 @@ pub struct KafkaSourceParams {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct GcpPubSubSourceParams {
+pub struct PubSubSourceParams {
     /// Name of the subscription that the source consumes.
     pub subscription: String,
     /// When backfill mode is enabled, the source exits after reaching the end of the topic.
@@ -434,8 +499,9 @@ pub enum PulsarSourceAuth {
 fn pulsar_uri<'de, D>(deserializer: D) -> Result<String, D::Error>
 where D: Deserializer<'de> {
     let uri: String = Deserialize::deserialize(deserializer)?;
+    let re: Regex = Regex::new(r"pulsar(\+ssl)?://.*").expect("regular expression should compile");
 
-    if uri.strip_prefix("pulsar://").is_none() {
+    if !re.is_match(uri.as_str()) {
         return Err(Error::custom(format!(
             "invalid Pulsar uri provided, must be in the format of `pulsar://host:port/path`. \
              got: `{uri}`"
@@ -489,7 +555,7 @@ impl TransformConfig {
         // If we are missing the VRL feature we do not return an error here,
         // to avoid breaking unit tests.
         //
-        // We do return an explicit error on instanciation of the program however.
+        // We do return an explicit error on instantiation of the program however.
         Ok(())
     }
 
@@ -571,8 +637,7 @@ mod tests {
             load_source_config_from_user_config(config_format, file_content.as_bytes()).unwrap();
         let expected_source_config = SourceConfig {
             source_id: "hdfs-logs-kafka-source".to_string(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(2).unwrap(),
-            desired_num_pipelines: NonZeroUsize::new(2).unwrap(),
+            num_pipelines: NonZeroUsize::new(2).unwrap(),
             enabled: true,
             source_params: SourceParams::Kafka(KafkaSourceParams {
                 topic: "cloudera-cluster-logs".to_string(),
@@ -587,7 +652,7 @@ mod tests {
             input_format: SourceInputFormat::Json,
         };
         assert_eq!(source_config, expected_source_config);
-        assert_eq!(source_config.desired_num_pipelines.get(), 2);
+        assert_eq!(source_config.num_pipelines.get(), 2);
     }
 
     #[test]
@@ -668,8 +733,7 @@ mod tests {
             load_source_config_from_user_config(config_format, file_content.as_bytes()).unwrap();
         let expected_source_config = SourceConfig {
             source_id: "hdfs-logs-kinesis-source".to_string(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(1).expect("1 should be non-zero"),
-            desired_num_pipelines: NonZeroUsize::new(1).expect("1 should be non-zero"),
+            num_pipelines: NonZeroUsize::MIN,
             enabled: true,
             source_params: SourceParams::Kinesis(KinesisSourceParams {
                 stream_name: "emr-cluster-logs".to_string(),
@@ -683,7 +747,7 @@ mod tests {
             input_format: SourceInputFormat::Json,
         };
         assert_eq!(source_config, expected_source_config);
-        assert_eq!(source_config.desired_num_pipelines.get(), 1);
+        assert_eq!(source_config.num_pipelines.get(), 1);
     }
 
     #[tokio::test]
@@ -705,30 +769,29 @@ mod tests {
                 .to_string()
                 .contains("`desired_num_pipelines` must be"));
         }
+        // {
+        //     let content = r#"
+        //     {
+        //         "version": "0.7",
+        //         "source_id": "hdfs-logs-void-source",
+        //         "desired_num_pipelines": 1,
+        //         "max_num_pipelines_per_indexer": 0,
+        //         "source_type": "void",
+        //         "params": {}
+        //     }
+        //     "#;
+        //     let error = load_source_config_from_user_config(ConfigFormat::Json,
+        // content.as_bytes())         .unwrap_err();
+        //     assert!(error
+        //         .to_string()
+        //         .contains("`max_num_pipelines_per_indexer` must be"));
+        // }
         {
             let content = r#"
             {
-                "version": "0.7",
+                "version": "0.8",
                 "source_id": "hdfs-logs-void-source",
-                "desired_num_pipelines": 1,
-                "max_num_pipelines_per_indexer": 0,
-                "source_type": "void",
-                "params": {}
-            }
-            "#;
-            let error = load_source_config_from_user_config(ConfigFormat::Json, content.as_bytes())
-                .unwrap_err();
-            assert!(error
-                .to_string()
-                .contains("`max_num_pipelines_per_indexer` must be"));
-        }
-        {
-            let content = r#"
-            {
-                "version": "0.7",
-                "source_id": "hdfs-logs-void-source",
-                "desired_num_pipelines": 1,
-                "max_num_pipelines_per_indexer": 2,
+                "num_pipelines": 2,
                 "source_type": "void",
                 "params": {}
             }
@@ -755,7 +818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_valid_distributed_source_config() {
+    async fn test_load_valid_distributed_source_config_0_7() {
         {
             let content = r#"
             {
@@ -772,8 +835,7 @@ mod tests {
             let source_config =
                 load_source_config_from_user_config(ConfigFormat::Json, content.as_bytes())
                     .unwrap();
-            assert_eq!(source_config.desired_num_pipelines.get(), 3);
-            assert_eq!(source_config.max_num_pipelines_per_indexer.get(), 3);
+            assert_eq!(source_config.num_pipelines.get(), 3);
         }
         {
             let content = r#"
@@ -792,23 +854,126 @@ mod tests {
             load_source_config_from_user_config(ConfigFormat::Json, content.as_bytes())
                 .unwrap_err();
             // TODO: uncomment asserts once distributed indexing is activated for pulsar.
-            // assert_eq!(source_config.desired_num_pipelines(), 3);
+            // assert_eq!(source_config.num_pipelines(), 3);
             // assert_eq!(source_config.max_num_pipelines_per_indexer(), 3);
         }
     }
 
+    #[tokio::test]
+    async fn test_load_valid_distributed_source_config() {
+        {
+            let content = r#"
+            {
+                "version": "0.8",
+                "source_id": "hdfs-logs-kafka-source",
+                "num_pipelines": 3,
+                "source_type": "kafka",
+                "params": {
+                    "topic": "my-topic"
+                }
+            }
+            "#;
+            let source_config =
+                load_source_config_from_user_config(ConfigFormat::Json, content.as_bytes())
+                    .unwrap();
+            assert_eq!(source_config.num_pipelines.get(), 3);
+        }
+    }
+
     #[test]
-    fn test_file_source_params_serialization() {
+    fn test_file_source_params_serde() {
         {
             let yaml = r#"
                 filepath: source-path.json
             "#;
-            let file_params = serde_yaml::from_str::<FileSourceParams>(yaml).unwrap();
+            let file_params_deserialized = serde_yaml::from_str::<FileSourceParams>(yaml).unwrap();
             let uri = Uri::from_str("source-path.json").unwrap();
+            assert_eq!(file_params_deserialized, FileSourceParams::Filepath(uri));
+            let file_params_reserialized = serde_json::to_value(file_params_deserialized).unwrap();
+            file_params_reserialized
+                .get("filepath")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("source-path.json");
+        }
+        {
+            let yaml = r#"
+                notifications:
+                  - type: sqs
+                    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/queue-name
+                    message_type: s3_notification
+            "#;
+            let file_params_deserialized = serde_yaml::from_str::<FileSourceParams>(yaml).unwrap();
             assert_eq!(
-                file_params.filepath.unwrap().as_path(),
-                Path::new(uri.as_str())
+                file_params_deserialized,
+                FileSourceParams::Notifications(FileSourceNotification::Sqs(FileSourceSqs {
+                    queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/queue-name"
+                        .to_string(),
+                    message_type: FileSourceMessageType::S3Notification,
+                    deduplication_window_duration_secs: default_deduplication_window_duration_secs(
+                    ),
+                    deduplication_window_max_messages: default_deduplication_window_max_messages(),
+                    deduplication_cleanup_interval_secs:
+                        default_deduplication_cleanup_interval_secs()
+                })),
             );
+            let file_params_reserialized = serde_json::to_value(&file_params_deserialized).unwrap();
+            assert_eq!(
+                file_params_reserialized,
+                json!({"notifications": [{
+                    "type": "sqs",
+                    "queue_url": "https://sqs.us-east-1.amazonaws.com/123456789012/queue-name",
+                    "message_type": "s3_notification",
+                    "deduplication_window_duration_secs": default_deduplication_window_duration_secs(),
+                    "deduplication_window_max_messages": default_deduplication_window_max_messages(),
+                    "deduplication_cleanup_interval_secs": default_deduplication_cleanup_interval_secs(),
+                }]})
+            );
+        }
+        {
+            let yaml = r#"
+                filepath: source-path.json
+                notifications:
+                  - type: sqs
+                    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/queue-name
+                    message_type: s3_notification
+            "#;
+            let error = serde_yaml::from_str::<FileSourceParams>(yaml).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "File source parameters `notifications` and `filepath` are mutually exclusive"
+            );
+        }
+        {
+            let yaml = r#"
+                notifications:
+                  - type: sqs
+                    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/queue1
+                    message_type: s3_notification
+                  - type: sqs
+                    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/queue2
+                    message_type: s3_notification
+            "#;
+            let error = serde_yaml::from_str::<FileSourceParams>(yaml).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Only one notification can be specified for now"
+            );
+        }
+        {
+            let json = r#"
+            {
+                "notifications": [
+                    {
+                        "queue_url": "https://sqs.us-east-1.amazonaws.com/123456789012/queue",
+                        "message_type": "s3_notification"
+                    }
+                ]
+            }
+            "#;
+            let error = serde_json::from_str::<FileSourceParams>(json).unwrap_err();
+            assert!(error.to_string().contains("missing field `type`"));
         }
     }
 
@@ -1076,8 +1241,7 @@ mod tests {
         let source_config: SourceConfig = ConfigFormat::Json.parse(&file_content).unwrap();
         let expected_source_config = SourceConfig {
             source_id: INGEST_API_SOURCE_ID.to_string(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(1).expect("1 should be non-zero"),
-            desired_num_pipelines: NonZeroUsize::new(1).expect("1 should be non-zero"),
+            num_pipelines: NonZeroUsize::MIN,
             enabled: true,
             source_params: SourceParams::IngestApi,
             transform_config: Some(TransformConfig {
@@ -1087,7 +1251,7 @@ mod tests {
             input_format: SourceInputFormat::Json,
         };
         assert_eq!(source_config, expected_source_config);
-        assert_eq!(source_config.desired_num_pipelines.get(), 1);
+        assert_eq!(source_config.num_pipelines.get(), 1);
     }
 
     #[test]
@@ -1196,7 +1360,9 @@ mod tests {
             "desired_num_pipelines": 1,
             "max_num_pipelines_per_indexer": 1,
             "source_type": "file",
-            "params": {"filepath": "/test_non_json_corpus.txt"},
+            "params": {
+              "filepath": "s3://mybucket/test_non_json_corpus.txt"
+            },
             "input_format": "plain_text"
         }"#;
         let source_config =

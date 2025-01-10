@@ -17,7 +17,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use aws_sdk_s3::error::{DisplayErrorContext, SdkError};
+use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError;
@@ -27,7 +27,6 @@ use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::operation::upload_part::UploadPartError;
-use hyper::http::StatusCode;
 
 use crate::{StorageError, StorageErrorKind};
 
@@ -47,10 +46,9 @@ where E: std::error::Error + ToStorageErrorKind + Send + Sync + 'static
                 }
             }
             SdkError::ResponseError(response_error) => {
-                let response = response_error.raw().http();
-                match response.status() {
-                    StatusCode::NOT_FOUND => StorageErrorKind::NotFound,
-                    StatusCode::UNAUTHORIZED => StorageErrorKind::Unauthorized,
+                match response_error.raw().status().as_u16() {
+                    404 /* NOT_FOUND */ => StorageErrorKind::NotFound,
+                    403 /* UNAUTHORIZED */ => StorageErrorKind::Unauthorized,
                     _ => StorageErrorKind::Internal,
                 }
             }
@@ -69,10 +67,14 @@ pub trait ToStorageErrorKind {
 
 impl ToStorageErrorKind for GetObjectError {
     fn to_storage_error_kind(&self) -> StorageErrorKind {
+        let error_code = self.code().unwrap_or("unknown");
+        crate::STORAGE_METRICS
+            .object_storage_get_errors_total
+            .with_label_values([error_code])
+            .inc();
         match self {
             GetObjectError::InvalidObjectState(_) => StorageErrorKind::Service,
             GetObjectError::NoSuchKey(_) => StorageErrorKind::NotFound,
-            GetObjectError::Unhandled(_) => StorageErrorKind::Service,
             _ => StorageErrorKind::Service,
         }
     }
@@ -106,7 +108,6 @@ impl ToStorageErrorKind for AbortMultipartUploadError {
     fn to_storage_error_kind(&self) -> StorageErrorKind {
         match self {
             AbortMultipartUploadError::NoSuchUpload(_) => StorageErrorKind::Internal,
-            AbortMultipartUploadError::Unhandled(_) => StorageErrorKind::Service,
             _ => StorageErrorKind::Service,
         }
     }
@@ -128,7 +129,6 @@ impl ToStorageErrorKind for HeadObjectError {
     fn to_storage_error_kind(&self) -> StorageErrorKind {
         match self {
             HeadObjectError::NotFound(_) => StorageErrorKind::NotFound,
-            HeadObjectError::Unhandled(_) => StorageErrorKind::Service,
             _ => StorageErrorKind::Service,
         }
     }

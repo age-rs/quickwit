@@ -27,14 +27,15 @@
 //! - object storages (S3)
 //! - local filesystem
 //! - distributed filesystems.
-//! etc.
+//! - etc.
 //!
-//! - The `BundleStorage` bundles together multiple files into a single file.
+//! The `BundleStorage` bundles together multiple files into a single file.
 mod cache;
 mod debouncer;
 mod file_descriptor_cache;
 mod metrics;
 mod storage;
+mod timeout_and_retry_storage;
 pub use debouncer::AsyncDebouncer;
 pub(crate) use debouncer::DebouncedStorage;
 
@@ -92,6 +93,7 @@ pub use self::test_suite::{
     storage_test_multi_part_upload, storage_test_single_part_upload, storage_test_suite,
     test_write_and_bulk_delete,
 };
+pub use self::timeout_and_retry_storage::TimeoutAndRetryStorage;
 pub use crate::error::{
     BulkDeleteError, DeleteFailure, StorageError, StorageErrorKind, StorageResolverError,
     StorageResult,
@@ -111,6 +113,17 @@ pub async fn load_file(
         .ok_or_else(|| anyhow::anyhow!("URI `{uri}` is not a valid file URI"))?;
     let bytes = storage.get_all(file_name).await?;
     Ok(bytes)
+}
+
+// this function isn't meant to be called, just to break compilation if
+// serde_json::Map is an ordered map and not a btree map
+#[allow(dead_code)]
+#[cfg(not(any(test, feature = "testsuite", feature = "integration-testsuite")))]
+unsafe fn serde_json_preserve_order_canary(
+    val: serde_json::Map<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    use std::mem::transmute as assert_serde_json__preserve_order__disabled;
+    assert_serde_json__preserve_order__disabled(val)
 }
 
 #[cfg(any(test, feature = "testsuite", feature = "integration-testsuite"))]

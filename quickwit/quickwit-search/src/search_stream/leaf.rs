@@ -24,12 +24,12 @@ use std::sync::Arc;
 
 use futures::{FutureExt, StreamExt};
 use quickwit_common::pretty::PrettySample;
-use quickwit_doc_mapper::DocMapper;
+use quickwit_doc_mapper::{DocMapper, FastFieldWarmupInfo, WarmupInfo};
 use quickwit_proto::search::{
     LeafSearchStreamResponse, OutputFormat, SearchRequest, SearchStreamRequest,
     SplitIdAndFooterOffsets,
 };
-use quickwit_storage::Storage;
+use quickwit_storage::{ByteRangeCache, Storage};
 use tantivy::columnar::{DynamicColumn, HasAssociatedColumnType};
 use tantivy::fastfield::Column;
 use tantivy::query::Query;
@@ -58,7 +58,7 @@ pub async fn leaf_search_stream(
     request: SearchStreamRequest,
     storage: Arc<dyn Storage>,
     splits: Vec<SplitIdAndFooterOffsets>,
-    doc_mapper: Arc<dyn DocMapper>,
+    doc_mapper: Arc<DocMapper>,
 ) -> UnboundedReceiverStream<crate::Result<LeafSearchStreamResponse>> {
     info!(split_offsets = ?PrettySample::new(&splits, 5));
     let (result_sender, result_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -88,7 +88,7 @@ async fn leaf_search_results_stream(
     request: SearchStreamRequest,
     storage: Arc<dyn Storage>,
     splits: Vec<SplitIdAndFooterOffsets>,
-    doc_mapper: Arc<dyn DocMapper>,
+    doc_mapper: Arc<DocMapper>,
 ) -> impl futures::Stream<Item = crate::Result<LeafSearchStreamResponse>> + Sync + Send + 'static {
     let max_num_concurrent_split_streams = searcher_context
         .searcher_config
@@ -112,10 +112,11 @@ async fn leaf_search_results_stream(
 async fn leaf_search_stream_single_split(
     searcher_context: Arc<SearcherContext>,
     split: SplitIdAndFooterOffsets,
-    doc_mapper: Arc<dyn DocMapper>,
+    doc_mapper: Arc<DocMapper>,
     mut stream_request: SearchStreamRequest,
     storage: Arc<dyn Storage>,
 ) -> crate::Result<LeafSearchStreamResponse> {
+    // TODO: Should we track the memory here using the SearchPermitProvider?
     let _leaf_split_stream_permit = searcher_context
         .split_stream_semaphore
         .acquire()
@@ -127,12 +128,14 @@ async fn leaf_search_stream_single_split(
         &split,
     );
 
-    let index = open_index_with_caches(
+    let cache =
+        ByteRangeCache::with_infinite_capacity(&quickwit_storage::STORAGE_METRICS.shortlived_cache);
+    let (index, _) = open_index_with_caches(
         &searcher_context,
         storage,
         &split,
         Some(doc_mapper.tokenizer_manager()),
-        true,
+        Some(cache),
     )
     .await?;
     let split_schema = index.schema();
@@ -178,12 +181,21 @@ async fn leaf_search_stream_single_split(
         .iter()
         .any(|sort| sort.field_name == "_score");
 
-    // TODO no test fail if this line get removed
-    warmup_info.field_norms |= requires_scoring;
-
-    let fast_field_names =
-        request_fields.fast_fields_for_request(timestamp_filter_builder_opt.as_ref());
-    warmup_info.fast_field_names.extend(fast_field_names);
+    let fast_fields = request_fields
+        .fast_fields_for_request(timestamp_filter_builder_opt.as_ref())
+        .into_iter()
+        .map(|name| FastFieldWarmupInfo {
+            name,
+            with_subfields: false,
+        })
+        .collect();
+    let stream_warmup_info = WarmupInfo {
+        fast_fields,
+        // TODO no test fail if this line get removed
+        field_norms: requires_scoring,
+        ..Default::default()
+    };
+    warmup_info.merge(stream_warmup_info);
     warmup_info.simplify();
 
     warmup(&searcher, &warmup_info).await?;
@@ -196,7 +208,7 @@ async fn leaf_search_stream_single_split(
 
     let _ = span.enter();
     let m_request_fields = request_fields.clone();
-    let collect_handle = crate::run_cpu_intensive(move || {
+    let collect_handle = crate::search_thread_pool().run_cpu_intensive(move || {
         let mut buffer = Vec::new();
         match m_request_fields.fast_field_types() {
             (Type::I64, None) => {
@@ -362,11 +374,11 @@ impl std::fmt::Display for SearchStreamRequestFields {
     }
 }
 
-impl<'a> SearchStreamRequestFields {
+impl SearchStreamRequestFields {
     pub fn from_request(
         stream_request: &SearchStreamRequest,
-        schema: &'a Schema,
-        doc_mapper: &dyn DocMapper,
+        schema: &Schema,
+        doc_mapper: &DocMapper,
     ) -> crate::Result<SearchStreamRequestFields> {
         let fast_field = schema.get_field(&stream_request.fast_field)?;
 
@@ -662,7 +674,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_leaf_search_stream_to_partitionned_clickhouse_binary_output_with_filtering(
+    async fn test_leaf_search_stream_to_partitioned_clickhouse_binary_output_with_filtering(
     ) -> anyhow::Result<()> {
         let index_id = "single-node-simple-2";
         let doc_mapping_yaml = r#"

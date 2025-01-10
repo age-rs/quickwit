@@ -18,29 +18,84 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use quickwit_actors::AskError;
-use quickwit_common::tower::RpcName;
+use quickwit_common::rate_limited_error;
+use quickwit_common::tower::{MakeLoadShedError, RpcName, TimeoutExceeded};
+use serde::{Deserialize, Serialize};
 use thiserror;
 
-use crate::metastore::MetastoreError;
-use crate::{ServiceError, ServiceErrorCode};
+use crate::metastore::{MetastoreError, OpenShardSubrequest};
+use crate::{GrpcServiceError, ServiceError, ServiceErrorCode};
 
 include!("../codegen/quickwit/quickwit.control_plane.rs");
 
 pub type ControlPlaneResult<T> = std::result::Result<T, ControlPlaneError>;
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ControlPlaneError {
-    #[error("an internal error occurred: {0}")]
+    #[error("internal error: {0}")]
     Internal(String),
-    #[error("a metastore error occurred: {0}")]
+    #[error("metastore error: {0}")]
     Metastore(#[from] MetastoreError),
-    #[error("control plane is unavailable: {0}")]
+    #[error("request timed out: {0}")]
+    Timeout(String),
+    #[error("too many requests")]
+    TooManyRequests,
+    #[error("service unavailable: {0}")]
     Unavailable(String),
 }
 
-impl ControlPlaneError {
-    pub fn label_value(&self) -> &'static str {
-        "error"
+impl From<TimeoutExceeded> for ControlPlaneError {
+    fn from(_timeout_exceeded: TimeoutExceeded) -> Self {
+        Self::Timeout("tower layer timeout".to_string())
+    }
+}
+
+impl From<quickwit_common::tower::TaskCancelled> for ControlPlaneError {
+    fn from(task_cancelled: quickwit_common::tower::TaskCancelled) -> Self {
+        ControlPlaneError::Internal(task_cancelled.to_string())
+    }
+}
+
+impl ServiceError for ControlPlaneError {
+    fn error_code(&self) -> ServiceErrorCode {
+        match self {
+            Self::Internal(error_msg) => {
+                rate_limited_error!(
+                    limit_per_min = 6,
+                    "control plane internal error: {error_msg}"
+                );
+                ServiceErrorCode::Internal
+            }
+            Self::Metastore(metastore_error) => metastore_error.error_code(),
+            Self::Timeout(_) => ServiceErrorCode::Timeout,
+            Self::TooManyRequests => ServiceErrorCode::TooManyRequests,
+            Self::Unavailable(_) => ServiceErrorCode::Unavailable,
+        }
+    }
+}
+
+impl GrpcServiceError for ControlPlaneError {
+    fn new_internal(message: String) -> Self {
+        Self::Internal(message)
+    }
+
+    fn new_timeout(message: String) -> Self {
+        Self::Timeout(message)
+    }
+
+    fn new_too_many_requests() -> Self {
+        Self::TooManyRequests
+    }
+
+    fn new_unavailable(message: String) -> Self {
+        Self::Unavailable(message)
+    }
+}
+
+impl MakeLoadShedError for ControlPlaneError {
+    fn make_load_shed_error() -> Self {
+        Self::TooManyRequests
     }
 }
 
@@ -52,28 +107,10 @@ impl From<ControlPlaneError> for MetastoreError {
                 cause: message,
             },
             ControlPlaneError::Metastore(error) => error,
+            ControlPlaneError::Timeout(message) => MetastoreError::Timeout(message),
+            ControlPlaneError::TooManyRequests => MetastoreError::TooManyRequests,
             ControlPlaneError::Unavailable(message) => MetastoreError::Unavailable(message),
         }
-    }
-}
-
-impl From<ControlPlaneError> for tonic::Status {
-    fn from(control_plane_error: ControlPlaneError) -> Self {
-        let grpc_status_code = control_plane_error.error_code().to_grpc_status_code();
-        let message_json = serde_json::to_string(&control_plane_error)
-            .unwrap_or_else(|_| format!("original control plane error: {control_plane_error}"));
-        tonic::Status::new(grpc_status_code, message_json)
-    }
-}
-
-impl From<tonic::Status> for ControlPlaneError {
-    fn from(status: tonic::Status) -> Self {
-        serde_json::from_str(status.message()).unwrap_or_else(|_| {
-            ControlPlaneError::Internal(format!(
-                "failed to deserialize control plane error: `{}`",
-                status.message()
-            ))
-        })
     }
 }
 
@@ -82,21 +119,11 @@ impl From<AskError<ControlPlaneError>> for ControlPlaneError {
         match error {
             AskError::ErrorReply(error) => error,
             AskError::MessageNotDelivered => {
-                ControlPlaneError::Unavailable("request not delivered".to_string())
+                Self::new_unavailable("request could not be delivered to actor".to_string())
             }
-            AskError::ProcessMessageError => ControlPlaneError::Internal(
-                "an error occurred while processing the request".to_string(),
-            ),
-        }
-    }
-}
-
-impl ServiceError for ControlPlaneError {
-    fn error_code(&self) -> ServiceErrorCode {
-        match self {
-            Self::Internal { .. } => ServiceErrorCode::Internal,
-            Self::Metastore(error) => error.error_code(),
-            Self::Unavailable(_) => ServiceErrorCode::Unavailable,
+            AskError::ProcessMessageError => {
+                Self::new_internal("an error occurred while processing the request".to_string())
+            }
         }
     }
 }
@@ -113,8 +140,30 @@ impl RpcName for AdviseResetShardsRequest {
     }
 }
 
-impl RpcName for GetDebugStateRequest {
-    fn rpc_name() -> &'static str {
-        "get_debug_state"
+impl GetOrCreateOpenShardsFailureReason {
+    pub fn create_failure(
+        &self,
+        subrequest: impl Into<GetOrCreateOpenShardsSubrequest>,
+    ) -> GetOrCreateOpenShardsFailure {
+        let subrequest = subrequest.into();
+
+        GetOrCreateOpenShardsFailure {
+            subrequest_id: subrequest.subrequest_id,
+            index_id: subrequest.index_id,
+            source_id: subrequest.source_id,
+            reason: *self as i32,
+        }
+    }
+}
+
+impl From<crate::metastore::OpenShardSubrequest> for GetOrCreateOpenShardsSubrequest {
+    fn from(metastore_open_shard_subrequest: OpenShardSubrequest) -> Self {
+        let index_id = metastore_open_shard_subrequest.index_uid().index_id.clone();
+
+        Self {
+            subrequest_id: metastore_open_shard_subrequest.subrequest_id,
+            index_id,
+            source_id: metastore_open_shard_subrequest.source_id,
+        }
     }
 }

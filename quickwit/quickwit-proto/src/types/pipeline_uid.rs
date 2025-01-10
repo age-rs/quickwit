@@ -17,17 +17,18 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
+use serde::de::Error;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-/// The size of a ULID in bytes.
-pub(crate) const ULID_SIZE: usize = 16;
+use super::ULID_SIZE;
 
-/// A pipeline uid identify an indexing pipeline and an indexing task.
+/// A pipeline UID identifies an indexing pipeline and an indexing task.
 #[derive(Clone, Copy, Default, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct PipelineUid(Ulid);
 
@@ -44,13 +45,14 @@ impl Display for PipelineUid {
 }
 
 impl PipelineUid {
-    pub fn from_u128(ulid_u128: u128) -> PipelineUid {
-        PipelineUid(Ulid::from_bytes(ulid_u128.to_le_bytes()))
+    /// Creates a new random pipeline UID.
+    pub fn random() -> Self {
+        Self(Ulid::new())
     }
 
-    /// Creates a new random pipeline uid.
-    pub fn new() -> Self {
-        Self(Ulid::new())
+    #[cfg(any(test, feature = "testsuite"))]
+    pub fn for_test(ulid_u128: u128) -> PipelineUid {
+        Self(Ulid::from(ulid_u128))
     }
 }
 
@@ -59,7 +61,7 @@ impl FromStr for PipelineUid {
 
     fn from_str(pipeline_uid_str: &str) -> Result<PipelineUid, Self::Err> {
         let pipeline_ulid =
-            Ulid::from_string(pipeline_uid_str).map_err(|_| "invalid pipeline uid")?;
+            Ulid::from_string(pipeline_uid_str).map_err(|_| "invalid pipeline UID")?;
         Ok(PipelineUid(pipeline_ulid))
     }
 }
@@ -72,9 +74,8 @@ impl Serialize for PipelineUid {
 
 impl<'de> Deserialize<'de> for PipelineUid {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let ulid_str = String::deserialize(deserializer)?;
-        let ulid = Ulid::from_string(&ulid_str)
-            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let ulid_str: Cow<'de, str> = Cow::deserialize(deserializer)?;
+        let ulid = Ulid::from_string(&ulid_str).map_err(D::Error::custom)?;
         Ok(Self(ulid))
     }
 }
@@ -153,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_uid_prost_serde_roundtrip() {
-        let pipeline_uid = PipelineUid::new();
+        let pipeline_uid = PipelineUid::random();
 
         let encoded = pipeline_uid.encode_to_vec();
         assert_eq!(

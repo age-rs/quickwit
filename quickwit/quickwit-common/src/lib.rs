@@ -43,9 +43,12 @@ pub mod stream_utils;
 pub mod temp_dir;
 #[cfg(any(test, feature = "testsuite"))]
 pub mod test_utils;
+pub mod thread_pool;
 pub mod tower;
 pub mod type_map;
 pub mod uri;
+
+mod socket_addr_legacy_hash;
 
 use std::env;
 use std::fmt::{Debug, Display};
@@ -57,6 +60,7 @@ pub use coolid::new_coolid;
 pub use kill_switch::KillSwitch;
 pub use path_hasher::PathHasher;
 pub use progress::{Progress, ProtectedZoneGuard};
+pub use socket_addr_legacy_hash::SocketAddrLegacyHash;
 pub use stream_utils::{BoxStream, ServiceStream};
 use tracing::{error, info};
 
@@ -82,14 +86,41 @@ pub fn split_file(split_id: impl Display) -> String {
 pub fn get_from_env<T: FromStr + Debug>(key: &str, default_value: T) -> T {
     if let Ok(value_str) = std::env::var(key) {
         if let Ok(value) = T::from_str(&value_str) {
-            info!(value=?value, "Setting `{}` from environment", key);
+            info!(value=?value, "using environment variable `{key}` value");
             return value;
         } else {
-            error!(value_str=%value_str, "Failed to parse `{}` from environment", key);
+            error!(value=%value_str, "failed to parse environment variable `{key}` value");
         }
     }
-    info!(value=?default_value, "Setting `{}` from default", key);
+    info!(value=?default_value, "using environment variable `{key}` default value");
     default_value
+}
+
+pub fn get_bool_from_env(key: &str, default_value: bool) -> bool {
+    if let Ok(value_str) = std::env::var(key) {
+        if let Some(value) = parse_bool_lenient(&value_str) {
+            info!(value=%value, "using environment variable `{key}` value");
+            return value;
+        } else {
+            error!(value=%value_str, "failed to parse environment variable `{key}` value");
+        }
+    }
+    info!(value=?default_value, "using environment variable `{key}` default value");
+    default_value
+}
+
+pub fn get_from_env_opt<T: FromStr + Debug>(key: &str) -> Option<T> {
+    let Some(value_str) = std::env::var(key).ok() else {
+        info!("environment variable `{key}` is not set");
+        return None;
+    };
+    if let Ok(value) = T::from_str(&value_str) {
+        info!(value=?value, "using environment variable `{key}` value");
+        Some(value)
+    } else {
+        error!(value=%value_str, "failed to parse environment variable `{key}` value");
+        None
+    }
 }
 
 pub fn truncate_str(text: &str, max_len: usize) -> &str {
@@ -173,6 +204,18 @@ pub const fn div_ceil(lhs: i64, rhs: i64) -> i64 {
     }
 }
 
+/// Return the number of vCPU/hyperthreads available.
+/// This number is usually not equal to the number of cpu cores
+pub fn num_cpus() -> usize {
+    match std::thread::available_parallelism() {
+        Ok(num_cpus) => num_cpus.get(),
+        Err(io_error) => {
+            error!(error=?io_error, "failed to detect the number of threads available: arbitrarily returning 2");
+            2
+        }
+    }
+}
+
 // The following are helpers to build named tasks.
 //
 // Named tasks require the tokio feature `tracing` to be enabled.
@@ -240,6 +283,22 @@ where
         .name(name)
         .spawn_on(future, runtime)
         .unwrap()
+}
+
+pub fn parse_bool_lenient(bool_str: &str) -> Option<bool> {
+    let trimmed_bool_str = bool_str.trim();
+
+    for truthy_value in ["true", "yes", "1"] {
+        if trimmed_bool_str.eq_ignore_ascii_case(truthy_value) {
+            return Some(true);
+        }
+    }
+    for falsy_value in ["false", "no", "0"] {
+        if trimmed_bool_str.eq_ignore_ascii_case(falsy_value) {
+            return Some(false);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -315,5 +374,22 @@ mod tests {
         assert_eq!(div_ceil_u32(2, 3), 1);
         assert_eq!(div_ceil_u32(1, 3), 1);
         assert_eq!(div_ceil_u32(0, 3), 0);
+    }
+
+    #[test]
+    fn test_parse_bool_lenient() {
+        assert_eq!(parse_bool_lenient("true"), Some(true));
+        assert_eq!(parse_bool_lenient("TRUE"), Some(true));
+        assert_eq!(parse_bool_lenient("True"), Some(true));
+        assert_eq!(parse_bool_lenient("yes"), Some(true));
+        assert_eq!(parse_bool_lenient(" 1"), Some(true));
+
+        assert_eq!(parse_bool_lenient("false"), Some(false));
+        assert_eq!(parse_bool_lenient("FALSE"), Some(false));
+        assert_eq!(parse_bool_lenient("False"), Some(false));
+        assert_eq!(parse_bool_lenient("no"), Some(false));
+        assert_eq!(parse_bool_lenient("0 "), Some(false));
+
+        assert_eq!(parse_bool_lenient("foo"), None);
     }
 }

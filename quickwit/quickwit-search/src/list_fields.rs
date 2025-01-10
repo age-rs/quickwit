@@ -34,17 +34,18 @@ use quickwit_proto::search::{
     deserialize_split_fields, LeafListFieldsRequest, ListFields, ListFieldsEntryResponse,
     ListFieldsRequest, ListFieldsResponse, SplitIdAndFooterOffsets,
 };
-use quickwit_proto::types::IndexUid;
+use quickwit_proto::types::{IndexId, IndexUid};
 use quickwit_storage::Storage;
 
 use crate::leaf::open_split_bundle;
+use crate::search_job_placer::group_jobs_by_index_id;
 use crate::service::SearcherContext;
 use crate::{list_relevant_splits, resolve_index_patterns, ClusterClient, SearchError, SearchJob};
 
 /// Get the list of splits for the request which we need to scan.
 pub async fn get_fields_from_split<'a>(
     searcher_context: &SearcherContext,
-    index_id: String,
+    index_id: IndexId,
     split_and_footer_offsets: &'a SplitIdAndFooterOffsets,
     index_storage: Arc<dyn Storage>,
 ) -> anyhow::Result<Box<dyn Iterator<Item = ListFieldsEntryResponse> + Send>> {
@@ -229,7 +230,7 @@ fn matches_pattern(field_pattern: &str, field_name: &str) -> bool {
 
 /// `leaf` step of list fields.
 pub async fn leaf_list_fields(
-    index_id: String,
+    index_id: IndexId,
     index_storage: Arc<dyn Storage>,
     searcher_context: &SearcherContext,
     split_ids: &[SplitIdAndFooterOffsets],
@@ -275,7 +276,7 @@ pub async fn leaf_list_fields(
 #[derive(Clone, Debug)]
 pub struct IndexMetasForLeafSearch {
     /// Index id.
-    pub index_id: String,
+    pub index_id: IndexId,
     /// Index URI.
     pub index_uri: Uri,
 }
@@ -356,12 +357,14 @@ pub fn jobs_to_leaf_requests(
     let search_request_for_leaf = request.clone();
     let mut leaf_search_requests = Vec::new();
     // Group jobs by index uid.
-    for (index_uid, job_group) in &jobs.into_iter().group_by(|job| job.index_uid.clone()) {
-        let index_meta = index_uid_to_id.get(&index_uid).ok_or_else(|| {
+    group_jobs_by_index_id(jobs, |job_group| {
+        let index_uid = &job_group[0].index_uid;
+        let index_meta = index_uid_to_id.get(index_uid).ok_or_else(|| {
             SearchError::Internal(format!(
                 "received list fields job for an unknown index {index_uid}. it should never happen"
             ))
         })?;
+
         let leaf_search_request = LeafListFieldsRequest {
             index_id: index_meta.index_id.to_string(),
             index_uri: index_meta.index_uri.to_string(),
@@ -369,7 +372,9 @@ pub fn jobs_to_leaf_requests(
             split_offsets: job_group.into_iter().map(|job| job.offsets).collect(),
         };
         leaf_search_requests.push(leaf_search_request);
-    }
+        Ok(())
+    })?;
+
     Ok(leaf_search_requests)
 }
 
@@ -391,7 +396,7 @@ mod tests {
         assert!(!matches_any_pattern("field1", &["fi*eld".to_string()]));
         assert!(!matches_any_pattern("field1", &["field".to_string()]));
 
-        // 2.nd pattern matches
+        // 2nd pattern matches
         assert!(matches_any_pattern(
             "field",
             &["a".to_string(), "field".to_string()]

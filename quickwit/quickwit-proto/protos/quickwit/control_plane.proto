@@ -32,6 +32,7 @@ service ControlPlaneService {
 
   // The following RPCs are forwarded and handled by the metastore:
   // - `create_index`
+  // - `update_index`
   // - `delete_index`
   // - `add_source`
   // - `toggle_source`
@@ -41,6 +42,9 @@ service ControlPlaneService {
 
   // Creates a new index.
   rpc CreateIndex(quickwit.metastore.CreateIndexRequest) returns (quickwit.metastore.CreateIndexResponse);
+
+  // Updates an index.
+  rpc UpdateIndex(quickwit.metastore.UpdateIndexRequest) returns (quickwit.metastore.IndexMetadataResponse);
 
   // Deletes an index.
   rpc DeleteIndex(quickwit.metastore.DeleteIndexRequest) returns (quickwit.metastore.EmptyResponse);
@@ -65,8 +69,8 @@ service ControlPlaneService {
   // Asks the control plane whether the shards listed in the request should be deleted or truncated.
   rpc AdviseResetShards(AdviseResetShardsRequest) returns (AdviseResetShardsResponse);
 
-  // Return some innerstate of the control plane meant to assist debugging.
-  rpc GetDebugState(GetDebugStateRequest) returns (GetDebugStateResponse);
+  // Performs a debounced shard pruning request to the metastore.
+  rpc PruneShards(quickwit.metastore.PruneShardsRequest) returns (quickwit.metastore.EmptyResponse);
 }
 
 // Shard API
@@ -103,6 +107,7 @@ enum GetOrCreateOpenShardsFailureReason {
   GET_OR_CREATE_OPEN_SHARDS_FAILURE_REASON_UNSPECIFIED = 0;
   GET_OR_CREATE_OPEN_SHARDS_FAILURE_REASON_INDEX_NOT_FOUND = 1;
   GET_OR_CREATE_OPEN_SHARDS_FAILURE_REASON_SOURCE_NOT_FOUND = 2;
+  GET_OR_CREATE_OPEN_SHARDS_FAILURE_REASON_NO_INGESTERS_AVAILABLE = 3;
 }
 
 message GetOrCreateOpenShardsFailure {
@@ -110,24 +115,6 @@ message GetOrCreateOpenShardsFailure {
   string index_id = 2;
   string source_id = 3;
   GetOrCreateOpenShardsFailureReason reason = 4;
-}
-
-message GetDebugStateRequest {
-}
-
-message GetDebugStateResponse {
-  repeated ShardTableEntry shard_table = 1;
-  repeated PhysicalIndexingPlanEntry physical_index_plan = 2;
-}
-
-message ShardTableEntry {
-  string source_id = 1;
-  repeated quickwit.ingest.Shard shards = 2;
-}
-
-message PhysicalIndexingPlanEntry {
-  string node_id = 1;
-  repeated quickwit.indexing.IndexingTask tasks = 2;
 }
 
 message AdviseResetShardsRequest {

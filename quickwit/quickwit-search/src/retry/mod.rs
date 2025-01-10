@@ -55,7 +55,7 @@ impl<Request, Response, Error> RetryPolicy<Request, Response, Error> for Default
     }
 }
 
-impl<'a> Job for &'a str {
+impl Job for &str {
     fn split_id(&self) -> &str {
         self
     }
@@ -133,6 +133,7 @@ mod tests {
             split_footer_start: 0,
             timestamp_start: None,
             timestamp_end: None,
+            num_docs: 0,
         };
         let client_for_retry = retry_client(
             &search_job_placer,

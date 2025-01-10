@@ -18,10 +18,12 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::ops::Deref;
+use std::sync::OnceLock;
 use std::{env, fmt};
 
 use anyhow::ensure;
 use itertools::Itertools;
+use quickwit_common::get_bool_from_env;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, EnumMap};
 
@@ -33,12 +35,12 @@ pub enum StorageBackend {
     Azure,
     /// Local file system
     File,
+    /// Google Cloud Storage
+    Google,
     /// In-memory storage, for testing purposes
     Ram,
     /// Amazon S3 or S3-compatible storage
     S3,
-    /// Google Cloud Storage
-    Google,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -369,7 +371,14 @@ impl S3StorageConfig {
     }
 
     pub fn force_path_style_access(&self) -> Option<bool> {
-        Some(env::var("QW_S3_FORCE_PATH_STYLE_ACCESS").is_ok() || self.force_path_style_access)
+        static FORCE_PATH_STYLE: OnceLock<Option<bool>> = OnceLock::new();
+        *FORCE_PATH_STYLE.get_or_init(|| {
+            let force_path_style_access = get_bool_from_env(
+                "QW_S3_FORCE_PATH_STYLE_ACCESS",
+                self.force_path_style_access,
+            );
+            Some(force_path_style_access)
+        })
     }
 }
 

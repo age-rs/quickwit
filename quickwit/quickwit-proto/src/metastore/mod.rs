@@ -19,11 +19,13 @@
 
 use std::fmt;
 
+use quickwit_common::rate_limited_error;
 use quickwit_common::retry::Retryable;
+use quickwit_common::tower::MakeLoadShedError;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{IndexId, IndexUid, QueueId, ShardId, SourceId, SplitId};
-use crate::{ServiceError, ServiceErrorCode};
+use crate::types::{IndexId, IndexUid, QueueId, SourceId, SplitId};
+use crate::{GrpcServiceError, ServiceError, ServiceErrorCode};
 
 pub mod events;
 
@@ -33,6 +35,7 @@ pub type MetastoreResult<T> = Result<T, MetastoreError>;
 
 /// Lists the object types stored and managed by the metastore.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     /// A checkpoint delta.
     CheckpointDelta {
@@ -71,7 +74,7 @@ pub enum EntityKind {
     /// A set of splits.
     Splits {
         /// Split IDs.
-        split_ids: Vec<SplitId>,
+        split_ids: Vec<String>,
     },
     /// An index template.
     IndexTemplate {
@@ -141,11 +144,40 @@ pub enum MetastoreError {
         message: String,
     },
 
-    #[error("{0} do(es) not exist")]
+    #[error("{0} not found")]
     NotFound(EntityKind),
 
-    #[error("metastore unavailable: {0}")]
+    #[error("request timed out: {0}")]
+    Timeout(String),
+
+    #[error("too many requests")]
+    TooManyRequests,
+
+    #[error("service unavailable: {0}")]
     Unavailable(String),
+}
+
+impl MetastoreError {
+    /// Returns `true` if the transaction that emitted this error is "certainly abort".
+    /// Returns `false` if we cannot know whether the transaction was successful or not.
+    pub fn is_transaction_certainly_aborted(&self) -> bool {
+        match self {
+            MetastoreError::AlreadyExists(_)
+            | MetastoreError::FailedPrecondition { .. }
+            | MetastoreError::Forbidden { .. }
+            | MetastoreError::InvalidArgument { .. }
+            | MetastoreError::JsonDeserializeError { .. }
+            | MetastoreError::JsonSerializeError { .. }
+            | MetastoreError::NotFound(_)
+            | MetastoreError::TooManyRequests => true,
+            MetastoreError::Connection { .. }
+            | MetastoreError::Db { .. }
+            | MetastoreError::Internal { .. }
+            | MetastoreError::Io { .. }
+            | MetastoreError::Timeout { .. }
+            | MetastoreError::Unavailable(_) => false,
+        }
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -157,40 +189,88 @@ impl From<sqlx::Error> for MetastoreError {
     }
 }
 
-impl From<tonic::Status> for MetastoreError {
-    fn from(status: tonic::Status) -> Self {
-        serde_json::from_str(status.message()).unwrap_or_else(|_| MetastoreError::Internal {
-            message: "failed to deserialize metastore error".to_string(),
-            cause: status.message().to_string(),
-        })
-    }
-}
-
-impl From<MetastoreError> for tonic::Status {
-    fn from(metastore_error: MetastoreError) -> Self {
-        let grpc_status_code = metastore_error.error_code().to_grpc_status_code();
-        let message_json = serde_json::to_string(&metastore_error)
-            .unwrap_or_else(|_| format!("original metastore error: {metastore_error}"));
-        tonic::Status::new(grpc_status_code, message_json)
-    }
-}
-
 impl ServiceError for MetastoreError {
     fn error_code(&self) -> ServiceErrorCode {
         match self {
-            Self::AlreadyExists { .. } => ServiceErrorCode::AlreadyExists,
-            Self::Connection { .. } => ServiceErrorCode::Internal,
-            Self::Db { .. } => ServiceErrorCode::Internal,
+            Self::AlreadyExists(_) => ServiceErrorCode::AlreadyExists,
+            Self::Connection { message } => {
+                rate_limited_error!(
+                    limit_per_min = 6,
+                    "metastore/connection internal error: {message}"
+                );
+                ServiceErrorCode::Internal
+            }
+            Self::Db { message } => {
+                rate_limited_error!(limit_per_min = 6, "metastore/db internal error: {message}");
+                ServiceErrorCode::Internal
+            }
             Self::FailedPrecondition { .. } => ServiceErrorCode::BadRequest,
-            Self::Forbidden { .. } => ServiceErrorCode::MethodNotAllowed,
-            Self::Internal { .. } => ServiceErrorCode::Internal,
+            Self::Forbidden { .. } => ServiceErrorCode::Forbidden,
+            Self::Internal { message, cause } => {
+                rate_limited_error!(
+                    limit_per_min = 6,
+                    "metastore internal error: {message} cause: {cause}"
+                );
+                ServiceErrorCode::Internal
+            }
             Self::InvalidArgument { .. } => ServiceErrorCode::BadRequest,
-            Self::Io { .. } => ServiceErrorCode::Internal,
-            Self::JsonDeserializeError { .. } => ServiceErrorCode::Internal,
-            Self::JsonSerializeError { .. } => ServiceErrorCode::Internal,
-            Self::NotFound { .. } => ServiceErrorCode::NotFound,
+            Self::Io { message } => {
+                rate_limited_error!(limit_per_min = 6, "metastore/io internal error: {message}");
+                ServiceErrorCode::Internal
+            }
+            Self::JsonDeserializeError {
+                struct_name,
+                message,
+            } => {
+                rate_limited_error!(
+                    limit_per_min = 6,
+                    "metastore/jsondeser internal error: [{struct_name}] {message}"
+                );
+                ServiceErrorCode::Internal
+            }
+            Self::JsonSerializeError {
+                struct_name,
+                message,
+            } => {
+                rate_limited_error!(
+                    limit_per_min = 6,
+                    "metastore/jsonser internal error: [{struct_name}]  {message}"
+                );
+                ServiceErrorCode::Internal
+            }
+            Self::NotFound(_) => ServiceErrorCode::NotFound,
+            Self::Timeout(_) => ServiceErrorCode::Timeout,
+            Self::TooManyRequests => ServiceErrorCode::TooManyRequests,
             Self::Unavailable(_) => ServiceErrorCode::Unavailable,
         }
+    }
+}
+
+impl GrpcServiceError for MetastoreError {
+    fn new_internal(message: String) -> Self {
+        quickwit_common::rate_limited_error!(limit_per_min=6, message=%message.as_str(), "metastore error: internal");
+        Self::Internal {
+            message,
+            cause: "".to_string(),
+        }
+    }
+
+    fn new_timeout(message: String) -> Self {
+        quickwit_common::rate_limited_error!(limit_per_min=6, message=%message.as_str(), "metastore error: timeout");
+        Self::Timeout(message)
+    }
+
+    fn new_too_many_requests() -> Self {
+        quickwit_common::rate_limited_error!(
+            limit_per_min = 6,
+            "metastore error: too many requests"
+        );
+        Self::TooManyRequests
+    }
+
+    fn new_unavailable(message: String) -> Self {
+        quickwit_common::rate_limited_error!(limit_per_min=6, message=%message.as_str(), "metastore error: unavailable metastore");
+        Self::Unavailable(message)
     }
 }
 
@@ -198,11 +278,19 @@ impl Retryable for MetastoreError {
     fn is_retryable(&self) -> bool {
         matches!(
             self,
-            MetastoreError::Connection { .. }
-                | MetastoreError::Db { .. }
-                | MetastoreError::Io { .. }
-                | MetastoreError::Internal { .. }
+            Self::Connection { .. }
+                | Self::Db { .. }
+                | Self::Internal { .. }
+                | Self::Io { .. }
+                | Self::Timeout(_)
+                | Self::Unavailable(_)
         )
+    }
+}
+
+impl MakeLoadShedError for MetastoreError {
+    fn make_load_shed_error() -> Self {
+        MetastoreError::TooManyRequests
     }
 }
 
@@ -211,13 +299,14 @@ impl SourceType {
         match self {
             SourceType::Cli => "ingest-cli",
             SourceType::File => "file",
-            SourceType::GcpPubsub => "gcp_pubsub",
             SourceType::IngestV1 => "ingest-api",
             SourceType::IngestV2 => "ingest",
             SourceType::Kafka => "kafka",
             SourceType::Kinesis => "kinesis",
             SourceType::Nats => "nats",
+            SourceType::PubSub => "pubsub",
             SourceType::Pulsar => "pulsar",
+            SourceType::Stdin => "stdin",
             SourceType::Unspecified => "unspecified",
             SourceType::Vec => "vec",
             SourceType::Void => "void",
@@ -225,7 +314,34 @@ impl SourceType {
     }
 }
 
+impl fmt::Display for SourceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let source_type_str = match self {
+            SourceType::Cli => "CLI ingest",
+            SourceType::File => "file",
+            SourceType::IngestV1 => "ingest API v1",
+            SourceType::IngestV2 => "ingest API v2",
+            SourceType::Kafka => "Apache Kafka",
+            SourceType::Kinesis => "Amazon Kinesis",
+            SourceType::Nats => "NATS",
+            SourceType::PubSub => "Google Cloud Pub/Sub",
+            SourceType::Pulsar => "Apache Pulsar",
+            SourceType::Stdin => "Stdin",
+            SourceType::Unspecified => "unspecified",
+            SourceType::Vec => "vec",
+            SourceType::Void => "void",
+        };
+        write!(f, "{}", source_type_str)
+    }
+}
+
 impl IndexMetadataRequest {
+    pub fn into_index_id(self) -> Option<IndexId> {
+        self.index_uid
+            .map(|index_uid| index_uid.index_id)
+            .or(self.index_id)
+    }
+
     pub fn for_index_id(index_id: IndexId) -> Self {
         Self {
             index_uid: None,
@@ -237,21 +353,6 @@ impl IndexMetadataRequest {
         Self {
             index_uid: Some(index_uid),
             index_id: None,
-        }
-    }
-
-    /// Returns the index id either from the `index_id` or the `index_uid`.
-    /// If none of them is set, an error is returned.
-    pub fn get_index_id(&self) -> MetastoreResult<IndexId> {
-        if let Some(index_id) = &self.index_id {
-            Ok(index_id.to_string())
-        } else if let Some(index_uid) = &self.index_uid {
-            Ok(index_uid.index_id.to_string())
-        } else {
-            Err(MetastoreError::Internal {
-                message: "index_id or index_uid must be set".to_string(),
-                cause: "".to_string(),
-            })
         }
     }
 }
@@ -296,6 +397,19 @@ pub mod serde_utils {
         })
     }
 
+    pub fn from_json_zstd<T: DeserializeOwned>(value_bytes: &[u8]) -> MetastoreResult<T> {
+        let value_json = zstd::decode_all(value_bytes).map_err(|error| {
+            MetastoreError::JsonDeserializeError {
+                struct_name: std::any::type_name::<T>().to_string(),
+                message: error.to_string(),
+            }
+        })?;
+        serde_json::from_slice(&value_json).map_err(|error| MetastoreError::JsonDeserializeError {
+            struct_name: std::any::type_name::<T>().to_string(),
+            message: error.to_string(),
+        })
+    }
+
     pub fn from_json_str<'de, T: Deserialize<'de>>(value_str: &'de str) -> MetastoreResult<T> {
         serde_json::from_str(value_str).map_err(|error| MetastoreError::JsonDeserializeError {
             struct_name: std::any::type_name::<T>().to_string(),
@@ -324,6 +438,23 @@ pub mod serde_utils {
         })
     }
 
+    pub fn to_json_zstd<T: Serialize>(
+        value: &T,
+        compression_level: i32,
+    ) -> Result<Vec<u8>, MetastoreError> {
+        let value_json =
+            serde_json::to_vec(value).map_err(|error| MetastoreError::JsonSerializeError {
+                struct_name: std::any::type_name::<T>().to_string(),
+                message: error.to_string(),
+            })?;
+        zstd::encode_all(value_json.as_slice(), compression_level).map_err(|error| {
+            MetastoreError::JsonSerializeError {
+                struct_name: std::any::type_name::<T>().to_string(),
+                message: error.to_string(),
+            }
+        })
+    }
+
     pub fn to_json_bytes_pretty<T: Serialize>(value: &T) -> Result<Vec<u8>, MetastoreError> {
         serde_json::to_vec_pretty(value).map_err(|error| MetastoreError::JsonSerializeError {
             struct_name: std::any::type_name::<T>().to_string(),
@@ -337,13 +468,5 @@ impl ListIndexesMetadataRequest {
         ListIndexesMetadataRequest {
             index_id_patterns: vec!["*".to_string()],
         }
-    }
-}
-
-impl OpenShardsSubrequest {
-    pub fn shard_id(&self) -> &ShardId {
-        self.shard_id
-            .as_ref()
-            .expect("`shard_id` should be a required field")
     }
 }

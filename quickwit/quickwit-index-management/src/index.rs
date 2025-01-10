@@ -25,6 +25,7 @@ use futures_util::StreamExt;
 use itertools::Itertools;
 use quickwit_common::fs::{empty_dir, get_cache_directory_path};
 use quickwit_common::pretty::PrettySample;
+use quickwit_common::rate_limited_error;
 use quickwit_config::{validate_identifier, IndexConfig, SourceConfig};
 use quickwit_indexing::check_source_connectivity;
 use quickwit_metastore::{
@@ -70,13 +71,28 @@ pub enum IndexServiceError {
 impl ServiceError for IndexServiceError {
     fn error_code(&self) -> ServiceErrorCode {
         match self {
-            Self::Internal(_) => ServiceErrorCode::Internal,
+            Self::Internal(err_msg) => {
+                rate_limited_error!(limit_per_min = 6, err_msg);
+                ServiceErrorCode::Internal
+            }
             Self::InvalidConfig(_) => ServiceErrorCode::BadRequest,
             Self::InvalidIdentifier(_) => ServiceErrorCode::BadRequest,
             Self::Metastore(error) => error.error_code(),
-            Self::OperationNotAllowed(_) => ServiceErrorCode::MethodNotAllowed,
-            Self::SplitDeletion(_) => ServiceErrorCode::Internal,
-            Self::Storage(_) => ServiceErrorCode::Internal,
+            Self::OperationNotAllowed(_) => ServiceErrorCode::Forbidden,
+            Self::SplitDeletion(delete_splits_error) => {
+                rate_limited_error!(
+                    limit_per_min = 6,
+                    "index service internal error/split deletion: {delete_splits_error:?}"
+                );
+                ServiceErrorCode::Internal
+            }
+            Self::Storage(storage_error) => {
+                rate_limited_error!(
+                    limit_per_min = 6,
+                    "index service internal error/storage {storage_error:?}"
+                );
+                ServiceErrorCode::Internal
+            }
         }
     }
 }
@@ -125,7 +141,7 @@ impl IndexService {
                 }
             }
         }
-        let mut metastore = self.metastore.clone();
+        let metastore = self.metastore.clone();
 
         let index_config_json = serde_utils::to_json_str(&index_config)?;
 
@@ -253,11 +269,12 @@ impl IndexService {
             }
         }
 
-        let mut metastore = self.metastore.clone();
+        let metastore = self.metastore.clone();
         let indexes_metadata = metastore
             .list_indexes_metadata(list_indexes_metadatas_request)
             .await?
-            .deserialize_indexes_metadata()?;
+            .deserialize_indexes_metadata()
+            .await?;
 
         if !ignore_missing && indexes_metadata.len() != index_id_patterns.len() {
             let found_index_ids: HashSet<&str> = indexes_metadata
@@ -292,7 +309,7 @@ impl IndexService {
         }
         let mut delete_responses: HashMap<String, Vec<SplitInfo>> = HashMap::new();
         let mut delete_errors: HashMap<String, IndexServiceError> = HashMap::new();
-        let mut stream = futures::stream::iter(delete_index_tasks).buffer_unordered(100);
+        let mut stream = futures::stream::iter(delete_index_tasks).buffer_unordered(5);
         while let Some((index_id, delete_response)) = stream.next().await {
             match delete_response {
                 Ok(split_infos) => {
@@ -348,14 +365,14 @@ impl IndexService {
             .await?;
 
         let deleted_entries = run_garbage_collect(
-            index_uid,
-            storage,
+            [(index_uid, storage)].into_iter().collect(),
             self.metastore.clone(),
             grace_period,
             // deletion_grace_period of zero, so that a cli call directly deletes splits after
             // marking to be deleted.
             Duration::ZERO,
             dry_run,
+            None,
             None,
         )
         .await?;
@@ -524,7 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_index() {
-        let mut metastore = metastore_for_test();
+        let metastore = metastore_for_test();
         let storage_resolver = StorageResolver::for_test();
         let mut index_service = IndexService::new(metastore.clone(), storage_resolver);
         let index_id = "test-index";

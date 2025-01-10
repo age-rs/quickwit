@@ -17,27 +17,34 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+mod change_tracker;
 mod scheduling;
 
 use std::cmp::Ordering;
 use std::fmt;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fnv::{FnvHashMap, FnvHashSet};
 use itertools::Itertools;
+use once_cell::sync::OnceCell;
+use quickwit_common::pretty::PrettySample;
+use quickwit_config::{FileSourceParams, SourceParams};
 use quickwit_proto::indexing::{
     ApplyIndexingPlanRequest, CpuCapacity, IndexingService, IndexingTask, PIPELINE_FULL_CAPACITY,
+    PIPELINE_THROUGHPUT,
 };
-use quickwit_proto::metastore::SourceType;
-use quickwit_proto::types::{NodeId, ShardId};
+use quickwit_proto::types::NodeId;
 use scheduling::{SourceToSchedule, SourceToScheduleType};
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::indexing_plan::PhysicalIndexingPlan;
+use crate::indexing_scheduler::change_tracker::{NotifyChangeOnDrop, RebuildNotifier};
 use crate::indexing_scheduler::scheduling::build_physical_indexing_plan;
-use crate::model::ControlPlaneModel;
+use crate::metrics::ShardLocalityMetrics;
+use crate::model::{ControlPlaneModel, ShardEntry, ShardLocations};
 use crate::{IndexerNodeInfo, IndexerPool};
 
 pub(crate) const MIN_DURATION_BETWEEN_SCHEDULING: Duration =
@@ -56,7 +63,7 @@ pub struct IndexingSchedulerState {
     pub last_applied_plan_timestamp: Option<Instant>,
 }
 
-/// The [`IndexingScheduler`] is responsible for listing indexing tasks and assiging them to
+/// The [`IndexingScheduler`] is responsible for listing indexing tasks and assigning them to
 /// indexers.
 /// We call this duty `scheduling`. Contrary to what the name suggests, most indexing tasks are
 /// ever running. We just borrowed the terminology to Kubernetes.
@@ -100,6 +107,7 @@ pub struct IndexingScheduler {
     self_node_id: NodeId,
     indexer_pool: IndexerPool,
     state: IndexingSchedulerState,
+    pub(crate) next_rebuild_tracker: RebuildNotifier,
 }
 
 impl fmt::Debug for IndexingScheduler {
@@ -115,6 +123,44 @@ impl fmt::Debug for IndexingScheduler {
     }
 }
 
+fn enable_variable_shard_load() -> bool {
+    static IS_SHARD_LOAD_CP_ENABLED: OnceCell<bool> = OnceCell::new();
+    *IS_SHARD_LOAD_CP_ENABLED.get_or_init(|| {
+        !quickwit_common::get_bool_from_env("QW_DISABLE_VARIABLE_SHARD_LOAD", false)
+    })
+}
+
+/// Computes the CPU load associated to a single shard of a given index.
+///
+/// The array passed contains all of data we have about the shard of the index.
+/// This function averages their statistics.
+///
+/// For the moment, this function only takes in account the measured throughput,
+/// and assumes a constant CPU usage of 4 vCPU = 20mb/s.
+///
+/// It does not take in account the variation that could raise from the different
+/// doc mapping / nature of the data, etc.
+fn compute_load_per_shard(shard_entries: &[&ShardEntry]) -> NonZeroU32 {
+    if enable_variable_shard_load() {
+        let num_shards = shard_entries.len().max(1) as u64;
+        let average_throughput_per_shard_bytes: u64 = shard_entries
+            .iter()
+            .map(|shard_entry| shard_entry.long_term_ingestion_rate.0 as u64 * bytesize::MIB)
+            .sum::<u64>()
+            .div_ceil(num_shards)
+            // A shard throughput cannot exceed PIPELINE_THROUGHPUT in the long term (this is
+            // enforced by the configuration).
+            .min(PIPELINE_THROUGHPUT.as_u64());
+        let num_cpu_millis = (PIPELINE_FULL_CAPACITY.cpu_millis() as u64
+            * average_throughput_per_shard_bytes)
+            / PIPELINE_THROUGHPUT.as_u64();
+        const MIN_CPU_LOAD_PER_SHARD: u32 = 50u32;
+        NonZeroU32::new((num_cpu_millis as u32).max(MIN_CPU_LOAD_PER_SHARD)).unwrap()
+    } else {
+        NonZeroU32::new(PIPELINE_FULL_CAPACITY.cpu_millis() / 4).unwrap()
+    }
+}
+
 fn get_sources_to_schedule(model: &ControlPlaneModel) -> Vec<SourceToSchedule> {
     let mut sources = Vec::new();
 
@@ -122,57 +168,66 @@ fn get_sources_to_schedule(model: &ControlPlaneModel) -> Vec<SourceToSchedule> {
         if !source_config.enabled {
             continue;
         }
-        match source_config.source_type() {
-            SourceType::Cli
-            | SourceType::File
-            | SourceType::Vec
-            | SourceType::Void
-            | SourceType::Unspecified => {
-                // We don't need to schedule those.
+        let params_fingerprint = model
+            .index_metadata(&source_uid.index_uid)
+            .map(|index_meta| index_meta.index_config.indexing_params_fingerprint())
+            .unwrap_or_default();
+        match source_config.source_params {
+            SourceParams::File(FileSourceParams::Filepath(_))
+            | SourceParams::IngestCli
+            | SourceParams::Stdin
+            | SourceParams::Void(_)
+            | SourceParams::Vec(_) => { // We don't need to schedule those.
             }
-            SourceType::IngestV1 => {
+
+            SourceParams::IngestApi => {
                 // TODO ingest v1 is scheduled differently
                 sources.push(SourceToSchedule {
                     source_uid,
                     source_type: SourceToScheduleType::IngestV1,
+                    params_fingerprint,
                 });
             }
-            SourceType::IngestV2 => {
+            SourceParams::Ingest => {
                 // Expect: the source should exist since we just read it from `get_source_configs`.
                 // Note that we keep all shards, including Closed shards:
                 // A closed shards still needs to be indexed.
-                let shard_ids: Vec<ShardId> = model
+                let shard_entries: Vec<&ShardEntry> = model
                     .get_shards_for_source(&source_uid)
                     .expect("source should exist")
-                    .keys()
-                    .cloned()
+                    .values()
                     .collect();
-                if shard_ids.is_empty() {
+                if shard_entries.is_empty() {
                     continue;
                 }
+                let shard_ids = shard_entries
+                    .iter()
+                    .map(|shard_entry| shard_entry.shard_id().clone())
+                    .collect();
+                let load_per_shard = compute_load_per_shard(&shard_entries[..]);
                 sources.push(SourceToSchedule {
                     source_uid,
                     source_type: SourceToScheduleType::Sharded {
                         shard_ids,
-                        // FIXME
-                        load_per_shard: NonZeroU32::new(PIPELINE_FULL_CAPACITY.cpu_millis() / 4)
-                            .unwrap(),
+                        load_per_shard,
                     },
+                    params_fingerprint,
                 });
             }
-            SourceType::Kafka
-            | SourceType::Kinesis
-            | SourceType::GcpPubsub
-            | SourceType::Nats
-            | SourceType::Pulsar => {
+            SourceParams::Kafka(_)
+            | SourceParams::Kinesis(_)
+            | SourceParams::PubSub(_)
+            | SourceParams::Pulsar(_)
+            | SourceParams::File(FileSourceParams::Notifications(_)) => {
                 sources.push(SourceToSchedule {
                     source_uid,
                     source_type: SourceToScheduleType::NonSharded {
-                        num_pipelines: source_config.desired_num_pipelines.get() as u32,
+                        num_pipelines: source_config.num_pipelines.get() as u32,
                         // FIXME
                         load_per_pipeline: NonZeroU32::new(PIPELINE_FULL_CAPACITY.cpu_millis())
                             .unwrap(),
                     },
+                    params_fingerprint,
                 });
             }
         }
@@ -187,6 +242,7 @@ impl IndexingScheduler {
             self_node_id,
             indexer_pool,
             state: IndexingSchedulerState::default(),
+            next_rebuild_tracker: RebuildNotifier::default(),
         }
     }
 
@@ -201,6 +257,8 @@ impl IndexingScheduler {
     // `ControlPlane::rebuild_indexing_plan_debounced`.
     pub(crate) fn rebuild_plan(&mut self, model: &ControlPlaneModel) {
         crate::metrics::CONTROL_PLANE_METRICS.schedule_total.inc();
+
+        let notify_on_drop = self.next_rebuild_tracker.start_rebuild();
 
         let sources = get_sources_to_schedule(model);
 
@@ -224,11 +282,16 @@ impl IndexingScheduler {
             return;
         };
 
+        let shard_locations = model.shard_locations();
         let new_physical_plan = build_physical_indexing_plan(
             &sources,
             &indexer_id_to_cpu_capacities,
             self.state.last_applied_physical_plan.as_ref(),
+            &shard_locations,
         );
+        let shard_locality_metrics =
+            get_shard_locality_metrics(&new_physical_plan, &shard_locations);
+        crate::metrics::CONTROL_PLANE_METRICS.set_shard_locality_metrics(shard_locality_metrics);
         if let Some(last_applied_plan) = &self.state.last_applied_physical_plan {
             let plans_diff = get_indexing_plans_diff(
                 last_applied_plan.indexing_tasks_per_indexer(),
@@ -239,7 +302,7 @@ impl IndexingScheduler {
                 return;
             }
         }
-        self.apply_physical_indexing_plan(&indexers, new_physical_plan);
+        self.apply_physical_indexing_plan(&indexers, new_physical_plan, Some(notify_on_drop));
         self.state.num_schedule_indexing_plan += 1;
     }
 
@@ -249,7 +312,7 @@ impl IndexingScheduler {
     /// - If indexing tasks differ, apply again the last plan.
     pub(crate) fn control_running_plan(&mut self, model: &ControlPlaneModel) {
         let last_applied_plan =
-            if let Some(last_applied_plan) = self.state.last_applied_physical_plan.as_ref() {
+            if let Some(last_applied_plan) = &self.state.last_applied_physical_plan {
                 last_applied_plan
             } else {
                 // If there is no plan, the node is probably starting and the scheduler did not find
@@ -258,7 +321,6 @@ impl IndexingScheduler {
                 self.rebuild_plan(model);
                 return;
             };
-
         if let Some(last_applied_plan_timestamp) = self.state.last_applied_plan_timestamp {
             if Instant::now().duration_since(last_applied_plan_timestamp)
                 < MIN_DURATION_BETWEEN_SCHEDULING
@@ -266,7 +328,6 @@ impl IndexingScheduler {
                 return;
             }
         }
-
         let indexers: Vec<IndexerNodeInfo> = self.get_indexers_from_indexer_pool();
         let running_indexing_tasks_by_node_id: FnvHashMap<String, Vec<IndexingTask>> = indexers
             .iter()
@@ -283,7 +344,7 @@ impl IndexingScheduler {
         } else if !indexing_plans_diff.has_same_tasks() {
             // Some nodes may have not received their tasks, apply it again.
             info!(plans_diff=?indexing_plans_diff, "running tasks and last applied tasks differ: reapply last plan");
-            self.apply_physical_indexing_plan(&indexers, last_applied_plan.clone());
+            self.apply_physical_indexing_plan(&indexers, last_applied_plan.clone(), None);
         }
     }
 
@@ -295,12 +356,15 @@ impl IndexingScheduler {
         &mut self,
         indexers: &[IndexerNodeInfo],
         new_physical_plan: PhysicalIndexingPlan,
+        notify_on_drop: Option<Arc<NotifyChangeOnDrop>>,
     ) {
         debug!(new_physical_plan=?new_physical_plan, "apply physical indexing plan");
+        crate::metrics::CONTROL_PLANE_METRICS.apply_total.inc();
         for (node_id, indexing_tasks) in new_physical_plan.indexing_tasks_per_indexer() {
             // We don't want to block on a slow indexer so we apply this change asynchronously
             // TODO not blocking is cool, but we need to make sure there is not accumulation
             // possible here.
+            let notify_on_drop = notify_on_drop.clone();
             tokio::spawn({
                 let indexer = indexers
                     .iter()
@@ -322,6 +386,7 @@ impl IndexingScheduler {
                             "failed to apply indexing plan to indexer"
                         );
                     }
+                    drop(notify_on_drop);
                 }
             });
         }
@@ -338,7 +403,7 @@ struct IndexingPlansDiff<'a> {
     pub unplanned_tasks_by_node_id: FnvHashMap<&'a str, Vec<&'a IndexingTask>>,
 }
 
-impl<'a> IndexingPlansDiff<'a> {
+impl IndexingPlansDiff<'_> {
     pub fn has_same_nodes(&self) -> bool {
         self.missing_node_ids.is_empty() && self.unplanned_node_ids.is_empty()
     }
@@ -362,41 +427,142 @@ impl<'a> IndexingPlansDiff<'a> {
     }
 }
 
-impl<'a> fmt::Debug for IndexingPlansDiff<'a> {
+fn get_shard_locality_metrics(
+    physical_plan: &PhysicalIndexingPlan,
+    shard_locations: &ShardLocations,
+) -> ShardLocalityMetrics {
+    let mut num_local_shards = 0;
+    let mut num_remote_shards = 0;
+    for (indexer, tasks) in physical_plan.indexing_tasks_per_indexer() {
+        for task in tasks {
+            for shard_id in &task.shard_ids {
+                if shard_locations
+                    .get_shard_locations(shard_id)
+                    .iter()
+                    .any(|node| node.as_str() == indexer)
+                {
+                    num_local_shards += 1;
+                } else {
+                    num_remote_shards += 1;
+                }
+            }
+        }
+    }
+    ShardLocalityMetrics {
+        num_remote_shards,
+        num_local_shards,
+    }
+}
+
+impl fmt::Debug for IndexingPlansDiff<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         if self.has_same_nodes() && self.has_same_tasks() {
-            return write!(formatter, "EmptyIndexingPlanDiff");
+            return write!(formatter, "EmptyIndexingPlansDiff");
         }
-        write!(formatter, "IndexingPlanDiff(")?;
+        write!(formatter, "IndexingPlansDiff(")?;
         let mut separator = "";
         if !self.missing_node_ids.is_empty() {
-            write!(formatter, "missing_node_ids={:?}, ", self.missing_node_ids)?;
+            write!(
+                formatter,
+                "missing_node_ids={:?}",
+                PrettySample::new(&self.missing_node_ids, 10)
+            )?;
             separator = ", "
         }
         if !self.unplanned_node_ids.is_empty() {
             write!(
                 formatter,
                 "{separator}unplanned_node_ids={:?}",
-                self.unplanned_node_ids
+                PrettySample::new(&self.unplanned_node_ids, 10)
             )?;
             separator = ", "
         }
         if !self.missing_tasks_by_node_id.is_empty() {
-            write!(
-                formatter,
-                "{separator}missing_tasks_by_node_id={:?}, ",
-                self.missing_tasks_by_node_id
-            )?;
+            write!(formatter, "{separator}missing_tasks_by_node_id=",)?;
+            format_indexing_task_map(formatter, &self.missing_tasks_by_node_id)?;
             separator = ", "
         }
         if !self.unplanned_tasks_by_node_id.is_empty() {
-            write!(
-                formatter,
-                "{separator}unplanned_tasks_by_node_id={:?}",
-                self.unplanned_tasks_by_node_id
-            )?;
+            write!(formatter, "{separator}unplanned_tasks_by_node_id=",)?;
+            format_indexing_task_map(formatter, &self.unplanned_tasks_by_node_id)?;
         }
         write!(formatter, ")")
+    }
+}
+
+fn format_indexing_task_map(
+    formatter: &mut std::fmt::Formatter,
+    indexing_tasks: &FnvHashMap<&str, Vec<&IndexingTask>>,
+) -> std::fmt::Result {
+    // we show at most 5 nodes, and aggregate the results for the other.
+    // we show at most 10 indexes, but aggregate results after.
+    // we always aggregate shard ids
+    // we hide pipeline id and incarnation id, they are not very useful in most case, but take a
+    // lot of place
+    const MAX_NODE: usize = 5;
+    const MAX_INDEXES: usize = 10;
+    let mut index_displayed = 0;
+    write!(formatter, "{{")?;
+    let mut indexer_iter = indexing_tasks.iter().enumerate();
+    for (i, (index_name, tasks)) in &mut indexer_iter {
+        if i != 0 {
+            write!(formatter, ", ")?;
+        }
+        if index_displayed != MAX_INDEXES - 1 {
+            write!(formatter, "{index_name:?}: [")?;
+            let mut tasks_iter = tasks.iter().enumerate();
+            for (i, task) in &mut tasks_iter {
+                if i != 0 {
+                    write!(formatter, ", ")?;
+                }
+                write!(
+                    formatter,
+                    r#"(index_id: "{}", source_id: "{}", shard_count: {})"#,
+                    task.index_uid.as_ref().unwrap().index_id,
+                    task.source_id,
+                    task.shard_ids.len()
+                )?;
+                index_displayed += 1;
+                if index_displayed == MAX_INDEXES - 1 {
+                    let (task_count, shard_count) = tasks_iter.fold((0, 0), |(t, s), (_, task)| {
+                        (t + 1, s + task.shard_ids.len())
+                    });
+                    if task_count > 0 {
+                        write!(
+                            formatter,
+                            " and {task_count} tasks and {shard_count} shards"
+                        )?;
+                    }
+                    break;
+                }
+            }
+            write!(formatter, "]")?;
+        } else {
+            write!(
+                formatter,
+                "{index_name:?}: [with {} tasks and {} shards]",
+                tasks.len(),
+                tasks.iter().map(|task| task.shard_ids.len()).sum::<usize>()
+            )?;
+        }
+        if i == MAX_NODE - 1 {
+            break;
+        }
+    }
+    let (indexer, tasks, shards) = indexer_iter.fold((0, 0, 0), |(i, t, s), (_, (_, task))| {
+        (
+            i + 1,
+            t + task.len(),
+            s + task.iter().map(|task| task.shard_ids.len()).sum::<usize>(),
+        )
+    });
+    if indexer > 0 {
+        write!(
+            formatter,
+            " and {indexer} more indexers, handling {tasks} tasks and {shards} shards}}"
+        )
+    } else {
+        write!(formatter, "}}")
     }
 }
 
@@ -460,13 +626,13 @@ fn get_indexing_tasks_diff<'a>(
     let mut unplanned_tasks: Vec<&IndexingTask> = Vec::new();
     let grouped_running_tasks: FnvHashMap<&IndexingTask, usize> = running_tasks
         .iter()
-        .group_by(|&task| task)
+        .chunk_by(|&task| task)
         .into_iter()
         .map(|(key, group)| (key, group.count()))
         .collect();
     let grouped_last_applied_tasks: FnvHashMap<&IndexingTask, usize> = last_applied_tasks
         .iter()
-        .group_by(|&task| task)
+        .chunk_by(|&task| task)
         .into_iter()
         .map(|(key, group)| (key, group.count()))
         .collect();
@@ -499,9 +665,10 @@ mod tests {
     use proptest::{prop_compose, proptest};
     use quickwit_config::{IndexConfig, KafkaSourceParams, SourceConfig, SourceParams};
     use quickwit_metastore::IndexMetadata;
-    use quickwit_proto::types::{IndexUid, PipelineUid, SourceUid};
+    use quickwit_proto::types::{IndexUid, PipelineUid, ShardId, SourceUid};
 
     use super::*;
+    use crate::model::ShardLocations;
     #[test]
     fn test_indexing_plans_diff() {
         let index_uid = IndexUid::from_str("index-1:11111111111111111111111111").unwrap();
@@ -516,22 +683,25 @@ mod tests {
             let mut running_plan = FnvHashMap::default();
             let mut desired_plan = FnvHashMap::default();
             let task_1 = IndexingTask {
-                pipeline_uid: Some(PipelineUid::from_u128(10u128)),
+                pipeline_uid: Some(PipelineUid::for_test(10u128)),
                 index_uid: Some(index_uid.clone()),
                 source_id: "source-1".to_string(),
                 shard_ids: Vec::new(),
+                params_fingerprint: 0,
             };
             let task_1b = IndexingTask {
-                pipeline_uid: Some(PipelineUid::from_u128(11u128)),
+                pipeline_uid: Some(PipelineUid::for_test(11u128)),
                 index_uid: Some(index_uid.clone()),
                 source_id: "source-1".to_string(),
                 shard_ids: Vec::new(),
+                params_fingerprint: 0,
             };
             let task_2 = IndexingTask {
-                pipeline_uid: Some(PipelineUid::from_u128(20u128)),
+                pipeline_uid: Some(PipelineUid::for_test(20u128)),
                 index_uid: Some(index_uid.clone()),
                 source_id: "source-2".to_string(),
                 shard_ids: Vec::new(),
+                params_fingerprint: 0,
             };
             running_plan.insert(
                 "indexer-1".to_string(),
@@ -548,16 +718,18 @@ mod tests {
             let mut running_plan = FnvHashMap::default();
             let mut desired_plan = FnvHashMap::default();
             let task_1 = IndexingTask {
-                pipeline_uid: Some(PipelineUid::from_u128(1u128)),
+                pipeline_uid: Some(PipelineUid::for_test(1u128)),
                 index_uid: Some(index_uid.clone()),
                 source_id: "source-1".to_string(),
                 shard_ids: Vec::new(),
+                params_fingerprint: 0,
             };
             let task_2 = IndexingTask {
-                pipeline_uid: Some(PipelineUid::from_u128(2u128)),
+                pipeline_uid: Some(PipelineUid::for_test(2u128)),
                 index_uid: Some(index_uid.clone()),
                 source_id: "source-2".to_string(),
                 shard_ids: Vec::new(),
+                params_fingerprint: 0,
             };
             running_plan.insert("indexer-1".to_string(), vec![task_1.clone()]);
             desired_plan.insert("indexer-1".to_string(), vec![task_2.clone()]);
@@ -580,16 +752,18 @@ mod tests {
             let mut running_plan = FnvHashMap::default();
             let mut desired_plan = FnvHashMap::default();
             let task_1 = IndexingTask {
-                pipeline_uid: Some(PipelineUid::from_u128(1u128)),
+                pipeline_uid: Some(PipelineUid::for_test(1u128)),
                 index_uid: Some(index_uid.clone()),
                 source_id: "source-1".to_string(),
                 shard_ids: Vec::new(),
+                params_fingerprint: 0,
             };
             let task_2 = IndexingTask {
-                pipeline_uid: Some(PipelineUid::from_u128(2u128)),
+                pipeline_uid: Some(PipelineUid::for_test(2u128)),
                 index_uid: Some(index_uid2.clone()),
                 source_id: "source-2".to_string(),
                 shard_ids: Vec::new(),
+                params_fingerprint: 0,
             };
             running_plan.insert("indexer-2".to_string(), vec![task_2.clone()]);
             desired_plan.insert("indexer-1".to_string(), vec![task_1.clone()]);
@@ -620,22 +794,25 @@ mod tests {
             let mut running_plan = FnvHashMap::default();
             let mut desired_plan = FnvHashMap::default();
             let task_1a = IndexingTask {
-                pipeline_uid: Some(PipelineUid::from_u128(10u128)),
+                pipeline_uid: Some(PipelineUid::for_test(10u128)),
                 index_uid: Some(index_uid.clone()),
                 source_id: "source-1".to_string(),
                 shard_ids: Vec::new(),
+                params_fingerprint: 0,
             };
             let task_1b = IndexingTask {
-                pipeline_uid: Some(PipelineUid::from_u128(11u128)),
+                pipeline_uid: Some(PipelineUid::for_test(11u128)),
                 index_uid: Some(index_uid.clone()),
                 source_id: "source-1".to_string(),
                 shard_ids: Vec::new(),
+                params_fingerprint: 0,
             };
             let task_1c = IndexingTask {
-                pipeline_uid: Some(PipelineUid::from_u128(12u128)),
+                pipeline_uid: Some(PipelineUid::for_test(12u128)),
                 index_uid: Some(index_uid.clone()),
                 source_id: "source-1".to_string(),
                 shard_ids: Vec::new(),
+                params_fingerprint: 0,
             };
             running_plan.insert("indexer-1".to_string(), vec![task_1a.clone()]);
             desired_plan.insert(
@@ -671,8 +848,7 @@ mod tests {
                 &index_uid,
                 SourceConfig {
                     source_id: "source_disabled".to_string(),
-                    max_num_pipelines_per_indexer: NonZeroUsize::new(3).unwrap(),
-                    desired_num_pipelines: NonZeroUsize::new(3).unwrap(),
+                    num_pipelines: NonZeroUsize::new(3).unwrap(),
                     enabled: false,
                     source_params: SourceParams::Kafka(kafka_source_params.clone()),
                     transform_config: None,
@@ -685,8 +861,7 @@ mod tests {
                 &index_uid,
                 SourceConfig {
                     source_id: "source_enabled".to_string(),
-                    max_num_pipelines_per_indexer: NonZeroUsize::new(2).unwrap(),
-                    desired_num_pipelines: NonZeroUsize::new(2).unwrap(),
+                    num_pipelines: NonZeroUsize::new(2).unwrap(),
                     enabled: true,
                     source_params: SourceParams::Kafka(kafka_source_params.clone()),
                     transform_config: None,
@@ -699,8 +874,7 @@ mod tests {
                 &index_uid,
                 SourceConfig {
                     source_id: "ingest_v1".to_string(),
-                    max_num_pipelines_per_indexer: NonZeroUsize::new(2).unwrap(),
-                    desired_num_pipelines: NonZeroUsize::new(2).unwrap(),
+                    num_pipelines: NonZeroUsize::new(2).unwrap(),
                     enabled: true,
                     // ingest v1
                     source_params: SourceParams::IngestApi,
@@ -714,8 +888,7 @@ mod tests {
                 &index_uid,
                 SourceConfig {
                     source_id: "ingest_v2".to_string(),
-                    max_num_pipelines_per_indexer: NonZeroUsize::new(2).unwrap(),
-                    desired_num_pipelines: NonZeroUsize::new(2).unwrap(),
+                    num_pipelines: NonZeroUsize::new(2).unwrap(),
                     enabled: true,
                     // ingest v2
                     source_params: SourceParams::Ingest,
@@ -730,8 +903,7 @@ mod tests {
                 &index_uid,
                 SourceConfig {
                     source_id: "ingest_v2_without_shard".to_string(),
-                    max_num_pipelines_per_indexer: NonZeroUsize::new(2).unwrap(),
-                    desired_num_pipelines: NonZeroUsize::new(2).unwrap(),
+                    num_pipelines: NonZeroUsize::new(2).unwrap(),
                     enabled: true,
                     // ingest v2
                     source_params: SourceParams::Ingest,
@@ -745,8 +917,7 @@ mod tests {
                 &index_uid,
                 SourceConfig {
                     source_id: "ingest_cli".to_string(),
-                    max_num_pipelines_per_indexer: NonZeroUsize::new(2).unwrap(),
-                    desired_num_pipelines: NonZeroUsize::new(2).unwrap(),
+                    num_pipelines: NonZeroUsize::new(2).unwrap(),
                     enabled: true,
                     // ingest v1
                     source_params: SourceParams::IngestCli,
@@ -770,11 +941,11 @@ mod tests {
     #[test]
     fn test_build_physical_indexing_plan_simple() {
         let source_1 = SourceUid {
-            index_uid: IndexUid::from_parts("index-1", 0),
+            index_uid: IndexUid::for_test("index-1", 0),
             source_id: "source1".to_string(),
         };
         let source_2 = SourceUid {
-            index_uid: IndexUid::from_parts("index-2", 0),
+            index_uid: IndexUid::for_test("index-2", 0),
             source_id: "source2".to_string(),
         };
         let sources = vec![
@@ -784,6 +955,7 @@ mod tests {
                     num_pipelines: 3,
                     load_per_pipeline: NonZeroU32::new(1_000).unwrap(),
                 },
+                params_fingerprint: 0,
             },
             SourceToSchedule {
                 source_uid: source_2.clone(),
@@ -791,17 +963,65 @@ mod tests {
                     num_pipelines: 2,
                     load_per_pipeline: NonZeroU32::new(1_000).unwrap(),
                 },
+                params_fingerprint: 0,
             },
         ];
         let mut indexer_max_loads = FnvHashMap::default();
         indexer_max_loads.insert("indexer1".to_string(), mcpu(3_000));
         indexer_max_loads.insert("indexer2".to_string(), mcpu(3_000));
-        let physical_plan = build_physical_indexing_plan(&sources[..], &indexer_max_loads, None);
+        let shard_locations = ShardLocations::default();
+        let physical_plan =
+            build_physical_indexing_plan(&sources[..], &indexer_max_loads, None, &shard_locations);
         assert_eq!(physical_plan.indexing_tasks_per_indexer().len(), 2);
         let indexing_tasks_1 = physical_plan.indexer("indexer1").unwrap();
         assert_eq!(indexing_tasks_1.len(), 2);
         let indexer_2_tasks = physical_plan.indexer("indexer2").unwrap();
         assert_eq!(indexer_2_tasks.len(), 3);
+    }
+
+    #[test]
+    fn test_debug_indexing_task_map() {
+        let mut map = FnvHashMap::default();
+        let task1 = IndexingTask {
+            index_uid: Some(IndexUid::for_test("index1", 123)),
+            source_id: "my-source".to_string(),
+            pipeline_uid: Some(PipelineUid::random()),
+            shard_ids: vec!["shard1".into()],
+            params_fingerprint: 0,
+        };
+        let task2 = IndexingTask {
+            index_uid: Some(IndexUid::for_test("index2", 123)),
+            source_id: "my-source".to_string(),
+            pipeline_uid: Some(PipelineUid::random()),
+            shard_ids: vec!["shard2".into(), "shard3".into()],
+            params_fingerprint: 0,
+        };
+        let task3 = IndexingTask {
+            index_uid: Some(IndexUid::for_test("index3", 123)),
+            source_id: "my-source".to_string(),
+            pipeline_uid: Some(PipelineUid::random()),
+            shard_ids: vec!["shard6".into()],
+            params_fingerprint: 0,
+        };
+        // order made to map with the debug for lisibility
+        map.insert("indexer5", vec![&task2]);
+        map.insert("indexer4", vec![&task1]);
+        map.insert("indexer3", vec![&task1, &task3]);
+        map.insert("indexer2", vec![&task2, &task3, &task1, &task2]);
+        map.insert("indexer1", vec![&task1, &task2, &task3, &task1]);
+        map.insert("indexer6", vec![&task1, &task2, &task3]);
+        let plan = IndexingPlansDiff {
+            missing_node_ids: FnvHashSet::default(),
+            unplanned_node_ids: FnvHashSet::default(),
+            missing_tasks_by_node_id: map,
+            unplanned_tasks_by_node_id: FnvHashMap::default(),
+        };
+
+        let debug = format!("{plan:?}");
+        assert_eq!(
+            debug,
+            r#"IndexingPlansDiff(missing_tasks_by_node_id={"indexer5": [(index_id: "index2", source_id: "my-source", shard_count: 2)], "indexer4": [(index_id: "index1", source_id: "my-source", shard_count: 1)], "indexer3": [(index_id: "index1", source_id: "my-source", shard_count: 1), (index_id: "index3", source_id: "my-source", shard_count: 1)], "indexer2": [(index_id: "index2", source_id: "my-source", shard_count: 2), (index_id: "index3", source_id: "my-source", shard_count: 1), (index_id: "index1", source_id: "my-source", shard_count: 1), (index_id: "index2", source_id: "my-source", shard_count: 2)], "indexer1": [(index_id: "index1", source_id: "my-source", shard_count: 1) and 3 tasks and 4 shards] and 1 more indexers, handling 3 tasks and 4 shards})"#
+        );
     }
 
     proptest! {
@@ -826,7 +1046,8 @@ mod tests {
                 let indexer_id = format!("indexer-{i}");
                 indexer_max_loads.insert(indexer_id, mcpu(4_000));
             }
-            let _physical_indexing_plan = build_physical_indexing_plan(&sources, &indexer_max_loads, None);
+            let shard_locations = ShardLocations::default();
+            let _physical_indexing_plan = build_physical_indexing_plan(&sources, &indexer_max_loads, None, &shard_locations);
         }
     }
 
@@ -847,13 +1068,12 @@ mod tests {
 
     prop_compose! {
       fn gen_kafka_source()
-        (index_idx in 0usize..100usize, desired_num_pipelines in 1usize..51usize, max_num_pipelines_per_indexer in 1usize..5usize) -> (IndexUid, SourceConfig) {
-          let index_uid = IndexUid::from_parts(&format!("index-id-{index_idx}"), 0 /* this is the index uid */);
+        (index_idx in 0usize..100usize, num_pipelines in 1usize..51usize) -> (IndexUid, SourceConfig) {
+          let index_uid = IndexUid::for_test(&format!("index-id-{index_idx}"), 0 /* this is the index uid */);
           let source_id = quickwit_common::rand::append_random_suffix("kafka-source");
           (index_uid, SourceConfig {
               source_id,
-              desired_num_pipelines: NonZeroUsize::new(desired_num_pipelines).unwrap(),
-              max_num_pipelines_per_indexer: NonZeroUsize::new(max_num_pipelines_per_indexer).unwrap(),
+              num_pipelines: NonZeroUsize::new(num_pipelines).unwrap(),
               enabled: true,
               source_params: kafka_source_params_for_test(),
               transform_config: None,

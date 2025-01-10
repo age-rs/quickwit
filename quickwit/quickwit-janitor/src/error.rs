@@ -17,6 +17,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+use quickwit_common::rate_limited_error;
 use quickwit_proto::metastore::MetastoreError;
 use quickwit_proto::{ServiceError, ServiceErrorCode};
 use serde::{Deserialize, Serialize};
@@ -26,10 +27,10 @@ use thiserror::Error;
 #[allow(missing_docs)]
 #[derive(Error, Debug, Serialize, Deserialize)]
 pub enum JanitorError {
-    #[error("invalid delete query: `{0}`")]
-    InvalidDeleteQuery(String),
     #[error("internal error: `{0}`")]
     Internal(String),
+    #[error("invalid delete query: `{0}`")]
+    InvalidDeleteQuery(String),
     #[error("metastore error: `{0}`")]
     Metastore(#[from] MetastoreError),
 }
@@ -37,9 +38,12 @@ pub enum JanitorError {
 impl ServiceError for JanitorError {
     fn error_code(&self) -> ServiceErrorCode {
         match self {
-            JanitorError::InvalidDeleteQuery(_) => ServiceErrorCode::BadRequest,
-            JanitorError::Internal(_) => ServiceErrorCode::Internal,
-            JanitorError::Metastore(error) => error.error_code(),
+            Self::Internal(err_msg) => {
+                rate_limited_error!(limit_per_min = 6, "janitor internal error {err_msg}");
+                ServiceErrorCode::Internal
+            }
+            Self::InvalidDeleteQuery(_) => ServiceErrorCode::BadRequest,
+            Self::Metastore(metastore_error) => metastore_error.error_code(),
         }
     }
 }

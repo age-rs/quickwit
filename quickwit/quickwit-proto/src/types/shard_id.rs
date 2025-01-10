@@ -26,6 +26,10 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 /// Shard ID.
+/// Shard ID are required to be globally unique.
+///
+/// In other words, there cannot be two shards belonging to two different sources
+/// with the same shard ID.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct ShardId(ByteString);
 
@@ -132,6 +136,27 @@ impl PartialEq<ShardId> for &ShardId {
     #[inline]
     fn eq(&self, other: &ShardId) -> bool {
         *self == other
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl sqlx::Type<sqlx::Postgres> for ShardId {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        sqlx::postgres::PgTypeInfo::with_name("VARCHAR")
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl sqlx::Encode<'_, sqlx::Postgres> for ShardId {
+    fn encode_by_ref(&self, buf: &mut sqlx::postgres::PgArgumentBuffer) -> sqlx::encode::IsNull {
+        sqlx::Encode::<sqlx::Postgres>::encode(self.as_str(), buf)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl sqlx::postgres::PgHasArrayType for ShardId {
+    fn array_type_info() -> sqlx::postgres::PgTypeInfo {
+        sqlx::postgres::PgTypeInfo::with_name("VARCHAR[]")
     }
 }
 

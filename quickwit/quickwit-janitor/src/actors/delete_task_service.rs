@@ -120,7 +120,8 @@ impl DeleteTaskService {
             .metastore
             .list_indexes_metadata(ListIndexesMetadataRequest::all())
             .await?
-            .deserialize_indexes_metadata()?
+            .deserialize_indexes_metadata()
+            .await?
             .into_iter()
             .map(|index_metadata| {
                 (
@@ -239,7 +240,7 @@ mod tests {
         "#;
         let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"]).await?;
         let index_uid = test_sandbox.index_uid();
-        let mut metastore = test_sandbox.metastore();
+        let metastore = test_sandbox.metastore();
         let mock_search_service = MockSearchService::new();
         let searcher_pool = searcher_pool_for_test([("127.0.0.1:1000", mock_search_service)]);
         let search_job_placer = SearchJobPlacer::new(searcher_pool);

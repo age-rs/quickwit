@@ -33,12 +33,14 @@ use quickwit_proto::search::{
     SplitIdAndFooterOffsets, SplitSearchError,
 };
 use quickwit_proto::types::IndexUid;
-use quickwit_storage::Storage;
+use quickwit_storage::{ByteRangeCache, Storage};
 use tantivy::schema::{Field, FieldType};
 use tantivy::{ReloadPolicy, Term};
 use tracing::{debug, error, info, instrument};
 
 use crate::leaf::open_index_with_caches;
+use crate::search_job_placer::group_jobs_by_index_id;
+use crate::search_permit_provider::compute_initial_memory_allocation;
 use crate::{resolve_index_patterns, ClusterClient, SearchError, SearchJob, SearcherContext};
 
 /// Performs a distributed list terms.
@@ -89,8 +91,12 @@ pub async fn root_list_terms(
         .iter()
         .map(|index_metadata| index_metadata.index_uid.clone())
         .collect();
-    let mut query = quickwit_metastore::ListSplitsQuery::try_from_index_uids(index_uids)?
-        .with_split_state(quickwit_metastore::SplitState::Published);
+
+    let Some(mut query) = quickwit_metastore::ListSplitsQuery::try_from_index_uids(index_uids)
+    else {
+        return Ok(ListTermsResponse::default());
+    };
+    query = query.with_split_state(quickwit_metastore::SplitState::Published);
 
     if let Some(start_ts) = list_terms_request.start_timestamp {
         query = query.with_time_range_start_gte(start_ts);
@@ -184,20 +190,22 @@ pub fn jobs_to_leaf_requests(
 ) -> crate::Result<Vec<LeafListTermsRequest>> {
     let search_request_for_leaf = request.clone();
     let mut leaf_search_requests = Vec::new();
-    // Group jobs by index uid.
-    for (index_uid, job_group) in &jobs.into_iter().group_by(|job| job.index_uid.clone()) {
-        let index_uri = index_uid_to_uri.get(&index_uid).ok_or_else(|| {
+    group_jobs_by_index_id(jobs, |job_group| {
+        let index_uid = &job_group[0].index_uid;
+        let index_uri = index_uid_to_uri.get(index_uid).ok_or_else(|| {
             SearchError::Internal(format!(
                 "received list fields job for an unknown index {index_uid}. it should never happen"
             ))
         })?;
+
         let leaf_search_request = LeafListTermsRequest {
             list_terms_request: Some(search_request_for_leaf.clone()),
             index_uri: index_uri.to_string(),
             split_offsets: job_group.into_iter().map(|job| job.offsets).collect(),
         };
         leaf_search_requests.push(leaf_search_request);
-    }
+        Ok(())
+    })?;
     Ok(leaf_search_requests)
 }
 
@@ -209,7 +217,10 @@ async fn leaf_list_terms_single_split(
     storage: Arc<dyn Storage>,
     split: SplitIdAndFooterOffsets,
 ) -> crate::Result<LeafListTermsResponse> {
-    let index = open_index_with_caches(searcher_context, storage, &split, None, true).await?;
+    let cache =
+        ByteRangeCache::with_infinite_capacity(&quickwit_storage::STORAGE_METRICS.shortlived_cache);
+    let (index, _) =
+        open_index_with_caches(searcher_context, storage, &split, None, Some(cache)).await?;
     let split_schema = index.schema();
     let reader = index
         .reader_builder()
@@ -318,16 +329,26 @@ pub async fn leaf_list_terms(
     splits: &[SplitIdAndFooterOffsets],
 ) -> Result<LeafListTermsResponse, SearchError> {
     info!(split_offsets = ?PrettySample::new(splits, 5));
+    let permit_sizes = splits.iter().map(|split| {
+        compute_initial_memory_allocation(
+            split,
+            searcher_context
+                .searcher_config
+                .warmup_single_split_initial_allocation,
+        )
+    });
+    let permits = searcher_context
+        .search_permit_provider
+        .get_permits(permit_sizes)
+        .await;
     let leaf_search_single_split_futures: Vec<_> = splits
         .iter()
-        .map(|split| {
+        .zip(permits.into_iter())
+        .map(|(split, search_permit_recv)| {
             let index_storage_clone = index_storage.clone();
             let searcher_context_clone = searcher_context.clone();
             async move {
-                let _leaf_split_search_permit = searcher_context_clone.leaf_search_split_semaphore.clone()
-                    .acquire_owned()
-                    .await
-                    .expect("Failed to acquire permit. This should never happen! Please, report on https://github.com/quickwit-oss/quickwit/issues.");
+                let leaf_split_search_permit = search_permit_recv.await;
                 // TODO dedicated counter and timer?
                 crate::SEARCH_METRICS.leaf_searches_splits_total.inc();
                 let timer = crate::SEARCH_METRICS
@@ -341,6 +362,11 @@ pub async fn leaf_list_terms(
                 )
                 .await;
                 timer.observe_duration();
+
+                // Explicitly drop the permit for readability.
+                // This should always happen after the ephemeral search cache is dropped.
+                std::mem::drop(leaf_split_search_permit);
+
                 leaf_search_single_split_res.map_err(|err| (split.split_id.clone(), err))
             }
         })

@@ -63,17 +63,18 @@ impl CloseIdleShardsTask {
             let Some(state) = self.weak_state.upgrade() else {
                 return;
             };
-            let mut state_guard =
-                with_lock_metrics!(state.lock_partially(), "close_idle_shards", "write")
-                    .await
-                    .expect("ingester should be ready");
+            let Ok(mut state_guard) =
+                with_lock_metrics!(state.lock_partially(), "close_idle_shards", "write").await
+            else {
+                return;
+            };
 
             let now = Instant::now();
 
             for (queue_id, shard) in &mut state_guard.shards {
                 if shard.is_open() && shard.is_idle(now, self.idle_shard_timeout) {
-                    info!("closing idle shard `{queue_id}`");
                     shard.close();
+                    info!("closed idle shard `{queue_id}`");
                 }
             }
         }
@@ -104,7 +105,9 @@ mod tests {
             ShardState::Open,
             Position::Beginning,
             Position::Beginning,
+            None,
             now - idle_shard_timeout,
+            false,
         );
         let queue_id_01 = queue_id(&index_uid, "test-source", &ShardId::from(1));
         state_guard.shards.insert(queue_id_01.clone(), shard_01);
@@ -113,7 +116,9 @@ mod tests {
             ShardState::Open,
             Position::Beginning,
             Position::Beginning,
+            None,
             now - idle_shard_timeout / 2,
+            false,
         );
         let queue_id_02 = queue_id(&index_uid, "test-source", &ShardId::from(2));
         state_guard.shards.insert(queue_id_02.clone(), shard_02);

@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use futures::{ready, Future};
 use pin_project::{pin_project, pinned_drop};
+use prometheus::exponential_buckets;
 use tower::{Layer, Service};
 
 use crate::metrics::{
@@ -65,7 +66,7 @@ where
             inner,
             start,
             rpc_name,
-            status: "canceled",
+            status: "cancelled",
             requests_total: self.requests_total.clone(),
             requests_in_flight: self.requests_in_flight.clone(),
             request_duration_seconds: self.request_duration_seconds.clone(),
@@ -103,6 +104,7 @@ impl GrpcMetricsLayer {
                 subsystem,
                 &[("kind", kind)],
                 ["rpc", "status"],
+                exponential_buckets(0.001, 2.0, 12).unwrap(),
             ),
         }
     }
@@ -233,7 +235,7 @@ mod tests {
         assert_eq!(
             layer
                 .requests_total
-                .with_label_values(["hello", "canceled"])
+                .with_label_values(["hello", "cancelled"])
                 .get(),
             1
         );

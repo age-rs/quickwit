@@ -108,7 +108,6 @@ pub struct ClientArgs {
     pub connect_timeout: Option<Timeout>,
     pub timeout: Option<Timeout>,
     pub commit_timeout: Option<Timeout>,
-    pub ingest_v2: bool,
 }
 
 impl Default for ClientArgs {
@@ -118,7 +117,6 @@ impl Default for ClientArgs {
             connect_timeout: None,
             timeout: None,
             commit_timeout: None,
-            ingest_v2: false,
         }
     }
 }
@@ -136,9 +134,6 @@ impl ClientArgs {
         }
         if let Some(commit_timeout) = self.commit_timeout {
             builder = builder.commit_timeout(commit_timeout);
-        }
-        if self.ingest_v2 {
-            builder = builder.enable_ingest_v2();
         }
         builder.build()
     }
@@ -167,11 +162,6 @@ impl ClientArgs {
         } else {
             None
         };
-        let ingest_v2 = if process_ingest {
-            matches.get_flag("v2")
-        } else {
-            false
-        };
         let commit_timeout = if process_ingest {
             if let Some(duration) = matches.remove_one::<String>("commit-timeout") {
                 Some(parse_duration_or_none(&duration)?)
@@ -186,7 +176,6 @@ impl ClientArgs {
             connect_timeout,
             timeout,
             commit_timeout,
-            ingest_v2,
         })
     }
 }
@@ -348,7 +337,7 @@ pub mod busy_detector {
 
     // LAST_UNPARK_TIMESTAMP and NEXT_DEBUG_TIMESTAMP are semantically micro-second
     // precision timestamps, but we use atomics to allow accessing them without locks.
-    thread_local!(static LAST_UNPARK_TIMESTAMP: AtomicU64 = AtomicU64::new(0));
+    thread_local!(static LAST_UNPARK_TIMESTAMP: AtomicU64 = const { AtomicU64::new(0) });
     static NEXT_DEBUG_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
     static SUPPRESSED_DEBUG_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -397,7 +386,7 @@ pub mod busy_detector {
             })
             .is_err()
         {
-            // a debug was emited recently, don't emit log for this one
+            // a debug was emitted recently, don't emit log for this one
             SUPPRESSED_DEBUG_COUNT.fetch_add(1, Ordering::Relaxed);
             return;
         }

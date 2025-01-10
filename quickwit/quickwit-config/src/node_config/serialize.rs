@@ -27,6 +27,7 @@ use http::HeaderMap;
 use quickwit_common::net::{find_private_ip, get_short_hostname, Host};
 use quickwit_common::new_coolid;
 use quickwit_common::uri::Uri;
+use quickwit_proto::types::NodeId;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -149,18 +150,16 @@ pub async fn load_node_config_with_env(
 #[derive(Debug, Deserialize)]
 #[serde(tag = "version")]
 enum VersionedNodeConfig {
-    #[serde(rename = "0.7")]
+    #[serde(rename = "0.8")]
     // Retro compatibility.
-    #[serde(alias = "0.6")]
-    #[serde(alias = "0.5")]
-    #[serde(alias = "0.4")]
-    V0_7(NodeConfigBuilder),
+    #[serde(alias = "0.7")]
+    V0_8(NodeConfigBuilder),
 }
 
 impl From<VersionedNodeConfig> for NodeConfigBuilder {
     fn from(versioned_node_config: VersionedNodeConfig) -> Self {
         match versioned_node_config {
-            VersionedNodeConfig::V0_7(node_config_builder) => node_config_builder,
+            VersionedNodeConfig::V0_8(node_config_builder) => node_config_builder,
         }
     }
 }
@@ -221,6 +220,8 @@ impl NodeConfigBuilder {
         mut self,
         env_vars: &HashMap<String, String>,
     ) -> anyhow::Result<NodeConfig> {
+        let node_id = self.node_id.resolve(env_vars).map(NodeId::new)?;
+
         let enabled_services = self
             .enabled_services
             .resolve(env_vars)?
@@ -306,7 +307,7 @@ impl NodeConfigBuilder {
 
         let node_config = NodeConfig {
             cluster_id: self.cluster_id.resolve(env_vars)?,
-            node_id: self.node_id.resolve(env_vars)?,
+            node_id,
             enabled_services,
             gossip_listen_addr,
             grpc_listen_addr,
@@ -410,12 +411,13 @@ impl RestConfigBuilder {
 }
 
 #[cfg(any(test, feature = "testsuite"))]
-pub fn node_config_for_test() -> NodeConfig {
-    use quickwit_common::net::find_available_tcp_port;
-
+pub fn node_config_for_tests_from_ports(
+    rest_listen_port: u16,
+    grpc_listen_port: u16,
+) -> NodeConfig {
+    let node_id = NodeId::new(default_node_id().unwrap());
     let enabled_services = QuickwitService::supported_services();
     let listen_address = Host::default();
-    let rest_listen_port = find_available_tcp_port().expect("OS should find an available port");
     let rest_listen_addr = listen_address
         .with_port(rest_listen_port)
         .to_socket_addr()
@@ -424,7 +426,6 @@ pub fn node_config_for_test() -> NodeConfig {
         .with_port(rest_listen_port)
         .to_socket_addr()
         .expect("default host should be an IP address");
-    let grpc_listen_port = find_available_tcp_port().expect("OS should find an available port");
     let grpc_listen_addr = listen_address
         .with_port(grpc_listen_port)
         .to_socket_addr()
@@ -444,7 +445,7 @@ pub fn node_config_for_test() -> NodeConfig {
     };
     NodeConfig {
         cluster_id: default_cluster_id().unwrap(),
-        node_id: default_node_id().unwrap(),
+        node_id,
         enabled_services,
         gossip_advertise_addr: gossip_listen_addr,
         grpc_advertise_addr: grpc_listen_addr,
@@ -610,6 +611,14 @@ mod tests {
                 max_num_concurrent_split_searches: 150,
                 max_num_concurrent_split_streams: 120,
                 split_cache: None,
+                request_timeout_secs: NonZeroU64::new(30).unwrap(),
+                storage_timeout_policy: Some(crate::StorageTimeoutPolicy {
+                    min_throughtput_bytes_per_secs: 100_000,
+                    timeout_millis: 2_000,
+                    max_num_retries: 2
+                }),
+                warmup_memory_budget: ByteSize::gb(100),
+                warmup_single_split_initial_allocation: ByteSize::gb(1),
             }
         );
         assert_eq!(
@@ -662,7 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_node_config_default_values_minimal() {
-        let config_yaml = "version: 0.7";
+        let config_yaml = "version: 0.8";
         let config = load_node_config_with_env(
             ConfigFormat::Yaml,
             config_yaml.as_bytes(),
@@ -711,7 +720,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_node_config_env_var_override() {
-        let config_yaml = "version: 0.7";
+        let config_yaml = "version: 0.8";
         let mut env_vars = HashMap::new();
         env_vars.insert("QW_CLUSTER_ID".to_string(), "test-cluster".to_string());
         env_vars.insert("QW_NODE_ID".to_string(), "test-node".to_string());
@@ -793,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn test_quickwwit_config_default_values_storage() {
         let config_yaml = r#"
-            version: 0.7
+            version: 0.8
             node_id: "node-1"
             metastore_uri: postgres://username:password@host:port/db
         "#;
@@ -815,7 +824,7 @@ mod tests {
     #[tokio::test]
     async fn test_node_config_config_default_values_default_indexer_searcher_config() {
         let config_yaml = r#"
-            version: 0.7
+            version: 0.8
             metastore_uri: postgres://username:password@host:port/db
             data_dir: /opt/quickwit/data
         "#;
@@ -865,22 +874,12 @@ mod tests {
         }
         {
             let node_config = NodeConfigBuilder {
-                peer_seeds: ConfigValue::for_test(List(vec!["unresolvable-host".to_string()])),
-                ..Default::default()
-            }
-            .build_and_validate(&HashMap::new())
-            .await
-            .unwrap();
-            assert!(node_config.peer_seed_addrs().await.is_err());
-        }
-        {
-            let node_config = NodeConfigBuilder {
                 rest_config_builder: RestConfigBuilder {
                     listen_port: Some(1789),
                     ..Default::default()
                 },
                 peer_seeds: ConfigValue::for_test(List(vec![
-                    "unresolvable-host".to_string(),
+                    "unresolvable.example.com".to_string(),
                     "localhost".to_string(),
                     "localhost:1337".to_string(),
                     "127.0.0.1".to_string(),
@@ -999,7 +998,7 @@ mod tests {
     async fn test_config_validates_uris() {
         {
             let config_yaml = r#"
-            version: 0.7
+            version: 0.8
             node_id: 1
             metastore_uri: ''
         "#;
@@ -1013,7 +1012,7 @@ mod tests {
         }
         {
             let config_yaml = r#"
-            version: 0.7
+            version: 0.8
             node_id: 1
             metastore_uri: postgres://username:password@host:port/db
             default_index_root_uri: ''
@@ -1032,7 +1031,7 @@ mod tests {
     async fn test_node_config_data_dir_accepts_both_file_uris_and_file_paths() {
         {
             let config_yaml = r#"
-                version: 0.7
+                version: 0.8
                 data_dir: /opt/quickwit/data
             "#;
             let config = load_node_config_with_env(
@@ -1046,7 +1045,7 @@ mod tests {
         }
         {
             let config_yaml = r#"
-                version: 0.7
+                version: 0.8
                 data_dir: file:///opt/quickwit/data
             "#;
             let config = load_node_config_with_env(
@@ -1060,7 +1059,7 @@ mod tests {
         }
         {
             let config_yaml = r#"
-                version: 0.7
+                version: 0.8
                 data_dir: s3://indexes/foo
             "#;
             let error = load_node_config_with_env(
@@ -1077,7 +1076,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_invalid_when_both_listen_ports_params_are_configured() {
         let config_yaml = r#"
-                version: 0.7
+                version: 0.8
                 rest_listen_port: 1789
                 rest:
                   listen_port: 1789
@@ -1112,7 +1111,7 @@ mod tests {
     #[tokio::test]
     async fn test_rest_config_accepts_wildcard() {
         let rest_config_yaml = r#"
-            version: 0.7
+            version: 0.8
             rest:
               cors_allow_origins: '*'
         "#;
@@ -1129,7 +1128,7 @@ mod tests {
     #[tokio::test]
     async fn test_rest_config_accepts_single_origin() {
         let rest_config_yaml = r#"
-            version: 0.7
+            version: 0.8
             rest:
               cors_allow_origins:
                 - https://www.my-domain.com
@@ -1147,7 +1146,7 @@ mod tests {
         );
 
         let rest_config_yaml = r#"
-            version: 0.7
+            version: 0.8
             rest:
               cors_allow_origins: http://192.168.0.108:7280
         "#;
@@ -1167,7 +1166,7 @@ mod tests {
     #[tokio::test]
     async fn test_rest_config_accepts_multi_origin() {
         let rest_config_yaml = r#"
-            version: 0.7
+            version: 0.8
             rest:
               cors_allow_origins:
                 - https://www.my-domain.com
@@ -1185,7 +1184,7 @@ mod tests {
         );
 
         let rest_config_yaml = r#"
-            version: 0.7
+            version: 0.8
             rest:
               cors_allow_origins:
                 - https://www.my-domain.com
@@ -1207,7 +1206,7 @@ mod tests {
         );
 
         let rest_config_yaml = r#"
-            version: 0.7
+            version: 0.8
             rest:
               rest_cors_allow_origins:
         "#;
@@ -1220,7 +1219,7 @@ mod tests {
         .expect_err("Config should not allow empty origins.");
 
         let rest_config_yaml = r#"
-            version: 0.7
+            version: 0.8
             rest:
               cors_allow_origins:
                 -
@@ -1251,7 +1250,7 @@ mod tests {
         assert!(error_message.contains("either 1 or 2, got `3`"));
 
         let node_config_yaml = r#"
-            version: 0.7
+            version: 0.8
             ingest_api:
               replication_factor: 0
         "#;

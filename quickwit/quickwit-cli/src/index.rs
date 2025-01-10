@@ -18,30 +18,26 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::fmt::Display;
-use std::io::{stdout, Stdout, Write};
+use std::num::NonZeroUsize;
 use std::ops::Div;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
-use std::{fmt, io};
 
 use anyhow::{anyhow, bail, Context};
 use bytesize::ByteSize;
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
-use colored::{ColoredString, Colorize};
-use humantime::format_duration;
+use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use itertools::Itertools;
 use numfmt::{Formatter, Scales};
-use quickwit_actors::ActorHandle;
+use quickwit_common::tower::{Rate, RateEstimator, SmaRateEstimator};
 use quickwit_common::uri::Uri;
 use quickwit_config::{ConfigFormat, IndexConfig};
-use quickwit_indexing::models::IndexingStatistics;
-use quickwit_indexing::IndexingPipeline;
 use quickwit_metastore::{IndexMetadata, Split, SplitState};
 use quickwit_proto::search::{CountHits, SortField, SortOrder};
+use quickwit_proto::types::IndexId;
 use quickwit_rest_client::models::IngestSource;
 use quickwit_rest_client::rest_client::{CommitType, IngestEvent};
 use quickwit_search::SearchResponseRest;
@@ -51,16 +47,15 @@ use tabled::settings::object::{FirstRow, Rows, Segment};
 use tabled::settings::panel::Footer;
 use tabled::settings::{Alignment, Disable, Format, Modify, Panel, Rotate, Style};
 use tabled::{Table, Tabled};
-use thousands::Separable;
 use tracing::{debug, Level};
 
 use crate::checklist::GREEN_COLOR;
 use crate::stats::{mean, percentile, std_deviation};
-use crate::{client_args, make_table, prompt_confirmation, ClientArgs, THROUGHPUT_WINDOW_SIZE};
+use crate::{client_args, make_table, prompt_confirmation, ClientArgs};
 
 pub fn build_index_command() -> Command {
     Command::new("index")
-        .about("Manages indexes: creates, deletes, ingests, searches, describes...")
+        .about("Manages indexes: creates, updates, deletes, ingests, searches, describes...")
         .args(client_args())
         .subcommand(
             Command::new("create")
@@ -75,8 +70,22 @@ pub fn build_index_command() -> Command {
                 ])
             )
         .subcommand(
+            Command::new("update")
+            .display_order(1)
+            .about("Updates an index using an index config file.")
+            .long_about("This command follows PUT semantics, which means that all the fields of the current configuration are replaced by the values specified in this request or the associated defaults. In particular, if the field is optional (e.g. `retention_policy`), omitting it will delete the associated configuration. If the new configuration file contains updates that cannot be applied, the request fails, and none of the updates are applied.")
+            .args(&[
+                arg!(--index <INDEX> "ID of the target index")
+                    .display_order(1)
+                    .required(true),
+                arg!(--"index-config" <INDEX_CONFIG> "Location of the index config file.")
+                    .display_order(2)
+                    .required(true),
+            ])
+        )
+        .subcommand(
             Command::new("clear")
-                .display_order(2)
+                .display_order(3)
                 .alias("clr")
                 .about("Clears an index: deletes all splits and resets checkpoint.")
                 .long_about("Deletes all its splits and resets its checkpoint. This operation is destructive and cannot be undone, proceed with caution.")
@@ -88,7 +97,7 @@ pub fn build_index_command() -> Command {
             )
         .subcommand(
             Command::new("delete")
-                .display_order(3)
+                .display_order(4)
                 .alias("del")
                 .about("Deletes an index.")
                 .long_about("Deletes an index. This operation is destructive and cannot be undone, proceed with caution.")
@@ -102,7 +111,7 @@ pub fn build_index_command() -> Command {
             )
         .subcommand(
             Command::new("describe")
-                .display_order(4)
+                .display_order(5)
                 .about("Displays descriptive statistics of an index.")
                 .long_about("Displays descriptive statistics of an index. Displayed statistics are: number of published splits, number of documents, splits min/max timestamps, size of splits.")
                 .args(&[
@@ -113,12 +122,12 @@ pub fn build_index_command() -> Command {
         .subcommand(
             Command::new("list")
                 .alias("ls")
-                .display_order(5)
+                .display_order(6)
                 .about("List indexes.")
             )
         .subcommand(
             Command::new("ingest")
-                .display_order(6)
+                .display_order(7)
                 .about("Ingest NDJSON documents with the ingest API.")
                 .long_about("Reads NDJSON documents from a file or streamed from stdin and sends them into ingest API.")
                 .args(&[
@@ -132,13 +141,7 @@ pub fn build_index_command() -> Command {
                     Arg::new("wait")
                         .long("wait")
                         .short('w')
-                        .help("Wait for all documents to be commited and available for search before exiting")
-                        .action(ArgAction::SetTrue),
-                    // TODO remove me after Quickwit 0.7.
-                    Arg::new("v2")
-                        .long("v2")
-                        .help("Ingest v2 (experimental! Do not use me.)")
-                        .hide(true)
+                        .help("Wait for all documents to be committed and available for search before exiting")
                         .action(ArgAction::SetTrue),
                     Arg::new("force")
                         .long("force")
@@ -148,14 +151,14 @@ pub fn build_index_command() -> Command {
                         .conflicts_with("wait"),
                     Arg::new("commit-timeout")
                         .long("commit-timeout")
-                        .help("Duration of the commit timeout operation.")
+                        .help("Timeout for ingest operations that require waiting for the final commit (`--wait` or `--force`). This is different from the `commit_timeout_secs` indexing setting, which sets the maximum time before committing splits after their creation.")
                         .required(false)
                         .global(true),
                 ])
             )
         .subcommand(
             Command::new("search")
-                .display_order(7)
+                .display_order(8)
                 .about("Searches an index.")
                 .args(&[
                     arg!(--index <INDEX> "ID of the target index")
@@ -192,7 +195,7 @@ pub fn build_index_command() -> Command {
 #[derive(Debug, Eq, PartialEq)]
 pub struct ClearIndexArgs {
     pub client_args: ClientArgs,
-    pub index_id: String,
+    pub index_id: IndexId,
     pub assume_yes: bool,
 }
 
@@ -205,15 +208,23 @@ pub struct CreateIndexArgs {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub struct UpdateIndexArgs {
+    pub client_args: ClientArgs,
+    pub index_id: IndexId,
+    pub index_config_uri: Uri,
+    pub assume_yes: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub struct DescribeIndexArgs {
     pub client_args: ClientArgs,
-    pub index_id: String,
+    pub index_id: IndexId,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct IngestDocsArgs {
     pub client_args: ClientArgs,
-    pub index_id: String,
+    pub index_id: IndexId,
     pub input_path_opt: Option<PathBuf>,
     pub batch_size_limit_opt: Option<ByteSize>,
     pub commit_type: CommitType,
@@ -222,7 +233,7 @@ pub struct IngestDocsArgs {
 #[derive(Debug, Eq, PartialEq)]
 pub struct SearchIndexArgs {
     pub client_args: ClientArgs,
-    pub index_id: String,
+    pub index_id: IndexId,
     pub query: String,
     pub aggregation: Option<String>,
     pub max_hits: usize,
@@ -237,7 +248,7 @@ pub struct SearchIndexArgs {
 #[derive(Debug, Eq, PartialEq)]
 pub struct DeleteIndexArgs {
     pub client_args: ClientArgs,
-    pub index_id: String,
+    pub index_id: IndexId,
     pub dry_run: bool,
     pub assume_yes: bool,
 }
@@ -251,6 +262,7 @@ pub struct ListIndexesArgs {
 pub enum IndexCliCommand {
     Clear(ClearIndexArgs),
     Create(CreateIndexArgs),
+    Update(UpdateIndexArgs),
     Delete(DeleteIndexArgs),
     Describe(DescribeIndexArgs),
     Ingest(IngestDocsArgs),
@@ -278,6 +290,7 @@ impl IndexCliCommand {
             "ingest" => Self::parse_ingest_args(submatches),
             "list" => Self::parse_list_args(submatches),
             "search" => Self::parse_search_args(submatches),
+            "update" => Self::parse_update_args(submatches),
             _ => bail!("unknown index subcommand `{subcommand}`"),
         }
     }
@@ -308,6 +321,25 @@ impl IndexCliCommand {
             client_args,
             index_config_uri,
             overwrite,
+            assume_yes,
+        }))
+    }
+
+    fn parse_update_args(mut matches: ArgMatches) -> anyhow::Result<Self> {
+        let client_args = ClientArgs::parse(&mut matches)?;
+        let index_id = matches
+            .remove_one::<String>("index")
+            .expect("`index` should be a required arg.");
+        let index_config_uri = matches
+            .remove_one::<String>("index-config")
+            .map(|uri| Uri::from_str(&uri))
+            .expect("`index-config` should be a required arg.")?;
+        let assume_yes = matches.get_flag("yes");
+
+        Ok(Self::Update(UpdateIndexArgs {
+            index_id,
+            client_args,
+            index_config_uri,
             assume_yes,
         }))
     }
@@ -438,6 +470,7 @@ impl IndexCliCommand {
             Self::Ingest(args) => ingest_docs_cli(args).await,
             Self::List(args) => list_index_cli(args).await,
             Self::Search(args) => search_index_cli(args).await,
+            Self::Update(args) => update_index_cli(args).await,
         }
     }
 }
@@ -489,6 +522,35 @@ pub async fn create_index_cli(args: CreateIndexArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn update_index_cli(args: UpdateIndexArgs) -> anyhow::Result<()> {
+    debug!(args=?args, "update-index");
+    println!("❯ Updating index...");
+    let storage_resolver = StorageResolver::unconfigured();
+    let file_content = load_file(&storage_resolver, &args.index_config_uri).await?;
+    let index_config_str = std::str::from_utf8(&file_content)
+        .with_context(|| {
+            format!(
+                "index config file `{}` contains some invalid UTF-8 characters",
+                args.index_config_uri
+            )
+        })?
+        .to_string();
+    let config_format = ConfigFormat::sniff_from_uri(&args.index_config_uri)?;
+    let qw_client = args.client_args.client();
+    if !args.assume_yes {
+        let prompt = "This operation will update the index configuration. Do you want to proceed?";
+        if !prompt_confirmation(prompt, false) {
+            return Ok(());
+        }
+    }
+    qw_client
+        .indexes()
+        .update(&args.index_id, &index_config_str, config_format)
+        .await?;
+    println!("{} Index successfully updated.", "✔".color(GREEN_COLOR));
+    Ok(())
+}
+
 pub async fn list_index_cli(args: ListIndexesArgs) -> anyhow::Result<()> {
     debug!(args=?args, "list-index");
     let qw_client = args.client_args.client();
@@ -517,7 +579,7 @@ where I: IntoIterator<Item = IndexConfig> {
 #[derive(Tabled)]
 struct IndexRow {
     #[tabled(rename = "Index ID")]
-    index_id: String,
+    index_id: IndexId,
     #[tabled(rename = "Index URI")]
     index_uri: Uri,
 }
@@ -537,7 +599,7 @@ pub async fn describe_index_cli(args: DescribeIndexArgs) -> anyhow::Result<()> {
 }
 
 pub struct IndexStats {
-    pub index_id: String,
+    pub index_id: IndexId,
     pub index_uri: Uri,
     pub num_published_splits: usize,
     pub size_published_splits: ByteSize,
@@ -618,7 +680,7 @@ fn display_option_in_table(opt: &Option<impl Display>) -> String {
 fn display_timestamp(timestamp: &Option<i64>) -> String {
     match timestamp {
         Some(timestamp) => {
-            let datetime = chrono::NaiveDateTime::from_timestamp_millis(*timestamp * 1000)
+            let datetime = chrono::DateTime::from_timestamp_millis(*timestamp * 1000)
                 .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_else(|| "Invalid timestamp!".to_string());
             format!("{} (Timestamp: {})", datetime, timestamp)
@@ -923,6 +985,11 @@ impl Tabled for Quantiles {
 
 pub async fn ingest_docs_cli(args: IngestDocsArgs) -> anyhow::Result<()> {
     debug!(args=?args, "ingest-docs");
+    let mut rate_estimator = SmaRateEstimator::new(
+        NonZeroUsize::new(8).unwrap(),
+        Duration::from_millis(250),
+        Duration::from_secs(1),
+    );
     if let Some(input_path) = &args.input_path_opt {
         println!("❯ Ingesting documents from {}.", input_path.display());
     } else {
@@ -938,13 +1005,17 @@ pub async fn ingest_docs_cli(args: IngestDocsArgs) -> anyhow::Result<()> {
     progress_bar.enable_steady_tick(Duration::from_millis(100));
     progress_bar.set_style(progress_bar_style());
     progress_bar.set_message("0MiB/s");
-    let update_progress_bar = |ingest_event: IngestEvent| {
+    // It is not used by the rate estimator anyway.
+    let useless_start_time = Instant::now();
+    let mut update_progress_bar = |ingest_event: IngestEvent| {
         match ingest_event {
-            IngestEvent::IngestedDocBatch(num_bytes) => progress_bar.inc(num_bytes as u64),
+            IngestEvent::IngestedDocBatch(num_bytes) => {
+                rate_estimator.update(useless_start_time, Instant::now(), num_bytes as u64);
+                progress_bar.inc(num_bytes as u64)
+            }
             IngestEvent::Sleep => {} // To
         };
-        let throughput =
-            progress_bar.position() as f64 / progress_bar.elapsed().as_secs_f64() / 1024.0 / 1024.0;
+        let throughput = rate_estimator.work() as f64 / (1024 * 1024) as f64;
         progress_bar.set_message(format!("{throughput:.1} MiB/s"));
     };
 
@@ -961,7 +1032,7 @@ pub async fn ingest_docs_cli(args: IngestDocsArgs) -> anyhow::Result<()> {
             &args.index_id,
             ingest_source,
             batch_size_limit_opt,
-            Some(&update_progress_bar),
+            Some(&mut update_progress_bar),
             args.commit_type,
         )
         .await?;
@@ -1056,187 +1127,6 @@ pub async fn delete_index_cli(args: DeleteIndexArgs) -> anyhow::Result<()> {
     }
     println!("{} Index successfully deleted.", "✔".color(GREEN_COLOR));
     Ok(())
-}
-
-/// Starts a tokio task that displays the indexing statistics
-/// every once in awhile.
-pub async fn start_statistics_reporting_loop(
-    pipeline_handle: ActorHandle<IndexingPipeline>,
-    is_stdin: bool,
-) -> anyhow::Result<IndexingStatistics> {
-    let mut stdout_handle = stdout();
-    let start_time = Instant::now();
-    let mut throughput_calculator = ThroughputCalculator::new(start_time);
-    let mut report_interval = tokio::time::interval(Duration::from_secs(1));
-
-    loop {
-        // TODO fixme. The way we wait today is a bit lame: if the indexing pipeline exits, we will
-        // still wait up to an entire heartbeat...  Ideally we should  select between two
-        // futures.
-        report_interval.tick().await;
-        // Try to receive with a timeout of 1 second.
-        // 1 second is also the frequency at which we update statistic in the console
-        pipeline_handle.refresh_observe();
-
-        let observation = pipeline_handle.last_observation();
-
-        // Let's not display live statistics to allow screen to scroll.
-        if observation.num_docs > 0 {
-            display_statistics(&mut stdout_handle, &mut throughput_calculator, &observation)?;
-        }
-
-        if pipeline_handle.state().is_exit() {
-            break;
-        }
-    }
-    let (pipeline_exit_status, pipeline_statistics) = pipeline_handle.join().await;
-    if !pipeline_exit_status.is_success() {
-        bail!(pipeline_exit_status);
-    }
-    // If we have received zero docs at this point,
-    // there is no point in displaying report.
-    if pipeline_statistics.num_docs == 0 {
-        return Ok(pipeline_statistics);
-    }
-
-    if is_stdin {
-        display_statistics(
-            &mut stdout_handle,
-            &mut throughput_calculator,
-            &pipeline_statistics,
-        )?;
-    }
-    // display end of task report
-    println!();
-    let secs = Duration::from_secs(start_time.elapsed().as_secs());
-    if pipeline_statistics.num_invalid_docs == 0 {
-        println!(
-            "Indexed {} documents in {}.",
-            pipeline_statistics.num_docs.separate_with_commas(),
-            format_duration(secs)
-        );
-    } else {
-        let num_indexed_docs = (pipeline_statistics.num_docs
-            - pipeline_statistics.num_invalid_docs)
-            .separate_with_commas();
-
-        let error_rate = (pipeline_statistics.num_invalid_docs as f64
-            / pipeline_statistics.num_docs as f64)
-            * 100.0;
-
-        println!(
-            "Indexed {} out of {} documents in {}. Failed to index {} document(s). {}\n",
-            num_indexed_docs,
-            pipeline_statistics.num_docs.separate_with_commas(),
-            format_duration(secs),
-            pipeline_statistics.num_invalid_docs.separate_with_commas(),
-            colorize_error_rate(error_rate),
-        );
-    }
-
-    Ok(pipeline_statistics)
-}
-
-fn colorize_error_rate(error_rate: f64) -> ColoredString {
-    let error_rate_message = format!("({error_rate:.1}% error rate)");
-    if error_rate < 1.0 {
-        error_rate_message.yellow()
-    } else if error_rate < 5.0 {
-        error_rate_message.truecolor(255, 181, 46) //< Orange
-    } else {
-        error_rate_message.red()
-    }
-}
-
-/// A struct to print data on the standard output.
-struct Printer<'a> {
-    pub stdout: &'a mut Stdout,
-}
-
-impl<'a> Printer<'a> {
-    pub fn print_header(&mut self, header: &str) -> io::Result<()> {
-        write!(&mut self.stdout, " {}", header.bright_blue())?;
-        Ok(())
-    }
-
-    pub fn print_value(&mut self, fmt_args: fmt::Arguments) -> io::Result<()> {
-        write!(&mut self.stdout, " {fmt_args}")
-    }
-
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.stdout.flush()
-    }
-}
-
-fn display_statistics(
-    stdout: &mut Stdout,
-    throughput_calculator: &mut ThroughputCalculator,
-    statistics: &IndexingStatistics,
-) -> anyhow::Result<()> {
-    let elapsed_duration = time::Duration::try_from(throughput_calculator.elapsed_time())?;
-    let elapsed_time = format!(
-        "{:02}:{:02}:{:02}",
-        elapsed_duration.whole_hours(),
-        elapsed_duration.whole_minutes() % 60,
-        elapsed_duration.whole_seconds() % 60
-    );
-    let throughput_mb_s = throughput_calculator.calculate(statistics.total_bytes_processed);
-    let mut printer = Printer { stdout };
-    printer.print_header("Num docs")?;
-    printer.print_value(format_args!("{:>7}", statistics.num_docs))?;
-    printer.print_header("Parse errs")?;
-    printer.print_value(format_args!("{:>5}", statistics.num_invalid_docs))?;
-    printer.print_header("PublSplits")?;
-    printer.print_value(format_args!("{:>3}", statistics.num_published_splits))?;
-    printer.print_header("Input size")?;
-    printer.print_value(format_args!(
-        "{:>5}MB",
-        statistics.total_bytes_processed / 1_000_000
-    ))?;
-    printer.print_header("Thrghput")?;
-    printer.print_value(format_args!("{throughput_mb_s:>5.2}MB/s"))?;
-    printer.print_header("Time")?;
-    printer.print_value(format_args!("{elapsed_time}\n"))?;
-    printer.flush()?;
-    Ok(())
-}
-
-/// ThroughputCalculator is used to calculate throughput.
-struct ThroughputCalculator {
-    /// Stores the time series of processed bytes value.
-    processed_bytes_values: VecDeque<(Instant, u64)>,
-    /// Store the time this calculator started
-    start_time: Instant,
-}
-
-impl ThroughputCalculator {
-    /// Creates new instance.
-    pub fn new(start_time: Instant) -> Self {
-        let processed_bytes_values: VecDeque<(Instant, u64)> = (0..THROUGHPUT_WINDOW_SIZE)
-            .map(|_| (start_time, 0u64))
-            .collect();
-        Self {
-            processed_bytes_values,
-            start_time,
-        }
-    }
-
-    /// Calculates the throughput.
-    pub fn calculate(&mut self, current_processed_bytes: u64) -> f64 {
-        self.processed_bytes_values.pop_front();
-        let current_instant = Instant::now();
-        let (first_instant, first_processed_bytes) = *self.processed_bytes_values.front().unwrap();
-        let elapsed_time = (current_instant - first_instant).as_millis() as f64 / 1_000f64;
-        self.processed_bytes_values
-            .push_back((current_instant, current_processed_bytes));
-        (current_processed_bytes - first_processed_bytes) as f64
-            / 1_000_000f64
-            / elapsed_time.max(1f64)
-    }
-
-    pub fn elapsed_time(&self) -> Duration {
-        self.start_time.elapsed()
-    }
 }
 
 #[cfg(test)]

@@ -18,25 +18,25 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::fmt;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use quickwit_actors::{ActorExitStatus, Mailbox};
 use quickwit_config::VecSourceParams;
-use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpoint, SourceCheckpointDelta};
-use quickwit_proto::types::Position;
+use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpointDelta};
+use quickwit_proto::metastore::SourceType;
+use quickwit_proto::types::{Position, SourceId};
 use serde_json::Value as JsonValue;
 use tracing::info;
 
+use super::BatchBuilder;
 use crate::actors::DocProcessor;
-use crate::models::RawDocBatch;
-use crate::source::{Source, SourceContext, SourceRuntimeArgs, TypedSourceFactory};
+use crate::source::{Source, SourceContext, SourceRuntime, TypedSourceFactory};
 
 pub struct VecSource {
-    source_id: String,
+    source_id: SourceId,
+    source_params: VecSourceParams,
     next_item_idx: usize,
-    params: VecSourceParams,
     partition: PartitionId,
 }
 
@@ -55,11 +55,11 @@ impl TypedSourceFactory for VecSourceFactory {
     type Source = VecSource;
     type Params = VecSourceParams;
     async fn typed_create_source(
-        ctx: Arc<SourceRuntimeArgs>,
-        params: VecSourceParams,
-        checkpoint: SourceCheckpoint,
+        source_runtime: SourceRuntime,
+        source_params: VecSourceParams,
     ) -> anyhow::Result<Self::Source> {
-        let partition = PartitionId::from(params.partition.as_str());
+        let checkpoint = source_runtime.fetch_checkpoint().await?;
+        let partition = PartitionId::from(source_params.partition.as_str());
         let next_item_idx = checkpoint
             .position_for_partition(&partition)
             .map(|position| {
@@ -70,10 +70,10 @@ impl TypedSourceFactory for VecSourceFactory {
             })
             .unwrap_or(0);
         Ok(VecSource {
-            source_id: ctx.source_id().to_string(),
-            next_item_idx,
-            params,
+            source_id: source_runtime.pipeline_id.source_id,
+            source_params,
             partition,
+            next_item_idx,
         })
     }
 }
@@ -92,34 +92,37 @@ impl Source for VecSource {
         batch_sink: &Mailbox<DocProcessor>,
         ctx: &SourceContext,
     ) -> Result<Duration, ActorExitStatus> {
-        let mut doc_batch = RawDocBatch::default();
+        let mut batch_builder = BatchBuilder::new(SourceType::Vec);
 
-        doc_batch.docs.extend(
-            self.params.docs[self.next_item_idx..]
-                .iter()
-                .take(self.params.batch_num_docs)
-                .cloned(),
-        );
-        if doc_batch.docs.is_empty() {
+        for doc in self.source_params.docs[self.next_item_idx..]
+            .iter()
+            .take(self.source_params.batch_num_docs)
+            .cloned()
+        {
+            batch_builder.add_doc(doc);
+        }
+        if batch_builder.docs.is_empty() {
             info!("reached end of source");
             ctx.send_exit_with_success(batch_sink).await?;
             return Err(ActorExitStatus::Success);
         }
         let from_item_idx = self.next_item_idx;
-        self.next_item_idx += doc_batch.docs.len();
+        self.next_item_idx += batch_builder.docs.len();
         let to_item_idx = self.next_item_idx;
-        doc_batch.checkpoint_delta = SourceCheckpointDelta::from_partition_delta(
+
+        batch_builder.checkpoint_delta = SourceCheckpointDelta::from_partition_delta(
             self.partition.clone(),
             position_from_offset(from_item_idx),
             position_from_offset(to_item_idx),
         )
         .unwrap();
-        ctx.send_message(batch_sink, doc_batch).await?;
+        ctx.send_message(batch_sink, batch_builder.build()).await?;
+
         Ok(Duration::default())
     }
 
     fn name(&self) -> String {
-        format!("VecSource {{ source_id={} }}", self.source_id)
+        format!("{:?}", self)
     }
 
     fn observable_state(&self) -> JsonValue {
@@ -132,16 +135,16 @@ impl Source for VecSource {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
-    use std::path::PathBuf;
 
     use bytes::Bytes;
     use quickwit_actors::{Actor, Command, Universe};
     use quickwit_config::{SourceConfig, SourceInputFormat, SourceParams};
-    use quickwit_metastore::metastore_for_test;
     use quickwit_proto::types::IndexUid;
     use serde_json::json;
 
     use super::*;
+    use crate::models::RawDocBatch;
+    use crate::source::tests::SourceRuntimeBuilder;
     use crate::source::SourceActor;
 
     #[tokio::test]
@@ -156,34 +159,24 @@ mod tests {
             batch_num_docs: 3,
             partition: "partition".to_string(),
         };
+        let index_uid = IndexUid::new_with_random_ulid("test-index");
         let source_config = SourceConfig {
             source_id: "test-vec-source".to_string(),
-            desired_num_pipelines: NonZeroUsize::new(1).unwrap(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(1).unwrap(),
+            num_pipelines: NonZeroUsize::new(1).unwrap(),
             enabled: true,
             source_params: SourceParams::Vec(params.clone()),
             transform_config: None,
             input_format: SourceInputFormat::Json,
         };
-        let metastore = metastore_for_test();
-        let vec_source = VecSourceFactory::typed_create_source(
-            SourceRuntimeArgs::for_test(
-                IndexUid::new_with_random_ulid("test-index"),
-                source_config,
-                metastore,
-                PathBuf::from("./queues"),
-            ),
-            params,
-            SourceCheckpoint::default(),
-        )
-        .await?;
+        let source_runtime = SourceRuntimeBuilder::new(index_uid, source_config).build();
+        let vec_source = VecSourceFactory::typed_create_source(source_runtime, params).await?;
         let vec_source_actor = SourceActor {
             source: Box::new(vec_source),
             doc_processor_mailbox,
         };
         assert_eq!(
             vec_source_actor.name(),
-            "VecSource { source_id=test-vec-source }"
+            r#"VecSource { source_id: "test-vec-source" }"#
         );
         let (_vec_source_mailbox, vec_source_handle) =
             universe.spawn_builder().spawn(vec_source_actor);
@@ -214,30 +207,20 @@ mod tests {
             batch_num_docs: 3,
             partition: "".to_string(),
         };
-        let mut checkpoint = SourceCheckpoint::default();
-        checkpoint.try_apply_delta(SourceCheckpointDelta::from_range(0u64..2u64))?;
-
+        let index_uid = IndexUid::new_with_random_ulid("test-index");
         let source_config = SourceConfig {
             source_id: "test-vec-source".to_string(),
-            desired_num_pipelines: NonZeroUsize::new(1).unwrap(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(1).unwrap(),
+            num_pipelines: NonZeroUsize::new(1).unwrap(),
             enabled: true,
             source_params: SourceParams::Vec(params.clone()),
             transform_config: None,
             input_format: SourceInputFormat::Json,
         };
-        let metastore = metastore_for_test();
-        let vec_source = VecSourceFactory::typed_create_source(
-            SourceRuntimeArgs::for_test(
-                IndexUid::new_with_random_ulid("test-index"),
-                source_config,
-                metastore,
-                PathBuf::from("./queues"),
-            ),
-            params,
-            checkpoint,
-        )
-        .await?;
+        let source_delta = SourceCheckpointDelta::from_range(0u64..2u64);
+        let source_runtime = SourceRuntimeBuilder::new(index_uid, source_config)
+            .with_mock_metastore(Some(source_delta))
+            .build();
+        let vec_source = VecSourceFactory::typed_create_source(source_runtime, params).await?;
         let vec_source_actor = SourceActor {
             source: Box::new(vec_source),
             doc_processor_mailbox,

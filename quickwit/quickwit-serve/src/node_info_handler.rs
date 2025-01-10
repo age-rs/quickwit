@@ -23,6 +23,7 @@ use quickwit_config::NodeConfig;
 use serde_json::json;
 use warp::{Filter, Rejection};
 
+use crate::rest::recover_fn;
 use crate::{with_arg, BuildInfo, RuntimeInfo};
 
 #[derive(utoipa::OpenApi)]
@@ -34,7 +35,10 @@ pub fn node_info_handler(
     runtime_info: &'static RuntimeInfo,
     config: Arc<NodeConfig>,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
-    node_version_handler(build_info, runtime_info).or(node_config_handler(config))
+    node_version_handler(build_info, runtime_info)
+        .or(node_config_handler(config))
+        .recover(recover_fn)
+        .boxed()
 }
 
 #[utoipa::path(get, tag = "Node Info", path = "/version")]
@@ -105,7 +109,7 @@ mod tests {
 
         let runtime_info_json = info_json.get("runtime").unwrap();
         let expected_runtime_info_json = serde_json::json!({
-            "num_cpus_physical": runtime_info.num_cpus_physical,
+            "num_cpus": runtime_info.num_cpus,
         });
         assert_json_include!(
             actual: runtime_info_json,

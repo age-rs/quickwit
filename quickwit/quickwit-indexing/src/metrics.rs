@@ -19,7 +19,8 @@
 
 use once_cell::sync::Lazy;
 use quickwit_common::metrics::{
-    new_counter_vec, new_gauge, new_gauge_vec, IntCounterVec, IntGauge, IntGaugeVec,
+    new_counter, new_counter_vec, new_gauge, new_gauge_vec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec,
 };
 
 pub struct IndexerMetrics {
@@ -27,9 +28,13 @@ pub struct IndexerMetrics {
     pub processed_bytes: IntCounterVec<2>,
     pub backpressure_micros: IntCounterVec<1>,
     pub available_concurrent_upload_permits: IntGaugeVec<1>,
+    pub split_builders: IntGauge,
     pub ongoing_merge_operations: IntGauge,
     pub pending_merge_operations: IntGauge,
     pub pending_merge_bytes: IntGauge,
+    // We use a lazy counter, as most users do not use Kafka.
+    #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
+    pub kafka_rebalance_total: Lazy<IntCounter>,
 }
 
 impl Default for IndexerMetrics {
@@ -66,21 +71,38 @@ impl Default for IndexerMetrics {
                 &[],
                 ["component"],
             ),
+            split_builders: new_gauge(
+                "split_builders",
+                "Number of existing index writer instances.",
+                "indexing",
+                &[],
+            ),
             ongoing_merge_operations: new_gauge(
                 "ongoing_merge_operations",
                 "Number of ongoing merge operations",
                 "indexing",
+                &[],
             ),
             pending_merge_operations: new_gauge(
                 "pending_merge_operations",
                 "Number of pending merge operations",
                 "indexing",
+                &[],
             ),
             pending_merge_bytes: new_gauge(
                 "pending_merge_bytes",
                 "Number of pending merge bytes",
                 "indexing",
+                &[],
             ),
+            kafka_rebalance_total: Lazy::new(|| {
+                new_counter(
+                    "kafka_rebalance_total",
+                    "Number of kafka rebalances",
+                    "indexing",
+                    &[],
+                )
+            }),
         }
     }
 }

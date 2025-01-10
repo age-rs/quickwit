@@ -110,7 +110,7 @@ impl CodegenBuilder {
         self
     }
 
-    /// Generates `RpcName` trait implentations for request types.
+    /// Generates `RpcName` trait implementations for request types.
     pub fn generate_rpc_name_impls(mut self) -> Self {
         self.generate_prom_labels_for_requests = true;
         self
@@ -185,6 +185,7 @@ struct CodegenContext {
     stream_type_alias: TokenStream,
     methods: Vec<SynMethod>,
     client_name: Ident,
+    inner_client_name: Ident,
     tower_svc_stack_name: Ident,
     tower_layer_stack_name: Ident,
     mailbox_name: Ident,
@@ -208,7 +209,7 @@ impl CodegenContext {
         generate_extra_service_methods: bool,
     ) -> Self {
         let service_name = quote::format_ident!("{}", service.name);
-        let mock_mod_name = quote::format_ident!("{}_mock", service.name.to_snake_case());
+        let mock_mod_name = quote::format_ident!("mock_{}", service.name.to_snake_case());
         let mock_name = quote::format_ident!("Mock{}", service.name);
 
         let result_type = syn::parse_str::<syn::Path>(result_type_path)
@@ -227,6 +228,7 @@ impl CodegenContext {
         let methods = SynMethod::parse_prost_methods(&service.methods);
 
         let client_name = quote::format_ident!("{}Client", service.name);
+        let inner_client_name = quote::format_ident!("Inner{}", client_name);
         let tower_svc_stack_name = quote::format_ident!("{}TowerServiceStack", service.name);
         let tower_layer_stack_name = quote::format_ident!("{}TowerLayerStack", service.name);
         let mailbox_name = quote::format_ident!("{}Mailbox", service.name);
@@ -253,6 +255,7 @@ impl CodegenContext {
             stream_type_alias,
             methods,
             client_name,
+            inner_client_name,
             tower_svc_stack_name,
             tower_layer_stack_name,
             mailbox_name,
@@ -353,6 +356,16 @@ impl SynMethod {
         }
     }
 
+    fn rpc_name(&self, mock: bool) -> TokenStream {
+        let request_type = &self.request_type;
+
+        if mock {
+            quote! { super::#request_type::rpc_name() }
+        } else {
+            quote! { #request_type::rpc_name() }
+        }
+    }
+
     fn response_type(&self, context: &CodegenContext, mock: bool) -> TokenStream {
         let response_type = if mock {
             let response_type = &self.response_type;
@@ -434,10 +447,9 @@ fn generate_comment_attributes(comments: &Comments) -> Vec<syn::Attribute> {
 fn generate_service_trait(context: &CodegenContext) -> TokenStream {
     let service_name = &context.service_name;
     let trait_methods = generate_service_trait_methods(context);
-    let mock_name = &context.mock_name;
     let extra_trait_methods = if context.generate_extra_service_methods {
         quote! {
-            async fn check_connectivity(&mut self) -> anyhow::Result<()>;
+            async fn check_connectivity(&self) -> anyhow::Result<()>;
             fn endpoints(&self) -> Vec<quickwit_common::uri::Uri>;
         }
     } else {
@@ -447,18 +459,9 @@ fn generate_service_trait(context: &CodegenContext) -> TokenStream {
     quote! {
         #[cfg_attr(any(test, feature = "testsuite"), mockall::automock)]
         #[async_trait::async_trait]
-        pub trait #service_name: std::fmt::Debug + dyn_clone::DynClone + Send + Sync + 'static {
+        pub trait #service_name: std::fmt::Debug + Send + Sync + 'static {
             #trait_methods
             #extra_trait_methods
-        }
-
-        dyn_clone::clone_trait_object!(#service_name);
-
-        #[cfg(any(test, feature = "testsuite"))]
-        impl Clone for #mock_name {
-            fn clone(&self) -> Self {
-                #mock_name::new()
-            }
         }
     }
 }
@@ -475,7 +478,7 @@ fn generate_service_trait_methods(context: &CodegenContext) -> TokenStream {
         let response_type = syn_method.response_type(context, false);
         let method = quote! {
             #(#comments)*
-            async fn #method_name(&mut self, request: #request_type) -> #result_type<#response_type>;
+            async fn #method_name(&self, request: #request_type) -> #result_type<#response_type>;
         };
         stream.extend(method);
     }
@@ -484,12 +487,12 @@ fn generate_service_trait_methods(context: &CodegenContext) -> TokenStream {
 
 fn generate_extra_methods_calling_inner() -> TokenStream {
     quote! {
-        async fn check_connectivity(&mut self) -> anyhow::Result<()> {
-            self.inner.check_connectivity().await
+        async fn check_connectivity(&self) -> anyhow::Result<()> {
+            self.inner.0.check_connectivity().await
         }
 
         fn endpoints(&self) -> Vec<quickwit_common::uri::Uri> {
-            self.inner.endpoints()
+            self.inner.0.endpoints()
         }
     }
 }
@@ -497,6 +500,7 @@ fn generate_extra_methods_calling_inner() -> TokenStream {
 fn generate_client(context: &CodegenContext) -> TokenStream {
     let service_name = &context.service_name;
     let client_name = &context.client_name;
+    let inner_client_name = &context.inner_client_name;
 
     let grpc_client_name = &context.grpc_client_name;
     let grpc_client_adapter_name = &context.grpc_client_adapter_name;
@@ -513,9 +517,9 @@ fn generate_client(context: &CodegenContext) -> TokenStream {
     let tower_layer_stack_name = &context.tower_layer_stack_name;
     let mock_name = &context.mock_name;
     let mock_wrapper_name = quote::format_ident!("{}Wrapper", mock_name);
-    let error_mesage = format!(
-        "`{}` must be wrapped in a `{}`. Use `{}::from(mock)` to instantiate the client.",
-        mock_name, mock_wrapper_name, mock_name
+    let error_message = format!(
+        "`{}` must be wrapped in a `{}`: use `{}::from_mock(mock)` to instantiate the client",
+        mock_name, mock_wrapper_name, client_name
     );
     let extra_client_methods = if context.generate_extra_service_methods {
         generate_extra_methods_calling_inner()
@@ -524,7 +528,7 @@ fn generate_client(context: &CodegenContext) -> TokenStream {
     };
     let extra_mock_methods = if context.generate_extra_service_methods {
         quote! {
-            async fn check_connectivity(&mut self) -> anyhow::Result<()> {
+            async fn check_connectivity(&self) -> anyhow::Result<()> {
                 self.inner.lock().await.check_connectivity().await
             }
 
@@ -539,8 +543,11 @@ fn generate_client(context: &CodegenContext) -> TokenStream {
     quote! {
         #[derive(Debug, Clone)]
         pub struct #client_name {
-            inner: Box<dyn #service_name>
+            inner: #inner_client_name,
         }
+
+        #[derive(Debug, Clone)]
+        struct #inner_client_name(std::sync::Arc<dyn #service_name>);
 
         impl #client_name {
             pub fn new<T>(instance: T) -> Self
@@ -548,9 +555,9 @@ fn generate_client(context: &CodegenContext) -> TokenStream {
                 T: #service_name,
             {
                 #[cfg(any(test, feature = "testsuite"))]
-                assert!(std::any::TypeId::of::<T>() != std::any::TypeId::of::<#mock_name>(), #error_mesage);
+                assert!(std::any::TypeId::of::<T>() != std::any::TypeId::of::<#mock_name>(), #error_message);
                 Self {
-                    inner: Box::new(instance),
+                    inner: #inner_client_name(std::sync::Arc::new(instance)),
                 }
             }
 
@@ -594,8 +601,16 @@ fn generate_client(context: &CodegenContext) -> TokenStream {
             }
 
             #[cfg(any(test, feature = "testsuite"))]
-            pub fn mock() -> #mock_name {
-                #mock_name::new()
+            pub fn from_mock(mock: #mock_name) -> Self {
+                let mock_wrapper = #mock_mod_name::#mock_wrapper_name {
+                    inner: tokio::sync::Mutex::new(mock)
+                };
+                Self::new(mock_wrapper)
+            }
+
+            #[cfg(any(test, feature = "testsuite"))]
+            pub fn mocked() -> Self {
+                Self::from_mock(#mock_name::new())
             }
         }
 
@@ -609,24 +624,15 @@ fn generate_client(context: &CodegenContext) -> TokenStream {
         pub mod #mock_mod_name {
             use super::*;
 
-            #[derive(Debug, Clone)]
-            struct #mock_wrapper_name {
-                inner: std::sync::Arc<tokio::sync::Mutex<#mock_name>>
+            #[derive(Debug)]
+            pub struct #mock_wrapper_name {
+                pub(super) inner: tokio::sync::Mutex<#mock_name>
             }
 
             #[async_trait::async_trait]
             impl #service_name for #mock_wrapper_name {
                 #mock_methods
                 #extra_mock_methods
-            }
-
-            impl From<#mock_name> for #client_name {
-                fn from(mock: #mock_name) -> Self {
-                    let mock_wrapper = #mock_wrapper_name {
-                        inner: std::sync::Arc::new(tokio::sync::Mutex::new(mock))
-                    };
-                    #client_name::new(mock_wrapper)
-                }
             }
         }
     }
@@ -644,7 +650,7 @@ fn generate_client_methods(context: &CodegenContext, mock: bool) -> TokenStream 
 
         let body = if !mock {
             quote! {
-                self.inner.#method_name(request).await
+                self.inner.0.#method_name(request).await
             }
         } else {
             quote! {
@@ -652,7 +658,7 @@ fn generate_client_methods(context: &CodegenContext, mock: bool) -> TokenStream 
             }
         };
         let method = quote! {
-            async fn #method_name(&mut self, request: #request_type) -> #result_type<#response_type> {
+            async fn #method_name(&self, request: #request_type) -> #result_type<#response_type> {
                 #body
             }
         };
@@ -662,7 +668,7 @@ fn generate_client_methods(context: &CodegenContext, mock: bool) -> TokenStream 
 }
 
 fn generate_tower_services(context: &CodegenContext) -> TokenStream {
-    let service_name = &context.service_name;
+    let inner_client_name = &context.inner_client_name;
     let error_type = &context.error_type;
 
     let mut stream = TokenStream::new();
@@ -673,7 +679,7 @@ fn generate_tower_services(context: &CodegenContext) -> TokenStream {
         let response_type = syn_method.response_type(context, false);
 
         let service = quote! {
-            impl tower::Service<#request_type> for Box<dyn #service_name> {
+            impl tower::Service<#request_type> for #inner_client_name {
                 type Response = #response_type;
                 type Error = #error_type;
                 type Future = BoxFuture<Self::Response, Self::Error>;
@@ -686,8 +692,8 @@ fn generate_tower_services(context: &CodegenContext) -> TokenStream {
                 }
 
                 fn call(&mut self, request: #request_type) -> Self::Future {
-                    let mut svc = self.clone();
-                    let fut = async move { svc.#method_name(request).await };
+                    let svc = self.clone();
+                    let fut = async move { svc.0.#method_name(request).await };
                     Box::pin(fut)
                 }
             }
@@ -699,21 +705,20 @@ fn generate_tower_services(context: &CodegenContext) -> TokenStream {
 
 fn generate_tower_svc_stack(context: &CodegenContext) -> TokenStream {
     let tower_svc_stack_name = &context.tower_svc_stack_name;
-    let service_name = &context.service_name;
+    let inner_client_name = &context.inner_client_name;
     let tower_svc_stack_attributes = generate_tower_svc_stack_attributes(context);
-    let tower_svc_stack_clone_impl = generate_tower_svc_stack_clone_impl(context);
     let tower_svc_stack_service_impl = generate_tower_svc_stack_service_impl(context);
 
     quote! {
         /// A tower service stack is a set of tower services.
         #[derive(Debug)]
         struct #tower_svc_stack_name {
-            inner: Box<dyn #service_name>,
+            // TODO: remove this field once `check_connectivity` is used for all services.
+            #[allow(dead_code)]
+            inner: #inner_client_name,
 
             #tower_svc_stack_attributes
         }
-
-        #tower_svc_stack_clone_impl
 
         #tower_svc_stack_service_impl
     }
@@ -737,31 +742,6 @@ fn generate_tower_svc_stack_attributes(context: &CodegenContext) -> TokenStream 
     stream
 }
 
-fn generate_tower_svc_stack_clone_impl(context: &CodegenContext) -> TokenStream {
-    let tower_svc_stack_name = &context.tower_svc_stack_name;
-
-    let mut cloned_attributes = TokenStream::new();
-
-    for syn_method in &context.methods {
-        let attribute_name = quote::format_ident!("{}_svc", syn_method.name);
-        let attribute = quote! {
-            #attribute_name: self.#attribute_name.clone(),
-        };
-        cloned_attributes.extend(attribute);
-    }
-
-    quote! {
-        impl Clone for #tower_svc_stack_name {
-            fn clone(&self) -> Self {
-                Self {
-                    inner: self.inner.clone(),
-                    #cloned_attributes
-                }
-            }
-        }
-    }
-}
-
 fn generate_tower_svc_stack_service_impl(context: &CodegenContext) -> TokenStream {
     let service_name = &context.service_name;
     let tower_svc_stack_name = &context.tower_svc_stack_name;
@@ -780,8 +760,8 @@ fn generate_tower_svc_stack_service_impl(context: &CodegenContext) -> TokenStrea
         let response_type = syn_method.response_type(context, false);
 
         let attribute = quote! {
-            async fn #method_name(&mut self, request: #request_type) -> #result_type<#response_type> {
-                self.#attribute_name.ready().await?.call(request).await
+            async fn #method_name(&self, request: #request_type) -> #result_type<#response_type> {
+                self.#attribute_name.clone().ready().await?.call(request).await
             }
         };
         methods.extend(attribute);
@@ -844,7 +824,9 @@ fn generate_layer_stack_types_and_attributes(
 fn generate_layer_stack_impl(context: &CodegenContext) -> TokenStream {
     let service_name = &context.service_name;
     let client_name = &context.client_name;
+    let inner_client_name = &context.inner_client_name;
     let mailbox_name = &context.mailbox_name;
+    let mock_name = &context.mock_name;
     let tower_svc_stack_name = &context.tower_svc_stack_name;
     let tower_layer_stack_name = &context.tower_layer_stack_name;
     let error_type = &context.error_type;
@@ -894,7 +876,7 @@ fn generate_layer_stack_impl(context: &CodegenContext) -> TokenStream {
         layer_methods.extend(layer_method);
 
         let svc_statement = quote! {
-            let #svc_attribute_name = self.#layer_attribute_name.into_iter().rev().fold(quickwit_common::tower::BoxService::new(boxed_instance.clone()), |svc, layer| layer.layer(svc));
+            let #svc_attribute_name = self.#layer_attribute_name.into_iter().rev().fold(quickwit_common::tower::BoxService::new(inner_client.clone()), |svc, layer| layer.layer(svc));
         };
         svc_statements.extend(svc_statement);
 
@@ -917,17 +899,22 @@ fn generate_layer_stack_impl(context: &CodegenContext) -> TokenStream {
             where
                 T: #service_name
             {
-                self.build_from_boxed(Box::new(instance))
+                let inner_client = #inner_client_name(std::sync::Arc::new(instance));
+                self.build_from_inner_client(inner_client)
             }
 
             pub fn build_from_channel(self, addr: std::net::SocketAddr, channel: tonic::transport::Channel, max_message_size: bytesize::ByteSize) -> #client_name
             {
-                self.build_from_boxed(Box::new(#client_name::from_channel(addr, channel, max_message_size)))
+                let client =  #client_name::from_channel(addr, channel, max_message_size);
+                let inner_client = client.inner;
+                self.build_from_inner_client(inner_client)
             }
 
             pub fn build_from_balance_channel(self, balance_channel: quickwit_common::tower::BalanceChannel<std::net::SocketAddr>, max_message_size: bytesize::ByteSize) -> #client_name
             {
-                self.build_from_boxed(Box::new(#client_name::from_balance_channel(balance_channel, max_message_size)))
+                let client =  #client_name::from_balance_channel(balance_channel, max_message_size);
+                let inner_client = client.inner;
+                self.build_from_inner_client(inner_client)
             }
 
             pub fn build_from_mailbox<A>(self, mailbox: quickwit_actors::Mailbox<A>) -> #client_name
@@ -935,15 +922,23 @@ fn generate_layer_stack_impl(context: &CodegenContext) -> TokenStream {
                 A: quickwit_actors::Actor + std::fmt::Debug + Send + 'static,
                 #mailbox_name<A>: #service_name,
             {
-                self.build_from_boxed(Box::new(#mailbox_name::new(mailbox)))
+                let inner_client = #inner_client_name(std::sync::Arc::new(#mailbox_name::new(mailbox)));
+                self.build_from_inner_client(inner_client)
             }
 
-            fn build_from_boxed(self, boxed_instance: Box<dyn #service_name>) -> #client_name
+            #[cfg(any(test, feature = "testsuite"))]
+            pub fn build_from_mock(self, mock: #mock_name) -> #client_name {
+                let client = #client_name::from_mock(mock);
+                let inner_client = client.inner;
+                self.build_from_inner_client(inner_client)
+            }
+
+            fn build_from_inner_client(self, inner_client: #inner_client_name) -> #client_name
             {
                 #svc_statements
 
                 let tower_svc_stack = #tower_svc_stack_name {
-                    inner: boxed_instance.clone(),
+                    inner: inner_client,
                     #(#svc_attribute_idents),*
                 };
                 #client_name::new(tower_svc_stack)
@@ -958,7 +953,7 @@ fn generate_tower_mailbox(context: &CodegenContext) -> TokenStream {
     let error_type = &context.error_type;
     let extra_mailbox_methods = if context.generate_extra_service_methods {
         quote! {
-            async fn check_connectivity(&mut self) -> anyhow::Result<()> {
+            async fn check_connectivity(&self) -> anyhow::Result<()> {
                 if self.inner.is_disconnected() {
                     anyhow::bail!("actor `{}` is disconnected", self.inner.actor_instance_id())
                 }
@@ -1080,8 +1075,8 @@ fn generate_mailbox_bounds_and_methods(
         bounds.push(bound);
 
         let method = quote! {
-            async fn #method_name(&mut self, request: #request_type) -> #result_type<#response_type> {
-                self.call(request).await
+            async fn #method_name(&self, request: #request_type) -> #result_type<#response_type> {
+                self.clone().call(request).await
             }
         };
         methods.extend(method);
@@ -1099,7 +1094,7 @@ fn generate_grpc_client_adapter(context: &CodegenContext) -> TokenStream {
     let grpc_server_adapter_methods = generate_grpc_client_adapter_methods(context);
     let extra_grpc_server_adapter_methods = if context.generate_extra_service_methods {
         quote! {
-            async fn check_connectivity(&mut self) -> anyhow::Result<()> {
+            async fn check_connectivity(&self) -> anyhow::Result<()> {
                 if self.connection_addrs_rx.borrow().len() == 0 {
                     anyhow::bail!("no server currently available")
                 }
@@ -1158,6 +1153,7 @@ fn generate_grpc_client_adapter_methods(context: &CodegenContext) -> TokenStream
     for syn_method in &context.methods {
         let method_name = syn_method.name.to_token_stream();
         let request_type = syn_method.request_type(false);
+        let rpc_name = syn_method.rpc_name(false);
         let response_type = syn_method.response_type(context, false);
 
         let into_response_type = if syn_method.server_streaming {
@@ -1165,19 +1161,20 @@ fn generate_grpc_client_adapter_methods(context: &CodegenContext) -> TokenStream
                 {
                     let streaming: tonic::Streaming<_> = response.into_inner();
                     let stream = quickwit_common::ServiceStream::from(streaming);
-                    stream.map_err(|error| error.into())
+                    stream.map_err(|status| crate::error::grpc_status_to_service_error(status, #rpc_name))
                 }
             }
         } else {
             quote! { |response| response.into_inner() }
         };
         let method = quote! {
-            async fn #method_name(&mut self, request: #request_type) -> #result_type<#response_type> {
+            async fn #method_name(&self, request: #request_type) -> #result_type<#response_type> {
                 self.inner
+                    .clone()
                     .#method_name(request)
                     .await
                     .map(#into_response_type)
-                    .map_err(|error| error.into())
+                    .map_err(|status| crate::error::grpc_status_to_service_error(status, #rpc_name))
             }
         };
         stream.extend(method);
@@ -1187,6 +1184,7 @@ fn generate_grpc_client_adapter_methods(context: &CodegenContext) -> TokenStream
 
 fn generate_grpc_server_adapter(context: &CodegenContext) -> TokenStream {
     let service_name = &context.service_name;
+    let inner_client_name = &context.inner_client_name;
     let grpc_server_package_name = &context.grpc_server_package_name;
     let grpc_service_name = &context.grpc_service_name;
     let grpc_server_adapter_name = &context.grpc_server_adapter_name;
@@ -1195,14 +1193,14 @@ fn generate_grpc_server_adapter(context: &CodegenContext) -> TokenStream {
     quote! {
         #[derive(Debug)]
         pub struct #grpc_server_adapter_name {
-            inner: Box<dyn #service_name>,
+            inner: #inner_client_name,
         }
 
         impl #grpc_server_adapter_name {
             pub fn new<T>(instance: T) -> Self
             where T: #service_name {
                 Self {
-                    inner: Box::new(instance),
+                    inner: #inner_client_name(std::sync::Arc::new(instance)),
                 }
             }
         }
@@ -1250,7 +1248,7 @@ fn generate_grpc_server_adapter_methods(context: &CodegenContext) -> TokenStream
         };
         let into_response_type = if syn_method.server_streaming {
             quote! {
-                |stream| tonic::Response::new(stream.map_err(|error| error.into()))
+                |stream| tonic::Response::new(stream.map_err(crate::error::grpc_error_to_grpc_status))
             }
         } else {
             quote! { tonic::Response::new }
@@ -1260,11 +1258,11 @@ fn generate_grpc_server_adapter_methods(context: &CodegenContext) -> TokenStream
 
             async fn #method_name(&self, request: tonic::Request<#request_type>) -> Result<tonic::Response<#response_type>, tonic::Status> {
                 self.inner
-                    .clone()
+                    .0
                     .#method_name(#method_arg)
                     .await
                     .map(#into_response_type)
-                    .map_err(|error| error.into())
+                    .map_err(crate::error::grpc_error_to_grpc_status)
             }
         };
         stream.extend(method);

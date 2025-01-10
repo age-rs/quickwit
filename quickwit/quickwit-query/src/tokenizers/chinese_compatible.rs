@@ -79,7 +79,7 @@ fn char_grouping(c: char) -> Grouping {
     }
 }
 
-impl<'a> TokenStream for ChineseTokenStream<'a> {
+impl TokenStream for ChineseTokenStream<'_> {
     fn advance(&mut self) -> bool {
         self.token.text.clear();
         self.token.position = self.token.position.wrapping_add(1);
@@ -145,7 +145,7 @@ mod tests {
             res.push(tok.clone());
         }
 
-        // latin alphabet splited on white spaces, Han split on each char
+        // latin alphabet split on white spaces, Han split on each char
         let expected = [
             Token {
                 offset_from: 0,

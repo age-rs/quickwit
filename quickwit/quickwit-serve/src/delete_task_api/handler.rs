@@ -25,19 +25,20 @@ use quickwit_proto::metastore::{
     MetastoreService, MetastoreServiceClient,
 };
 use quickwit_proto::search::SearchRequest;
-use quickwit_proto::types::IndexUid;
+use quickwit_proto::types::{IndexId, IndexUid};
 use quickwit_query::query_ast::{query_ast_from_user_text, QueryAst};
 use serde::Deserialize;
 use warp::{Filter, Rejection};
 
 use crate::format::extract_format_from_qs;
+use crate::rest::recover_fn;
 use crate::rest_api_response::into_rest_api_response;
 use crate::with_arg;
 
 #[derive(utoipa::OpenApi)]
 #[openapi(
     paths(get_delete_tasks, post_delete_request),
-    components(schemas(DeleteQueryRequest, DeleteTask, DeleteQuery,))
+    components(schemas(DeleteQueryRequest, DeleteTask, DeleteQuery))
 )]
 pub struct DeleteTaskApi;
 
@@ -61,7 +62,10 @@ pub struct DeleteQueryRequest {
 pub fn delete_task_api_handlers(
     metastore: MetastoreServiceClient,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
-    get_delete_tasks_handler(metastore.clone()).or(post_delete_tasks_handler(metastore.clone()))
+    get_delete_tasks_handler(metastore.clone())
+        .or(post_delete_tasks_handler(metastore.clone()))
+        .recover(recover_fn)
+        .boxed()
 }
 
 pub fn get_delete_tasks_handler(
@@ -94,8 +98,8 @@ pub fn get_delete_tasks_handler(
 // `DeleteTaskService`. This is ensured by requiring a `Mailbox<DeleteTaskService>` in
 // `get_delete_tasks_handler` and consequently we get the mailbox in `get_delete_tasks` signature.
 pub async fn get_delete_tasks(
-    index_id: String,
-    mut metastore: MetastoreServiceClient,
+    index_id: IndexId,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<Vec<DeleteTask>> {
     let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
     let index_uid: IndexUid = metastore
@@ -140,9 +144,9 @@ pub fn post_delete_tasks_handler(
 /// This operation will not be immediately executed, instead it will be added to a queue
 /// and cleaned up in the near future.
 pub async fn post_delete_request(
-    index_id: String,
+    index_id: IndexId,
     delete_request: DeleteQueryRequest,
-    mut metastore: MetastoreServiceClient,
+    metastore: MetastoreServiceClient,
 ) -> Result<DeleteTask, JanitorError> {
     let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
     let metadata = metastore
@@ -220,7 +224,7 @@ mod tests {
         assert_eq!(created_delete_query.index_uid(), &test_sandbox.index_uid());
         assert_eq!(
             created_delete_query.query_ast,
-            r#"{"type":"full_text","field":"body","text":"myterm","params":{"mode":{"type":"phrase_fallback_to_intersection"}}}"#
+            r#"{"type":"full_text","field":"body","text":"myterm","params":{"mode":{"type":"phrase_fallback_to_intersection"}},"lenient":false}"#
         );
         assert_eq!(created_delete_query.start_timestamp, Some(1));
         assert_eq!(created_delete_query.end_timestamp, Some(10));

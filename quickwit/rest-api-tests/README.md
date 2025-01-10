@@ -34,7 +34,7 @@ running in DEBUG mode is fine.
 ```
 
 When targeting elasticsearch, the script expects elastic to be running on
-`http://localhost:9200`.
+`http://localhost:9200` (see [compose script](./docker-compose.yaml)).
 
 In both cases, the test will take care of setting up, ingesting and tearing down the
 indexes involved.
@@ -56,7 +56,7 @@ This engine-specific context is perfect if you know all steps will target a spec
 Once the context is loaded, the steps described in `_setup.yaml` and `_setup.<engine>.yaml` (if present) will be executed.
 
 These steps are just like any other steps except you are guaranteed they will be executed respectively before and after all other steps.
-In particular, when targetting one specific test using the `--test flag`,
+In particular, when targeting one specific test using the `--test flag`,
 the necessary `setup` and `teardown` script will be automatically executed.
 
 # teardown

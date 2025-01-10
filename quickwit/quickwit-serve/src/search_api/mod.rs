@@ -23,8 +23,9 @@ mod rest_handler;
 pub use self::grpc_adapter::GrpcSearchAdapter;
 pub(crate) use self::rest_handler::{extract_index_id_patterns, extract_index_id_patterns_default};
 pub use self::rest_handler::{
-    search_get_handler, search_post_handler, search_request_from_api_request,
-    search_stream_handler, SearchApi, SearchRequestQueryString, SortBy,
+    search_get_handler, search_plan_get_handler, search_plan_post_handler, search_post_handler,
+    search_request_from_api_request, search_stream_handler, SearchApi, SearchRequestQueryString,
+    SortBy,
 };
 
 #[cfg(test)]
@@ -38,7 +39,7 @@ mod tests {
     use quickwit_indexing::MockSplitBuilder;
     use quickwit_metastore::{IndexMetadata, IndexMetadataResponseExt, ListSplitsResponseExt};
     use quickwit_proto::metastore::{
-        IndexMetadataResponse, ListSplitsResponse, MetastoreServiceClient,
+        IndexMetadataResponse, ListSplitsResponse, MetastoreServiceClient, MockMetastoreService,
     };
     use quickwit_proto::search::search_service_server::SearchServiceServer;
     use quickwit_proto::search::OutputFormat;
@@ -81,13 +82,13 @@ mod tests {
             output_format: OutputFormat::Csv as i32,
             partition_by_field: None,
         };
-        let mut metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         let index_metadata = IndexMetadata::for_test("test-index", "ram:///indexes/test-index");
         let index_uid = index_metadata.index_uid.clone();
-        metastore.expect_index_metadata().returning(move |_| {
+        mock_metastore.expect_index_metadata().returning(move |_| {
             Ok(IndexMetadataResponse::try_from_index_metadata(&index_metadata).unwrap())
         });
-        metastore.expect_list_splits().returning(move |_| {
+        mock_metastore.expect_list_splits().returning(move |_| {
             let splits = vec![
                 MockSplitBuilder::new("split_1")
                     .with_index_uid(&index_uid)
@@ -137,7 +138,7 @@ mod tests {
         let cluster_client = ClusterClient::new(search_job_placer.clone());
         let stream = root_search_stream(
             request,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             cluster_client,
         )
         .await?;

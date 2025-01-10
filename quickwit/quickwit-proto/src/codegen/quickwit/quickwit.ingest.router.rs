@@ -47,6 +47,10 @@ pub struct IngestSuccess {
     /// Replication position inclusive.
     #[prost(message, optional, tag = "5")]
     pub replication_position_inclusive: ::core::option::Option<crate::types::Position>,
+    #[prost(uint32, tag = "6")]
+    pub num_ingested_docs: u32,
+    #[prost(message, repeated, tag = "7")]
+    pub parse_failures: ::prost::alloc::vec::Vec<super::ParseFailure>,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -71,8 +75,12 @@ pub enum IngestFailureReason {
     SourceNotFound = 2,
     Internal = 3,
     NoShardsAvailable = 4,
-    RateLimited = 5,
-    ResourceExhausted = 6,
+    ShardRateLimited = 5,
+    WalFull = 6,
+    Timeout = 7,
+    RouterLoadShedding = 8,
+    LoadShedding = 9,
+    CircuitBreaker = 10,
 }
 impl IngestFailureReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -90,9 +98,17 @@ impl IngestFailureReason {
             IngestFailureReason::NoShardsAvailable => {
                 "INGEST_FAILURE_REASON_NO_SHARDS_AVAILABLE"
             }
-            IngestFailureReason::RateLimited => "INGEST_FAILURE_REASON_RATE_LIMITED",
-            IngestFailureReason::ResourceExhausted => {
-                "INGEST_FAILURE_REASON_RESOURCE_EXHAUSTED"
+            IngestFailureReason::ShardRateLimited => {
+                "INGEST_FAILURE_REASON_SHARD_RATE_LIMITED"
+            }
+            IngestFailureReason::WalFull => "INGEST_FAILURE_REASON_WAL_FULL",
+            IngestFailureReason::Timeout => "INGEST_FAILURE_REASON_TIMEOUT",
+            IngestFailureReason::RouterLoadShedding => {
+                "INGEST_FAILURE_REASON_ROUTER_LOAD_SHEDDING"
+            }
+            IngestFailureReason::LoadShedding => "INGEST_FAILURE_REASON_LOAD_SHEDDING",
+            IngestFailureReason::CircuitBreaker => {
+                "INGEST_FAILURE_REASON_CIRCUIT_BREAKER"
             }
         }
     }
@@ -104,8 +120,14 @@ impl IngestFailureReason {
             "INGEST_FAILURE_REASON_SOURCE_NOT_FOUND" => Some(Self::SourceNotFound),
             "INGEST_FAILURE_REASON_INTERNAL" => Some(Self::Internal),
             "INGEST_FAILURE_REASON_NO_SHARDS_AVAILABLE" => Some(Self::NoShardsAvailable),
-            "INGEST_FAILURE_REASON_RATE_LIMITED" => Some(Self::RateLimited),
-            "INGEST_FAILURE_REASON_RESOURCE_EXHAUSTED" => Some(Self::ResourceExhausted),
+            "INGEST_FAILURE_REASON_SHARD_RATE_LIMITED" => Some(Self::ShardRateLimited),
+            "INGEST_FAILURE_REASON_WAL_FULL" => Some(Self::WalFull),
+            "INGEST_FAILURE_REASON_TIMEOUT" => Some(Self::Timeout),
+            "INGEST_FAILURE_REASON_ROUTER_LOAD_SHEDDING" => {
+                Some(Self::RouterLoadShedding)
+            }
+            "INGEST_FAILURE_REASON_LOAD_SHEDDING" => Some(Self::LoadShedding),
+            "INGEST_FAILURE_REASON_CIRCUIT_BREAKER" => Some(Self::CircuitBreaker),
             _ => None,
         }
     }
@@ -122,25 +144,20 @@ impl RpcName for IngestRequestV2 {
 }
 #[cfg_attr(any(test, feature = "testsuite"), mockall::automock)]
 #[async_trait::async_trait]
-pub trait IngestRouterService: std::fmt::Debug + dyn_clone::DynClone + Send + Sync + 'static {
+pub trait IngestRouterService: std::fmt::Debug + Send + Sync + 'static {
     /// Ingests batches of documents for one or multiple indexes.
     /// TODO: Describe error cases and how to handle them.
     async fn ingest(
-        &mut self,
+        &self,
         request: IngestRequestV2,
     ) -> crate::ingest::IngestV2Result<IngestResponseV2>;
 }
-dyn_clone::clone_trait_object!(IngestRouterService);
-#[cfg(any(test, feature = "testsuite"))]
-impl Clone for MockIngestRouterService {
-    fn clone(&self) -> Self {
-        MockIngestRouterService::new()
-    }
-}
 #[derive(Debug, Clone)]
 pub struct IngestRouterServiceClient {
-    inner: Box<dyn IngestRouterService>,
+    inner: InnerIngestRouterServiceClient,
 }
+#[derive(Debug, Clone)]
+struct InnerIngestRouterServiceClient(std::sync::Arc<dyn IngestRouterService>);
 impl IngestRouterServiceClient {
     pub fn new<T>(instance: T) -> Self
     where
@@ -150,9 +167,11 @@ impl IngestRouterServiceClient {
         assert!(
             std::any::TypeId::of:: < T > () != std::any::TypeId::of:: <
             MockIngestRouterService > (),
-            "`MockIngestRouterService` must be wrapped in a `MockIngestRouterServiceWrapper`. Use `MockIngestRouterService::from(mock)` to instantiate the client."
+            "`MockIngestRouterService` must be wrapped in a `MockIngestRouterServiceWrapper`: use `IngestRouterServiceClient::from_mock(mock)` to instantiate the client"
         );
-        Self { inner: Box::new(instance) }
+        Self {
+            inner: InnerIngestRouterServiceClient(std::sync::Arc::new(instance)),
+        }
     }
     pub fn as_grpc_service(
         &self,
@@ -211,48 +230,47 @@ impl IngestRouterServiceClient {
         IngestRouterServiceTowerLayerStack::default()
     }
     #[cfg(any(test, feature = "testsuite"))]
-    pub fn mock() -> MockIngestRouterService {
-        MockIngestRouterService::new()
+    pub fn from_mock(mock: MockIngestRouterService) -> Self {
+        let mock_wrapper = mock_ingest_router_service::MockIngestRouterServiceWrapper {
+            inner: tokio::sync::Mutex::new(mock),
+        };
+        Self::new(mock_wrapper)
+    }
+    #[cfg(any(test, feature = "testsuite"))]
+    pub fn mocked() -> Self {
+        Self::from_mock(MockIngestRouterService::new())
     }
 }
 #[async_trait::async_trait]
 impl IngestRouterService for IngestRouterServiceClient {
     async fn ingest(
-        &mut self,
+        &self,
         request: IngestRequestV2,
     ) -> crate::ingest::IngestV2Result<IngestResponseV2> {
-        self.inner.ingest(request).await
+        self.inner.0.ingest(request).await
     }
 }
 #[cfg(any(test, feature = "testsuite"))]
-pub mod ingest_router_service_mock {
+pub mod mock_ingest_router_service {
     use super::*;
-    #[derive(Debug, Clone)]
-    struct MockIngestRouterServiceWrapper {
-        inner: std::sync::Arc<tokio::sync::Mutex<MockIngestRouterService>>,
+    #[derive(Debug)]
+    pub struct MockIngestRouterServiceWrapper {
+        pub(super) inner: tokio::sync::Mutex<MockIngestRouterService>,
     }
     #[async_trait::async_trait]
     impl IngestRouterService for MockIngestRouterServiceWrapper {
         async fn ingest(
-            &mut self,
+            &self,
             request: super::IngestRequestV2,
         ) -> crate::ingest::IngestV2Result<super::IngestResponseV2> {
             self.inner.lock().await.ingest(request).await
-        }
-    }
-    impl From<MockIngestRouterService> for IngestRouterServiceClient {
-        fn from(mock: MockIngestRouterService) -> Self {
-            let mock_wrapper = MockIngestRouterServiceWrapper {
-                inner: std::sync::Arc::new(tokio::sync::Mutex::new(mock)),
-            };
-            IngestRouterServiceClient::new(mock_wrapper)
         }
     }
 }
 pub type BoxFuture<T, E> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'static>,
 >;
-impl tower::Service<IngestRequestV2> for Box<dyn IngestRouterService> {
+impl tower::Service<IngestRequestV2> for InnerIngestRouterServiceClient {
     type Response = IngestResponseV2;
     type Error = crate::ingest::IngestV2Error;
     type Future = BoxFuture<Self::Response, Self::Error>;
@@ -263,36 +281,29 @@ impl tower::Service<IngestRequestV2> for Box<dyn IngestRouterService> {
         std::task::Poll::Ready(Ok(()))
     }
     fn call(&mut self, request: IngestRequestV2) -> Self::Future {
-        let mut svc = self.clone();
-        let fut = async move { svc.ingest(request).await };
+        let svc = self.clone();
+        let fut = async move { svc.0.ingest(request).await };
         Box::pin(fut)
     }
 }
 /// A tower service stack is a set of tower services.
 #[derive(Debug)]
 struct IngestRouterServiceTowerServiceStack {
-    inner: Box<dyn IngestRouterService>,
+    #[allow(dead_code)]
+    inner: InnerIngestRouterServiceClient,
     ingest_svc: quickwit_common::tower::BoxService<
         IngestRequestV2,
         IngestResponseV2,
         crate::ingest::IngestV2Error,
     >,
 }
-impl Clone for IngestRouterServiceTowerServiceStack {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            ingest_svc: self.ingest_svc.clone(),
-        }
-    }
-}
 #[async_trait::async_trait]
 impl IngestRouterService for IngestRouterServiceTowerServiceStack {
     async fn ingest(
-        &mut self,
+        &self,
         request: IngestRequestV2,
     ) -> crate::ingest::IngestV2Result<IngestResponseV2> {
-        self.ingest_svc.ready().await?.call(request).await
+        self.ingest_svc.clone().ready().await?.call(request).await
     }
 }
 type IngestLayer = quickwit_common::tower::BoxLayer<
@@ -364,7 +375,8 @@ impl IngestRouterServiceTowerLayerStack {
     where
         T: IngestRouterService,
     {
-        self.build_from_boxed(Box::new(instance))
+        let inner_client = InnerIngestRouterServiceClient(std::sync::Arc::new(instance));
+        self.build_from_inner_client(inner_client)
     }
     pub fn build_from_channel(
         self,
@@ -372,25 +384,25 @@ impl IngestRouterServiceTowerLayerStack {
         channel: tonic::transport::Channel,
         max_message_size: bytesize::ByteSize,
     ) -> IngestRouterServiceClient {
-        self.build_from_boxed(
-            Box::new(
-                IngestRouterServiceClient::from_channel(addr, channel, max_message_size),
-            ),
-        )
+        let client = IngestRouterServiceClient::from_channel(
+            addr,
+            channel,
+            max_message_size,
+        );
+        let inner_client = client.inner;
+        self.build_from_inner_client(inner_client)
     }
     pub fn build_from_balance_channel(
         self,
         balance_channel: quickwit_common::tower::BalanceChannel<std::net::SocketAddr>,
         max_message_size: bytesize::ByteSize,
     ) -> IngestRouterServiceClient {
-        self.build_from_boxed(
-            Box::new(
-                IngestRouterServiceClient::from_balance_channel(
-                    balance_channel,
-                    max_message_size,
-                ),
-            ),
-        )
+        let client = IngestRouterServiceClient::from_balance_channel(
+            balance_channel,
+            max_message_size,
+        );
+        let inner_client = client.inner;
+        self.build_from_inner_client(inner_client)
     }
     pub fn build_from_mailbox<A>(
         self,
@@ -400,22 +412,34 @@ impl IngestRouterServiceTowerLayerStack {
         A: quickwit_actors::Actor + std::fmt::Debug + Send + 'static,
         IngestRouterServiceMailbox<A>: IngestRouterService,
     {
-        self.build_from_boxed(Box::new(IngestRouterServiceMailbox::new(mailbox)))
+        let inner_client = InnerIngestRouterServiceClient(
+            std::sync::Arc::new(IngestRouterServiceMailbox::new(mailbox)),
+        );
+        self.build_from_inner_client(inner_client)
     }
-    fn build_from_boxed(
+    #[cfg(any(test, feature = "testsuite"))]
+    pub fn build_from_mock(
         self,
-        boxed_instance: Box<dyn IngestRouterService>,
+        mock: MockIngestRouterService,
+    ) -> IngestRouterServiceClient {
+        let client = IngestRouterServiceClient::from_mock(mock);
+        let inner_client = client.inner;
+        self.build_from_inner_client(inner_client)
+    }
+    fn build_from_inner_client(
+        self,
+        inner_client: InnerIngestRouterServiceClient,
     ) -> IngestRouterServiceClient {
         let ingest_svc = self
             .ingest_layers
             .into_iter()
             .rev()
             .fold(
-                quickwit_common::tower::BoxService::new(boxed_instance.clone()),
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
                 |svc, layer| layer.layer(svc),
             );
         let tower_svc_stack = IngestRouterServiceTowerServiceStack {
-            inner: boxed_instance.clone(),
+            inner: inner_client,
             ingest_svc,
         };
         IngestRouterServiceClient::new(tower_svc_stack)
@@ -501,10 +525,10 @@ where
     >,
 {
     async fn ingest(
-        &mut self,
+        &self,
         request: IngestRequestV2,
     ) -> crate::ingest::IngestV2Result<IngestResponseV2> {
-        self.call(request).await
+        self.clone().call(request).await
     }
 }
 #[derive(Debug, Clone)]
@@ -542,26 +566,32 @@ where
     T::Future: Send,
 {
     async fn ingest(
-        &mut self,
+        &self,
         request: IngestRequestV2,
     ) -> crate::ingest::IngestV2Result<IngestResponseV2> {
         self.inner
+            .clone()
             .ingest(request)
             .await
             .map(|response| response.into_inner())
-            .map_err(|error| error.into())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                IngestRequestV2::rpc_name(),
+            ))
     }
 }
 #[derive(Debug)]
 pub struct IngestRouterServiceGrpcServerAdapter {
-    inner: Box<dyn IngestRouterService>,
+    inner: InnerIngestRouterServiceClient,
 }
 impl IngestRouterServiceGrpcServerAdapter {
     pub fn new<T>(instance: T) -> Self
     where
         T: IngestRouterService,
     {
-        Self { inner: Box::new(instance) }
+        Self {
+            inner: InnerIngestRouterServiceClient(std::sync::Arc::new(instance)),
+        }
     }
 }
 #[async_trait::async_trait]
@@ -572,11 +602,11 @@ for IngestRouterServiceGrpcServerAdapter {
         request: tonic::Request<IngestRequestV2>,
     ) -> Result<tonic::Response<IngestResponseV2>, tonic::Status> {
         self.inner
-            .clone()
+            .0
             .ingest(request.into_inner())
             .await
             .map(tonic::Response::new)
-            .map_err(|error| error.into())
+            .map_err(crate::error::grpc_error_to_grpc_status)
     }
 }
 /// Generated client implementations.

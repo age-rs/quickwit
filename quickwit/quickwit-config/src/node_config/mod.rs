@@ -29,12 +29,13 @@ use std::time::Duration;
 use anyhow::{bail, ensure};
 use bytesize::ByteSize;
 use http::HeaderMap;
-use once_cell::sync::Lazy;
 use quickwit_common::net::HostAddr;
+use quickwit_common::shared_consts::DEFAULT_SHARD_THROUGHPUT_LIMIT;
 use quickwit_common::uri::Uri;
 use quickwit_proto::indexing::CpuCapacity;
+use quickwit_proto::types::NodeId;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::node_config::serialize::load_node_config_with_env;
 use crate::service::QuickwitService;
@@ -122,7 +123,7 @@ impl IndexerConfig {
         }
         #[cfg(not(any(test, feature = "testsuite")))]
         {
-            true
+            quickwit_common::get_bool_from_env("QW_ENABLE_OTLP_ENDPOINT", true)
         }
     }
 
@@ -139,11 +140,12 @@ impl IndexerConfig {
     }
 
     pub fn default_merge_concurrency() -> NonZeroUsize {
-        NonZeroUsize::new(num_cpus::get() / 2).unwrap_or(NonZeroUsize::new(1).unwrap())
+        NonZeroUsize::new(quickwit_common::num_cpus() * 2 / 3)
+            .unwrap_or(NonZeroUsize::new(1).unwrap())
     }
 
     fn default_cpu_capacity() -> CpuCapacity {
-        CpuCapacity::one_cpu_thread() * (num_cpus::get() as u32)
+        CpuCapacity::one_cpu_thread() * (quickwit_common::num_cpus() as u32)
     }
 
     #[cfg(any(test, feature = "testsuite"))]
@@ -219,11 +221,51 @@ pub struct SearcherConfig {
     // TODO document and fix if necessary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_cache: Option<SplitCacheLimits>,
+    #[serde(default = "SearcherConfig::default_request_timeout_secs")]
+    request_timeout_secs: NonZeroU64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_timeout_policy: Option<StorageTimeoutPolicy>,
+    pub warmup_memory_budget: ByteSize,
+    pub warmup_single_split_initial_allocation: ByteSize,
+}
+
+/// Configuration controlling how fast a searcher should timeout a `get_slice`
+/// request to retry it.
+///
+/// [Amazon's best practise](https://docs.aws.amazon.com/whitepapers/latest/s3-optimizing-performance-best-practices/timeouts-and-retries-for-latency-sensitive-applications.html)
+/// suggests that to ensure low latency, it is best to:
+/// - retry small GET request after 2s
+/// - retry large GET request when the throughput is below some percentile.
+///
+/// This policy is inspired by this guidance. It does not track instanteneous throughput, but
+/// computes an overall timeout using the following formula:
+/// `timeout_offset + num_bytes_get_request / min_throughtput`
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StorageTimeoutPolicy {
+    pub min_throughtput_bytes_per_secs: u64,
+    pub timeout_millis: u64,
+    // Disclaimer: this is a number of retry, so the overall max number of
+    // attempts is `max_num_retries + 1``.
+    pub max_num_retries: usize,
+}
+
+impl StorageTimeoutPolicy {
+    pub fn compute_timeout(&self, num_bytes: usize) -> impl Iterator<Item = Duration> {
+        let min_download_time_secs: f64 = if self.min_throughtput_bytes_per_secs == 0 {
+            0.0f64
+        } else {
+            num_bytes as f64 / self.min_throughtput_bytes_per_secs as f64
+        };
+        let timeout = Duration::from_millis(self.timeout_millis)
+            + Duration::from_secs_f64(min_download_time_secs);
+        std::iter::repeat(timeout).take(self.max_num_retries + 1)
+    }
 }
 
 impl Default for SearcherConfig {
     fn default() -> Self {
-        Self {
+        SearcherConfig {
             fast_field_cache_capacity: ByteSize::gb(1),
             split_footer_cache_capacity: ByteSize::mb(500),
             partial_request_cache_capacity: ByteSize::mb(64),
@@ -232,11 +274,22 @@ impl Default for SearcherConfig {
             aggregation_memory_limit: ByteSize::mb(500),
             aggregation_bucket_limit: 65000,
             split_cache: None,
+            request_timeout_secs: Self::default_request_timeout_secs(),
+            storage_timeout_policy: None,
+            warmup_memory_budget: ByteSize::gb(100),
+            warmup_single_split_initial_allocation: ByteSize::gb(1),
         }
     }
 }
 
 impl SearcherConfig {
+    /// The timeout after which a search should be cancelled
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_secs(self.request_timeout_secs.get())
+    }
+    fn default_request_timeout_secs() -> NonZeroU64 {
+        NonZeroU64::new(30).unwrap()
+    }
     fn validate(&self) -> anyhow::Result<()> {
         if let Some(split_cache_limits) = self.split_cache {
             if self.max_num_concurrent_split_searches
@@ -259,6 +312,14 @@ impl SearcherConfig {
                     split_cache_limits.max_file_descriptors
                 );
             }
+            if self.warmup_single_split_initial_allocation > self.warmup_memory_budget {
+                anyhow::bail!(
+                    "warmup_single_split_initial_allocation ({}) must be lower or equal to \
+                     warmup_memory_budget ({})",
+                    self.warmup_single_split_initial_allocation,
+                    self.warmup_memory_budget
+                );
+            }
         }
         Ok(())
     }
@@ -269,28 +330,26 @@ impl SearcherConfig {
 pub struct IngestApiConfig {
     pub max_queue_memory_usage: ByteSize,
     pub max_queue_disk_usage: ByteSize,
-    pub replication_factor: usize,
+    replication_factor: usize,
     pub content_length_limit: ByteSize,
+    pub shard_throughput_limit: ByteSize,
 }
 
 impl Default for IngestApiConfig {
     fn default() -> Self {
         Self {
-            max_queue_memory_usage: ByteSize::gib(2), // TODO maybe we want more?
-            max_queue_disk_usage: ByteSize::gib(4),   // TODO maybe we want more?
+            max_queue_memory_usage: ByteSize::gib(2),
+            max_queue_disk_usage: ByteSize::gib(4),
             replication_factor: 1,
             content_length_limit: ByteSize::mib(10),
+            shard_throughput_limit: DEFAULT_SHARD_THROUGHPUT_LIMIT,
         }
     }
 }
 
-/// Returns true if the ingest API v2 is enabled.
-pub fn enable_ingest_v2() -> bool {
-    static ENABLE_INGEST_V2: Lazy<bool> = Lazy::new(|| env::var("QW_ENABLE_INGEST_V2").is_ok());
-    *ENABLE_INGEST_V2
-}
-
 impl IngestApiConfig {
+    /// Returns the replication factor, as defined in environment variable or in the configuration
+    /// in that order (the environment variable can overrides the configuration).
     pub fn replication_factor(&self) -> anyhow::Result<NonZeroUsize> {
         if let Ok(replication_factor_str) = env::var("QW_INGEST_REPLICATION_FACTOR") {
             let replication_factor = match replication_factor_str.trim() {
@@ -324,6 +383,16 @@ impl IngestApiConfig {
             "max_queue_disk_usage ({}) must be at least max_queue_memory_usage ({})",
             self.max_queue_disk_usage,
             self.max_queue_memory_usage
+        );
+        info!(
+            "ingestion shard throughput limit: {:?}",
+            self.shard_throughput_limit
+        );
+        ensure!(
+            self.shard_throughput_limit >= ByteSize::mib(1)
+                && self.shard_throughput_limit <= ByteSize::mib(20),
+            "shard_throughput_limit ({:?}) must be within 1mb and 20mb",
+            self.shard_throughput_limit
         );
         Ok(())
     }
@@ -370,7 +439,7 @@ impl JaegerConfig {
         }
         #[cfg(not(any(test, feature = "testsuite")))]
         {
-            true
+            quickwit_common::get_bool_from_env("QW_ENABLE_JAEGER_ENDPOINT", true)
         }
     }
 
@@ -401,7 +470,7 @@ impl Default for JaegerConfig {
 #[derive(Clone, Debug, Serialize)]
 pub struct NodeConfig {
     pub cluster_id: String,
-    pub node_id: String,
+    pub node_id: NodeId,
     pub enabled_services: HashSet<QuickwitService>,
     pub gossip_listen_addr: SocketAddr,
     pub grpc_listen_addr: SocketAddr,
@@ -459,10 +528,7 @@ impl NodeConfig {
             peer_seed_addrs.push(peer_seed_addr.to_string())
         }
         if !self.peer_seeds.is_empty() && peer_seed_addrs.is_empty() {
-            bail!(
-                "failed to resolve any of the peer seed addresses: `{}`",
-                self.peer_seeds.join(", ")
-            )
+            warn!("failed to resolve all the peer seed addresses")
         }
         Ok(peer_seed_addrs)
     }
@@ -473,9 +539,17 @@ impl NodeConfig {
         self.storage_configs.redact();
     }
 
+    /// Creates a config with defaults suitable for testing.
+    ///
+    /// Uses the default ports without ensuring that they are available.
     #[cfg(any(test, feature = "testsuite"))]
     pub fn for_test() -> Self {
-        serialize::node_config_for_test()
+        serialize::node_config_for_tests_from_ports(7280, 7281)
+    }
+
+    #[cfg(any(test, feature = "testsuite"))]
+    pub fn for_test_from_ports(rest_listen_port: u16, grpc_listen_port: u16) -> Self {
+        serialize::node_config_for_tests_from_ports(rest_listen_port, grpc_listen_port)
     }
 }
 
@@ -546,22 +620,30 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_validate_ingest_api_default() {
+        let ingest_api_config: IngestApiConfig = serde_yaml::from_str("").unwrap();
+        assert!(ingest_api_config.validate().is_ok());
+        assert_eq!(ingest_api_config, IngestApiConfig::default());
+    }
+
     #[test]
     fn test_validate_ingest_api_config() {
         {
-            let indexer_config: IngestApiConfig = serde_yaml::from_str(
+            let ingest_api_config: IngestApiConfig = serde_yaml::from_str(
                 r#"
                     max_queue_disk_usage: 100M
                 "#,
             )
             .unwrap();
             assert_eq!(
-                indexer_config.validate().unwrap_err().to_string(),
+                ingest_api_config.validate().unwrap_err().to_string(),
                 "max_queue_disk_usage must be at least 256 MiB, got `100.0 MB`"
             );
         }
         {
-            let indexer_config: IngestApiConfig = serde_yaml::from_str(
+            let ingest_api_config: IngestApiConfig = serde_yaml::from_str(
                 r#"
                     max_queue_memory_usage: 600M
                     max_queue_disk_usage: 500M
@@ -569,9 +651,21 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                indexer_config.validate().unwrap_err().to_string(),
+                ingest_api_config.validate().unwrap_err().to_string(),
                 "max_queue_disk_usage (500.0 MB) must be at least max_queue_memory_usage (600.0 \
                  MB)"
+            );
+        }
+        {
+            let ingest_api_config: IngestApiConfig = serde_yaml::from_str(
+                r#"
+                    shard_throughput_limit: 21M
+                "#,
+            )
+            .unwrap();
+            assert_eq!(
+                ingest_api_config.validate().unwrap_err().to_string(),
+                "shard_throughput_limit (21.0 MB) must be within 1mb and 20mb"
             );
         }
     }

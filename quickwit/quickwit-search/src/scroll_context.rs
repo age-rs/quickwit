@@ -18,6 +18,7 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -27,7 +28,7 @@ use anyhow::Context;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use quickwit_metastore::SplitMetadata;
-use quickwit_proto::search::{LeafSearchResponse, PartialHit, SearchRequest};
+use quickwit_proto::search::{LeafSearchResponse, PartialHit, SearchRequest, SplitSearchError};
 use quickwit_proto::types::IndexUid;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -56,6 +57,8 @@ pub(crate) struct ScrollContext {
     pub max_hits_per_page: u64,
     pub cached_partial_hits_start_offset: u64,
     pub cached_partial_hits: Vec<PartialHit>,
+    pub failed_splits: Vec<SplitSearchError>,
+    pub num_successful_splits: u64,
 }
 
 impl ScrollContext {
@@ -192,15 +195,16 @@ impl ScrollKeyAndStartOffset {
     }
 }
 
-impl ToString for ScrollKeyAndStartOffset {
-    fn to_string(&self) -> String {
+impl fmt::Display for ScrollKeyAndStartOffset {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         let mut payload = vec![0u8; 28];
         payload[..16].copy_from_slice(&u128::from(self.scroll_ulid).to_le_bytes());
         payload[16..24].copy_from_slice(&self.start_offset.to_le_bytes());
         payload[24..28].copy_from_slice(&self.max_hits_per_page.to_le_bytes());
         serde_json::to_writer(&mut payload, &self.search_after)
             .expect("serializing PartialHit should never fail");
-        BASE64_STANDARD.encode(payload)
+        let b64_payload = BASE64_STANDARD.encode(payload);
+        write!(formatter, "{}", b64_payload)
     }
 }
 
@@ -222,6 +226,9 @@ impl FromStr for ScrollKeyAndStartOffset {
         let scroll_ulid = u128::from_le_bytes(scroll_ulid_bytes.try_into().unwrap()).into();
         let from = u64::from_le_bytes(from_bytes.try_into().unwrap());
         let max_hits = u32::from_le_bytes(max_hits_bytes.try_into().unwrap());
+        if max_hits > 10_000 {
+            return Err("scroll id is malformed");
+        }
         let search_after =
             serde_json::from_slice(&base64_decoded[28..]).map_err(|_| "scroll id is malformed")?;
         Ok(ScrollKeyAndStartOffset {

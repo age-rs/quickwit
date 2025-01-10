@@ -12,8 +12,9 @@ In addition to the `index_id`, the index configuration lets you define five item
 - The **doc mapping**: it defines how a document and the fields it contains are stored and indexed for a given index.
 - The **indexing settings**: it defines the timestamp field used for sharding, and some more advanced parameters like the merge policy.
 - The **search settings**: it defines the default search fields `default_search_fields`, a list of fields that Quickwit will search into if the user query does not explicitly target a field.
+- The **retention policy**: it defines how long Quickwit should keep the indexed data. If not specified, the data is stored forever.
 
-Configuration is set at index creation and cannot be modified with the current version of Quickwit.
+Configuration is set at index creation and can be changed using the [update endpoint](../reference/rest-api.md) or the [CLI](../reference/cli.md).
 
 ## Config file format
 
@@ -134,17 +135,19 @@ fast:
 | `tokenizer` | Name of the `Tokenizer`. ([See tokenizers](#description-of-available-tokenizers)) for a list of available tokenizers.  | `default` |
 | `record`    | Describes the amount of information indexed, choices between `basic`, `freq` and `position` | `basic` |
 | `fieldnorms` | Whether to store fieldnorms for the field. Fieldnorms are required to calculate the BM25 Score of the document. | `false` |
-| `fast`     | Whether value is stored in a fast field. The fast field will contain the term ids and the dictionary. The default behaviour for `true` is to store the original text unchanged. The normalizers on the fast field is seperately configured. It can be configured via `normalizer: lowercase`. ([See normalizers](#description-of-available-normalizers)) for a list of available normalizers. | `false` |
+| `fast`     | Whether value is stored in a fast field. The fast field will contain the term ids and the dictionary. The default behaviour for `true` is to store the original text unchanged. The normalizers on the fast field is separately configured. It can be configured via `normalizer: lowercase`. ([See normalizers](#description-of-available-normalizers)) for a list of available normalizers. | `false` |
 
 ##### Description of available tokenizers
 
 | Tokenizer     | Description   |
 | ------------- | ------------- |
 | `raw`         | Does not process nor tokenize text. Filters out tokens larger than 255 bytes.  |
+| `raw_lowercase` | Does not tokenize text, but lowercase it. Filters out tokens larger than 255 bytes.  |
 | `default`     | Chops the text on according to whitespace and punctuation, removes tokens that are too long, and converts to lowercase. Filters out tokens larger than 255 bytes. |
-| `en_stem`     |  Like `default`, but also applies stemming on the resulting tokens. Filters out tokens larger than 255 bytes.  |
+| `en_stem`     | Like `default`, but also applies stemming on the resulting tokens. Filters out tokens larger than 255 bytes.  |
+| `whitespace`  | Chops the text on according to whitespace only. Doesn't remove long tokens or converts to lowercase. |
 | `chinese_compatible` |  Chop between each CJK character in addition to what `default` does. Should be used with `record: position` to be able to properly search |
-| `lowercase` |  Applies a lowercase transformation on the text. It does not tokenize the text. |
+| `lowercase`   | Applies a lowercase transformation on the text. It does not tokenize the text. |
 
 ##### Description of available normalizers
 
@@ -168,6 +171,8 @@ Indexing with position is required to run phrase queries.
 Quickwit handles three numeric types: `i64`, `u64`, and `f64`.
 
 Numeric values can be stored in a fast field (the equivalent of Lucene's `DocValues`), which is a column-oriented storage used for range queries and aggregations.
+
+When querying negative numbers without precising a field (using `default_search_fields`), you should single-quote the number (for instance '-5'), otherwise it will be interpreted as wanting to match anything but that number.
 
 Example of a mapping for an u64 field:
 
@@ -322,7 +327,7 @@ stored: true
 indexed: true
 fast: true
 input_format: hex
-output_foramt: hex
+output_format: hex
 ```
 
 **Parameters for bytes field**
@@ -409,6 +414,65 @@ field_mappings:
   - name: service
     type: text
 ```
+
+#### concatenate
+
+Quickwit supports mapping the content of multiple fields to a single one. This can be more efficient at query time than
+searching through dozens of `default_search_fields`. It also allow querying inside a json field without knowing the path
+to the field being searched.
+
+```yaml
+name: my_default_field
+type: concatenate
+concatenate_fields:
+  - text # things inside text, tokenized with the `default` tokenizer
+  - resource.author # all fields in resource.author, assuming resource is an `object` field.
+include_dynamic_fields: true
+tokenizer: default
+record: basic
+```
+
+Concatenate fields don't support fast fields, and are never stored. They uses their own tokenizer, independently of the
+tokenizer configured on the individual fields.
+At query time, concatenate fields don't support range queries.
+Only the following types are supported inside a concatenate field: text, bool, i64, u64, f64, json. Other types are rejected
+at index creation, or silently discarded during indexation if they are found inside a json field.
+Adding an object field to a concatenate field doesn't automatically add its subfields (yet).
+<!-- typing is made so it wouldn't be too hard do add, as well as things like params_* matching all fields which starts name with params_ , but the feature isn't implemented yet -->
+It isn't possible to add subfields from a json field to a concatenate field. For instance if `attributes` is a json field, it's not possible to add only `attributes.color` to a concatenate field.
+
+For json fields and dynamic fields, the path is not indexed, only values are. For instance, given the following document:
+```json
+{
+  "421312": {
+    "my-key": "my-value"
+  }
+}
+```
+It is possible to search for `my-value` despite not knowing the full path, but it isn't possible to search for all documents containing a key `my-key`.
+
+<!--
+when the features are supported, add these:
+  - params_* # shortcut for all fields starting with `params_`
+  - resource.author # all fields in resource.author, assuming resource is either of type `object` or `json`
+---
+Only the following types are supported inside a concatenate field: text, datetime, bool, i64, u64, ip, json. Other types are rejected
+---
+Datetime can only be queried in their RFC-3339 form, possibly omitting later components. # todo! will have to confirm this is achievable
+---
+plan:
+- implement text/bool/i64/u64 (nothing to do on search side for it to work). all gets converted to strings
+- add json
+- add object
+- add dynamic
+-- you are here
+- add wildcard
+- add json sub-fields?
+- add datetime (at index time, generate multiple tokens for yyyy, yyyy-MM... to yyyy-MM-ddThh:mm:ss; at search time, emit both tokenized and "raw" version of what may look like a datetime)
+- check negative i64 works as intended for non-raw tokenizer, and leverage datetime code if it doesn't
+- add ip (at index time, convert to single token; at search time, emit both tokenized and "raw" version of the ip)
+- allow optionally indexing json path (how do we tokenize it? split at each dot, or not?)
+-->
 
 ### Mode
 
@@ -517,6 +581,16 @@ This section describes indexing settings for a given index.
 | `split_num_docs_target` | Target number of docs per split.   | `10000000` |
 | `merge_policy` | Describes the strategy used to trigger split merge operations (see [Merge policies](#merge-policies) section below). |
 | `resources.heap_size`      | Indexer heap size per source per index.   | `2000000000` |
+| `docstore_compression_level` | Level of compression used by zstd for the docstore. Lower values may increase ingest speed, at the cost of index size | `8` |
+| `docstore_blocksize` | Size of blocks in the docstore, in bytes. Lower values may improve doc retrieval speed, at the cost of index size | `1000000` |
+
+:::note
+
+Choosing an appropriate commit timeout is critical. With a shorter commit timeout, ingested data is queryable faster. But the published splits will be smaller, increasing the overhead associated with [merges](#merge-policies). 
+
+When decommissioning definitively an indexer node that received data through the ingest API (including the [Elastic bulk API](/docs/reference/es_compatible_api) and the OTEL [log](/docs/log-management/otel-service.md) and [trace](/docs/distributed-tracing/otel-service.md) services), we need to make sure that all the data that was persisted locally (Write Ahead Log) is indexed and committed. After receiving the termination signal, the Quickwit process waits for the indexing pipelines to finish processing this local data. This can take as long as the longest commit timeout of all indexes. Make sure that the termination grace period of the infrastructure supporting the Quickwit indexer nodes is long enough (e.g [`terminationGracePeriodSeconds`](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/) in Kubernetes or [`stopTimeout`](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html) on AWS ECS).
+
+:::
 
 ### Merge policies
 
@@ -611,12 +685,11 @@ This section describes search settings for a given index.
 
 | Variable      | Description   | Default value |
 | ------------- | ------------- | ------------- |
-| `default_search_fields`      | Default list of fields that will be used for search. The field names in this list may be declared
-explicitly in the schema, or may refer to a field captured by the dynamic mode.   | `None` |
+| `default_search_fields` | Default list of fields that will be used for search. The field names in this list may be declared explicitly in the schema, or may refer to a field captured by the dynamic mode. | `None` |
 
 ## Retention policy
 
-This section describes how Quickwit manages data retention. In Quickwit, the retention policy manager drops data on a split basis as opposed to individually dropping documents. Splits are evaluated based on their `time_range` which is derived from the index timestamp field specified in the (`indexing_settings.timestamp_field`) settings. Using this setting, the retention policy will delete a split when `now() - split.time_range.end >= retention_policy.period`
+This section describes how Quickwit manages data retention. In Quickwit, the retention policy manager drops data on a split basis as opposed to individually dropping documents. Splits are evaluated based on their `time_range` which is derived from the index timestamp field specified in the (`doc_mapping.timestamp_field`) settings. Using this setting, the retention policy will delete a split when `now() - split.time_range.end >= retention_policy.period`
 
 ```yaml
 version: 0.7

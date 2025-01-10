@@ -62,6 +62,7 @@ where S: Service<R>
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct CounterLayer {
     counter: Arc<AtomicUsize>,
 }
@@ -77,6 +78,7 @@ impl<S> Layer<S> for CounterLayer {
     }
 }
 
+#[allow(dead_code)]
 fn spawn_ping_response_stream(
     mut request_stream: ServiceStream<PingRequest>,
 ) -> ServiceStream<HelloResult<PingResponse>> {
@@ -113,31 +115,41 @@ fn spawn_ping_response_stream(
     service_stream
 }
 
-#[derive(Debug, Clone)]
-struct HelloImpl;
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+struct HelloImpl {
+    delay: Duration,
+}
 
 #[async_trait]
 impl Hello for HelloImpl {
-    async fn hello(&mut self, request: HelloRequest) -> HelloResult<HelloResponse> {
+    async fn hello(&self, request: HelloRequest) -> HelloResult<HelloResponse> {
+        tokio::time::sleep(self.delay).await;
+
+        if request.name.is_empty() {
+            return Err(HelloError::InvalidArgument("name is empty".to_string()));
+        }
         Ok(HelloResponse {
             message: format!("Hello, {}!", request.name),
         })
     }
 
-    async fn goodbye(&mut self, request: GoodbyeRequest) -> HelloResult<GoodbyeResponse> {
+    async fn goodbye(&self, request: GoodbyeRequest) -> HelloResult<GoodbyeResponse> {
+        tokio::time::sleep(self.delay).await;
+
         Ok(GoodbyeResponse {
             message: format!("Goodbye, {}!", request.name),
         })
     }
 
     async fn ping(
-        &mut self,
+        &self,
         request: ServiceStream<PingRequest>,
     ) -> HelloResult<HelloStream<PingResponse>> {
         Ok(spawn_ping_response_stream(request))
     }
 
-    async fn check_connectivity(&mut self) -> anyhow::Result<()> {
+    async fn check_connectivity(&self) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -148,6 +160,7 @@ impl Hello for HelloImpl {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
     use std::net::SocketAddr;
     use std::str::FromStr;
     use std::sync::atomic::Ordering;
@@ -169,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hello_codegen() {
-        let mut hello = HelloImpl;
+        let hello = HelloImpl::default();
 
         assert_eq!(
             hello
@@ -183,7 +196,7 @@ mod tests {
             }
         );
 
-        let mut client = HelloClient::new(hello.clone()).clone();
+        let client = HelloClient::new(hello.clone()).clone();
 
         assert_eq!(
             client
@@ -255,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hello_codegen_grpc() {
-        let grpc_server_adapter = HelloGrpcServerAdapter::new(HelloImpl);
+        let grpc_server_adapter = HelloGrpcServerAdapter::new(HelloImpl::default());
         let grpc_server: HelloGrpcServer<HelloGrpcServerAdapter> =
             HelloGrpcServer::new(grpc_server_adapter);
         let addr: SocketAddr = "127.0.0.1:6666".parse().unwrap();
@@ -273,7 +286,7 @@ mod tests {
             "127.0.0.1:6666".parse().unwrap(),
             Endpoint::from_static("http://127.0.0.1:6666").connect_lazy(),
         );
-        let mut grpc_client = HelloClient::from_balance_channel(channel, MAX_GRPC_MESSAGE_SIZE);
+        let grpc_client = HelloClient::from_balance_channel(channel, MAX_GRPC_MESSAGE_SIZE);
 
         assert_eq!(
             grpc_client
@@ -286,6 +299,16 @@ mod tests {
                 message: "Hello, gRPC client!".to_string()
             }
         );
+
+        assert!(matches!(
+            grpc_client
+                .hello(HelloRequest {
+                    name: "".to_string()
+                })
+                .await
+                .unwrap_err(),
+            HelloError::InvalidArgument(_)
+        ));
 
         let (ping_stream_tx, ping_stream) = ServiceStream::new_bounded(1);
         let mut pong_stream = grpc_client.ping(ping_stream).await.unwrap();
@@ -322,8 +345,7 @@ mod tests {
 
         // The connectivity check fails if there is no client behind the channel.
         let (balance_channel, _): (BalanceChannel<SocketAddr>, _) = BalanceChannel::new();
-        let mut grpc_client =
-            HelloClient::from_balance_channel(balance_channel, MAX_GRPC_MESSAGE_SIZE);
+        let grpc_client = HelloClient::from_balance_channel(balance_channel, MAX_GRPC_MESSAGE_SIZE);
         assert_eq!(
             grpc_client
                 .check_connectivity()
@@ -391,7 +413,7 @@ mod tests {
         let universe = Universe::new();
         let hello_actor = HelloActor;
         let (actor_mailbox, _actor_handle) = universe.spawn_builder().spawn(hello_actor);
-        let mut actor_client = HelloClient::from_mailbox(actor_mailbox.clone());
+        let actor_client = HelloClient::from_mailbox(actor_mailbox.clone());
 
         assert_eq!(
             actor_client
@@ -428,7 +450,7 @@ mod tests {
             "Pong, beautiful actor!"
         );
 
-        let mut hello_tower = HelloClient::tower().build_from_mailbox(actor_mailbox);
+        let hello_tower = HelloClient::tower().build_from_mailbox(actor_mailbox);
 
         assert_eq!(
             hello_tower
@@ -479,12 +501,12 @@ mod tests {
         let goodbye_layer = CounterLayer::default();
         let ping_layer = CounterLayer::default();
 
-        let mut hello_tower = HelloClient::tower()
+        let hello_tower = HelloClient::tower()
             .stack_layer(layer.clone())
             .stack_hello_layer(hello_layer.clone())
             .stack_goodbye_layer(goodbye_layer.clone())
             .stack_ping_layer(ping_layer.clone())
-            .build(HelloImpl);
+            .build(HelloImpl::default());
 
         hello_tower
             .hello(HelloRequest {
@@ -520,6 +542,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_hello_codegen_tower_stack_layer_ordering() {
+        trait AppendSuffix {
+            fn append_suffix(&mut self, suffix: &'static str);
+        }
+
+        impl AppendSuffix for HelloRequest {
+            fn append_suffix(&mut self, suffix: &'static str) {
+                self.name.push_str(suffix);
+            }
+        }
+
+        impl AppendSuffix for GoodbyeRequest {
+            fn append_suffix(&mut self, suffix: &'static str) {
+                self.name.push_str(suffix);
+            }
+        }
+
+        impl AppendSuffix for PingRequest {
+            fn append_suffix(&mut self, suffix: &'static str) {
+                self.name.push_str(suffix);
+            }
+        }
+
+        impl AppendSuffix for ServiceStream<PingRequest> {
+            fn append_suffix(&mut self, _suffix: &'static str) {}
+        }
+
+        #[derive(Debug, Clone)]
+        struct AppendSuffixService<S> {
+            inner: S,
+            suffix: &'static str,
+        }
+
+        impl<S, R> Service<R> for AppendSuffixService<S>
+        where
+            S: Service<R, Error = HelloError>,
+            S::Response: fmt::Debug,
+            S::Future: Send + 'static,
+            R: AppendSuffix,
+        {
+            type Response = S::Response;
+            type Error = HelloError;
+            type Future = BoxFuture<S::Response, S::Error>;
+
+            fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                self.inner.poll_ready(cx)
+            }
+
+            fn call(&mut self, mut req: R) -> Self::Future {
+                req.append_suffix(self.suffix);
+                let inner = self.inner.call(req);
+                Box::pin(inner)
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        struct AppendSuffixLayer {
+            suffix: &'static str,
+        }
+
+        impl AppendSuffixLayer {
+            fn new(suffix: &'static str) -> Self {
+                Self { suffix }
+            }
+        }
+
+        impl<S> Layer<S> for AppendSuffixLayer {
+            type Service = AppendSuffixService<S>;
+
+            fn layer(&self, inner: S) -> Self::Service {
+                AppendSuffixService {
+                    inner,
+                    suffix: self.suffix,
+                }
+            }
+        }
+        let hello_tower = HelloClient::tower()
+            .stack_layer(AppendSuffixLayer::new("->foo"))
+            .stack_hello_layer(AppendSuffixLayer::new("->bar"))
+            .stack_layer(AppendSuffixLayer::new("->qux"))
+            .stack_hello_layer(AppendSuffixLayer::new("->tox"))
+            .stack_goodbye_layer(AppendSuffixLayer::new("->moo"))
+            .build(HelloImpl::default());
+
+        let response = hello_tower
+            .hello(HelloRequest {
+                name: "".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.message, "Hello, ->foo->bar->qux->tox!");
+
+        let response = hello_tower
+            .goodbye(GoodbyeRequest {
+                name: "".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.message, "Goodbye, ->foo->qux->moo!");
+    }
+
+    #[tokio::test]
     async fn test_from_channel() {
         let balance_channed = BalanceChannel::from_channel(
             "127.0.0.1:7777".parse().unwrap(),
@@ -530,10 +654,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_balance_channel() {
-        let hello = HelloImpl;
+        let hello = HelloImpl::default();
         let grpc_server_adapter = HelloGrpcServerAdapter::new(hello);
         let grpc_server = HelloGrpcServer::new(grpc_server_adapter);
-        let addr: SocketAddr = "127.0.0.1:8888".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:11111".parse().unwrap();
 
         tokio::spawn({
             async move {
@@ -545,7 +669,7 @@ mod tests {
             }
         });
         let (balance_channel, balance_channel_tx) = BalanceChannel::new();
-        let channel = Endpoint::from_static("http://127.0.0.1:8888").connect_lazy();
+        let channel = Endpoint::from_static("http://127.0.0.1:11111").connect_lazy();
         balance_channel_tx
             .send(Change::Insert("foo", channel))
             .unwrap();
@@ -569,14 +693,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_hello_codegen_mock() {
-        let mut hello_mock = HelloClient::mock();
-        hello_mock.expect_hello().returning(|_| {
+        let mut mock_hello = MockHello::new();
+        mock_hello.expect_hello().returning(|_| {
             Ok(HelloResponse {
                 message: "Hello, mock!".to_string(),
             })
         });
-        hello_mock.expect_check_connectivity().returning(|| Ok(()));
-        let mut hello: HelloClient = hello_mock.into();
+        mock_hello.expect_check_connectivity().returning(|| Ok(()));
+        let hello = HelloClient::from_mock(mock_hello);
+
         assert_eq!(
             hello
                 .hello(HelloRequest {
@@ -601,5 +726,50 @@ mod tests {
             }
         );
         hello.check_connectivity().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_transport_errors_handling() {
+        quickwit_common::setup_logging_for_tests();
+
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let channel = Endpoint::from_static("http://127.0.0.1:9999")
+            .timeout(Duration::from_millis(100))
+            .connect_lazy();
+        let max_message_size = ByteSize::mib(1);
+        let grpc_client = HelloClient::from_channel(addr, channel, max_message_size);
+
+        let error = grpc_client
+            .hello(HelloRequest {
+                name: "Client".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HelloError::Unavailable(_)));
+
+        let hello = HelloImpl {
+            delay: Duration::from_secs(1),
+        };
+        let grpc_server_adapter = HelloGrpcServerAdapter::new(hello);
+        let grpc_server: HelloGrpcServer<HelloGrpcServerAdapter> =
+            HelloGrpcServer::new(grpc_server_adapter);
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        tokio::spawn({
+            async move {
+                Server::builder()
+                    .add_service(grpc_server)
+                    .serve(addr)
+                    .await
+                    .unwrap();
+            }
+        });
+        let error = grpc_client
+            .hello(HelloRequest {
+                name: "Client".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HelloError::Timeout(_)));
     }
 }

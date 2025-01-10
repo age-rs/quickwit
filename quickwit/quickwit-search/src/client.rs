@@ -20,7 +20,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytesize::ByteSize;
 use futures::{StreamExt, TryStreamExt};
@@ -37,6 +37,7 @@ use tower::timeout::Timeout;
 use tracing::{info_span, warn, Instrument};
 
 use crate::error::parse_grpc_error;
+use crate::metrics::SEARCH_METRICS;
 use crate::SearchService;
 
 /// Impl is an enumeration that meant to manage Quickwit's search service client types.
@@ -110,17 +111,30 @@ impl SearchServiceClient {
         &mut self,
         request: quickwit_proto::search::SearchRequest,
     ) -> crate::Result<quickwit_proto::search::SearchResponse> {
-        match &mut self.client_impl {
-            SearchServiceClientImpl::Grpc(grpc_client) => {
-                let tonic_request = Request::new(request);
-                let tonic_response = grpc_client
-                    .root_search(tonic_request)
-                    .await
-                    .map_err(|tonic_error| parse_grpc_error(&tonic_error))?;
-                Ok(tonic_response.into_inner())
-            }
+        let start = Instant::now();
+        let response_result = match &mut self.client_impl {
+            SearchServiceClientImpl::Grpc(grpc_client) => grpc_client
+                .root_search(request)
+                .await
+                .map(|tonic_response| tonic_response.into_inner())
+                .map_err(|tonic_error| parse_grpc_error(&tonic_error)),
             SearchServiceClientImpl::Local(service) => service.root_search(request).await,
-        }
+        };
+        let elapsed = start.elapsed().as_secs_f64();
+        let label_values = if response_result.is_ok() {
+            ["success"]
+        } else {
+            ["error"]
+        };
+        SEARCH_METRICS
+            .root_search_requests_total
+            .with_label_values(label_values)
+            .inc();
+        SEARCH_METRICS
+            .root_search_request_duration_seconds
+            .with_label_values(label_values)
+            .observe(elapsed);
+        response_result
     }
 
     /// Perform leaf search.
@@ -128,17 +142,30 @@ impl SearchServiceClient {
         &mut self,
         request: quickwit_proto::search::LeafSearchRequest,
     ) -> crate::Result<quickwit_proto::search::LeafSearchResponse> {
-        match &mut self.client_impl {
-            SearchServiceClientImpl::Grpc(grpc_client) => {
-                let tonic_request = Request::new(request);
-                let tonic_response = grpc_client
-                    .leaf_search(tonic_request)
-                    .await
-                    .map_err(|tonic_error| parse_grpc_error(&tonic_error))?;
-                Ok(tonic_response.into_inner())
-            }
+        let start = Instant::now();
+        let response_result = match &mut self.client_impl {
+            SearchServiceClientImpl::Grpc(grpc_client) => grpc_client
+                .leaf_search(request)
+                .await
+                .map(|tonic_response| tonic_response.into_inner())
+                .map_err(|tonic_error| parse_grpc_error(&tonic_error)),
             SearchServiceClientImpl::Local(service) => service.leaf_search(request).await,
-        }
+        };
+        let elapsed = start.elapsed().as_secs_f64();
+        let label_values = if response_result.is_ok() {
+            ["success"]
+        } else {
+            ["error"]
+        };
+        SEARCH_METRICS
+            .leaf_search_requests_total
+            .with_label_values(label_values)
+            .inc();
+        SEARCH_METRICS
+            .leaf_search_request_duration_seconds
+            .with_label_values(label_values)
+            .observe(elapsed);
+        response_result
     }
 
     /// Perform leaf search.
@@ -249,9 +276,9 @@ impl SearchServiceClient {
         }
     }
 
-    /// Gets the value associated to a key stored locally in the targetted node.
+    /// Gets the value associated to a key stored locally in the targeted node.
     /// This call is not "distributed".
-    /// If the key is not present on the targetted search `None` is simply returned.
+    /// If the key is not present on the targeted search `None` is simply returned.
     pub async fn get_kv(&mut self, get_kv_req: GetKvRequest) -> crate::Result<Option<Vec<u8>>> {
         match &mut self.client_impl {
             SearchServiceClientImpl::Local(service) => {
@@ -269,7 +296,7 @@ impl SearchServiceClient {
         }
     }
 
-    /// Gets the value associated to a key stored locally in the targetted node.
+    /// Gets the value associated to a key stored locally in the targeted node.
     /// This call is not "distributed". It is up to the client to put the K,V pair
     /// on several nodes.
     pub async fn put_kv(&mut self, put_kv_req: PutKvRequest) -> crate::Result<()> {

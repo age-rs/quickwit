@@ -38,8 +38,9 @@ pub struct IndexerNodeInfo {
     pub indexing_capacity: CpuCapacity,
 }
 
-pub type IndexerPool = Pool<String, IndexerNodeInfo>;
+pub type IndexerPool = Pool<NodeId, IndexerNodeInfo>;
 
+mod cooldown_map;
 mod debouncer;
 #[cfg(test)]
 mod tests;

@@ -31,36 +31,13 @@ console](https://console.aws.amazon.com/servicequotas/home/services/lambda/quota
 
 ### Python venv
 
-This project is set up like a standard Python project. The initialization
-process also creates a virtualenv within this project, stored under the `.venv`
-directory.  To create the virtualenv it assumes that there is a `python3`
-executable in your path with access to the `venv` package. If for any reason the
-automatic creation of the virtualenv fails, you can create the virtualenv
-manually.
+The Python environment is configured using pipenv:
 
-To manually create a virtualenv on MacOS and Linux:
-
-```bash
-python3 -m venv .venv
 ```
-
-After the init process completes and the virtualenv is created, you can use the following
-step to activate your virtualenv.
-
-```bash
-source .venv/bin/activate
-```
-
-Once the virtualenv is activated, you can install the required dependencies.
-
-```bash
-pip install .
-```
-
-If you prefer using Poetry, achieve the same by running:
-```bash
-poetry shell
-poetry install
+# Install pipenv if needed.
+pip install --user pipenv
+pipenv shell
+pipenv install
 ```
 
 ### Example stacks
@@ -75,7 +52,7 @@ Provided demonstration setups:
 
 ### Deploy and run
 
-The Makefile is a usefull entrypoint to show how the Lambda deployment can used.
+The Makefile is a useful entrypoint to show how the Lambda deployment can used.
 
 Configure your shell and AWS account:
 ```bash
@@ -98,6 +75,46 @@ make deploy-mock-data
 # wait a few minutes...
 make invoke-mock-data-searcher
 ```
+
+### Configurations
+
+The following environment variables can be configured on the Lambda functions.
+Note that only a small subset of all Quickwit configurations are exposed to
+simplify the setup and avoid unstable deployments.
+
+| Variable | Description | Default |
+|---|---|---|
+| QW_LAMBDA_INDEX_ID | the index this Lambda interacts with (one and only one) | required |
+| QW_LAMBDA_METASTORE_BUCKET | bucket name for metastore files | required |
+| QW_LAMBDA_INDEX_BUCKET | bucket name for split files | required |
+| QW_LAMBDA_OPENTELEMETRY_URL | HTTP OTEL tracing collector endpoint | none, OTEL disabled |
+| QW_LAMBDA_OPENTELEMETRY_AUTHORIZATION | Authorization header value for HTTP OTEL calls | none, OTEL disabled |
+| QW_LAMBDA_ENABLE_VERBOSE_JSON_LOGS | true to enable JSON logging of spans and logs in Cloudwatch | false |
+| RUST_LOG | [Rust logging config][1] | info |
+
+[1]: https://rust-lang-nursery.github.io/rust-cookbook/development_tools/debugging/config_log.html
+
+
+> [!TIP]  
+> The Indexer Lambda's logging is quite verbose. To reduce the associated
+> CloudWatch costs, you can disable some lower level logs by setting the
+> `RUST_LOG` environment variable to `info,quickwit_actors=warn`, or disable
+> INFO logs altogether by setting `RUST_LOG=warn`.
+
+Indexer only:
+| Variable | Description | Default |
+|---|---|---|
+| QW_LAMBDA_INDEX_CONFIG_URI | location of the index configuration file, e.g `s3://mybucket/index-config.yaml` | required |
+| QW_LAMBDA_DISABLE_MERGE | true to disable compaction merges | false |
+| QW_LAMBDA_DISABLE_JANITOR | true to disable retention enforcement and garbage collection | false |
+| QW_LAMBDA_MAX_CHECKPOINTS | maximum number of ingested file names to keep in source history | 100 |
+
+Searcher only:
+| Variable | Description | Default |
+|---|---|---|
+| QW_LAMBDA_SEARCHER_METASTORE_POLLING_INTERVAL_SECONDS | refresh interval of the metastore | 60 |
+| QW_LAMBDA_PARTIAL_REQUEST_CACHE_CAPACITY | `searcher.partial_request_cache_capacity` node config | 64M |
+
 
 ### Set up a search API
 
@@ -128,3 +145,30 @@ curl -d '{"query":"quantity:>5", "max_hits": 10}' -H "Content-Type: application/
  * `cdk deploy`      deploy this stack to your default AWS account/region
  * `cdk diff`        compare deployed stack with current state
  * `cdk docs`        open CDK documentation
+
+### Grafana data source setup
+
+You can query and visualize the Quickwit Searcher Lambda from Grafana by using the [Quickwit data source for Grafana](https://grafana.com/grafana/plugins/quickwit-quickwit-datasource/).
+
+#### Prerequisites
+
+- [Set up HTTP API endpoint for Quickwit Searcher Lambda](#set-up-a-search-api)
+- [Install Quickwit data source plugin on Grafana](https://github.com/quickwit-oss/quickwit-datasource#installation)
+
+#### Configure Grafana data source
+
+If you don't have a Grafana instance running yet, you can start one with the Quickwit plugin installed using Docker:
+
+```bash
+docker run -e GF_INSTALL_PLUGINS="quickwit-quickwit-datasource" -p 3000:3000 grafana/grafana
+```
+
+In the `Connections > Data sources` page, add a new Quickwit data source and configure the following settings:
+
+|Variable|Description|Example|
+|--|--|--|
+|HTTP URL| HTTP search endpoint for Quickwit Searcher Lambda | https://*******.execute-api.us-east-1.amazonaws.com/api/v1 |
+|Custom HTTP Headers| If you configure API Gateway to require an API key, set `x-api-key` HTTP Header | Header: `x-api-key` <br> Value: API key value|
+|Index ID| Same as `QW_LAMBDA_INDEX_ID` | hdfs-logs |
+
+After entering these values, click "Save & test". You can now query your Quickwit Lambda from Grafana!

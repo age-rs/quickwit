@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use assert_json_diff::{assert_json_eq, assert_json_include};
 use quickwit_config::SearcherConfig;
 use quickwit_doc_mapper::tag_pruning::extract_tags_from_query;
-use quickwit_doc_mapper::DefaultDocMapper;
+use quickwit_doc_mapper::DocMapper;
 use quickwit_indexing::TestSandbox;
 use quickwit_opentelemetry::otlp::TraceId;
 use quickwit_proto::search::{
@@ -37,6 +37,7 @@ use tantivy::schema::OwnedValue as TantivyValue;
 use tantivy::time::OffsetDateTime;
 use tantivy::Term;
 
+use self::leaf::leaf_search;
 use super::*;
 use crate::find_trace_ids_collector::Span;
 use crate::list_terms::leaf_list_terms;
@@ -265,7 +266,7 @@ async fn test_slop_queries() {
 }
 
 // TODO remove me once `Iterator::is_sorted_by_key` is stabilized.
-fn is_sorted<E, I: Iterator<Item = E>>(mut it: I) -> bool
+fn is_reverse_sorted<E, I: Iterator<Item = E>>(mut it: I) -> bool
 where E: Ord {
     let mut previous_el = if let Some(first_el) = it.next() {
         first_el
@@ -274,7 +275,7 @@ where E: Ord {
         return true;
     };
     for next_el in it {
-        if next_el < previous_el {
+        if next_el > previous_el {
             return false;
         }
         previous_el = next_el;
@@ -283,7 +284,6 @@ where E: Ord {
 }
 
 #[tokio::test]
-#[cfg_attr(not(feature = "ci-test"), ignore)]
 async fn test_single_node_several_splits() -> anyhow::Result<()> {
     let index_id = "single-node-several-splits";
     let doc_mapping_yaml = r#"
@@ -323,17 +323,14 @@ async fn test_single_node_several_splits() -> anyhow::Result<()> {
     .await?;
     assert_eq!(single_node_result.num_hits, 20);
     assert_eq!(single_node_result.hits.len(), 6);
-    assert!(&single_node_result.hits[0].json.contains("Snoopy"));
-    assert!(&single_node_result.hits[1].json.contains("breed"));
-    assert!(is_sorted(single_node_result.hits.iter().flat_map(|hit| {
-        hit.partial_hit.as_ref().map(|partial_hit| {
-            (
-                partial_hit.sort_value,
-                partial_hit.split_id.as_str(),
-                partial_hit.doc_id,
-            )
-        })
-    })));
+    assert!(&single_node_result.hits[0].json.contains("breed"));
+    assert!(&single_node_result.hits[1].json.contains("Snoopy"));
+    let hit_keys = single_node_result.hits.iter().flat_map(|hit| {
+        hit.partial_hit
+            .as_ref()
+            .map(|partial_hit| (partial_hit.split_id.as_str(), partial_hit.doc_id as i32))
+    });
+    assert!(is_reverse_sorted(hit_keys));
     assert!(single_node_result.elapsed_time_micros > 10);
     assert!(single_node_result.elapsed_time_micros < 1_000_000);
     test_sandbox.assert_quit().await;
@@ -1054,15 +1051,20 @@ async fn test_search_util(test_sandbox: &TestSandbox, query: &str) -> Vec<u32> {
     });
     let searcher_context: Arc<SearcherContext> =
         Arc::new(SearcherContext::new(SearcherConfig::default(), None));
+
+    let agg_limits = searcher_context.get_aggregation_limits();
+
     let search_response = leaf_search(
         searcher_context,
         request,
         test_sandbox.storage(),
         splits_offsets,
         test_sandbox.doc_mapper(),
+        agg_limits,
     )
     .await
     .unwrap();
+
     search_response
         .partial_hits
         .into_iter()
@@ -1200,8 +1202,7 @@ fn test_convert_leaf_hit_aux(
     document_json: JsonValue,
     expected_hit_json: JsonValue,
 ) {
-    let default_doc_mapper: DefaultDocMapper =
-        serde_json::from_value(default_doc_mapper_json).unwrap();
+    let default_doc_mapper: DocMapper = serde_json::from_value(default_doc_mapper_json).unwrap();
     let named_field_doc = json_to_named_field_doc(document_json);
     let hit_json_str =
         convert_document_to_json_string(named_field_doc, &default_doc_mapper).unwrap();
@@ -1459,10 +1460,10 @@ async fn test_single_node_aggregation_missing_fast_field() {
     )
     .await
     .unwrap_err();
-    let SearchError::Internal(error_msg) = single_node_error else {
+    let SearchError::InvalidArgument(error_msg) = single_node_error else {
         panic!();
     };
-    assert!(error_msg.contains("Field \"color\" is not configured as fast field"));
+    assert!(error_msg.contains("Field \"color\" is not configured as a fast field"));
     test_sandbox.assert_quit().await;
 }
 

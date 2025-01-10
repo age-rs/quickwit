@@ -38,6 +38,7 @@ pub struct RateLimiterSettings {
     pub refill_period: Duration,
 }
 
+#[cfg(any(test, feature = "testsuite"))]
 impl Default for RateLimiterSettings {
     fn default() -> Self {
         // 10 MB burst limit.
@@ -103,6 +104,8 @@ impl RateLimiter {
 
     /// Acquires some permits from the rate limiter.
     /// If the permits are not available, returns the duration to wait before trying again.
+    ///
+    /// This method is currently only used in simian.
     pub fn acquire_with_duration(&mut self, num_permits: u64) -> Result<(), Duration> {
         if self.acquire_inner(num_permits) {
             return Ok(());
@@ -116,8 +119,17 @@ impl RateLimiter {
         Err(wait)
     }
 
+    /// Acquires some permits expressed in bytes from the rate limiter. Returns whether the permits
+    /// were acquired.
     pub fn acquire_bytes(&mut self, bytes: ByteSize) -> bool {
         self.acquire(bytes.as_u64())
+    }
+
+    /// Drains all the permits from the rate limiter, effectively disabling all the operations
+    /// guarded by the rate limiter for one refill period.
+    pub fn drain(&mut self) {
+        self.available_permits = 0;
+        self.refill_at = Instant::now() + self.refill_period;
     }
 
     /// Gives back some unused permits to the rate limiter.
@@ -177,6 +189,24 @@ mod tests {
         assert!(rate_limiter.acquire_bytes(ByteSize::kb(125)));
         assert!(rate_limiter.acquire_bytes(ByteSize::kb(125)));
         assert!(!rate_limiter.acquire_bytes(ByteSize::kb(20)));
+    }
+
+    #[test]
+    fn test_rate_limiter_drain() {
+        let settings = RateLimiterSettings {
+            burst_limit: ByteSize::mb(2).as_u64(),
+            rate_limit: ConstantRate::bytes_per_sec(ByteSize::mb(1)),
+            refill_period: Duration::from_millis(100),
+        };
+        let mut rate_limiter = RateLimiter::from_settings(settings);
+        rate_limiter.drain();
+        assert_eq!(rate_limiter.available_permits, 0);
+
+        rate_limiter.refill(Instant::now() + Duration::from_millis(50));
+        assert_eq!(rate_limiter.available_permits, 0);
+
+        rate_limiter.refill(Instant::now() + Duration::from_millis(100));
+        assert!(rate_limiter.available_permits >= ByteSize::kb(100).as_u64());
     }
 
     #[test]

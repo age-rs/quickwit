@@ -22,6 +22,7 @@ use std::iter::once;
 use std::ops::RangeInclusive;
 
 use bytesize::ByteSize;
+#[cfg(feature = "failpoints")]
 use fail::fail_point;
 use mrecordlog::error::{AppendError, DeleteQueueError};
 use quickwit_proto::ingest::DocBatchV2;
@@ -51,22 +52,30 @@ pub(super) async fn append_non_empty_doc_batch(
 ) -> Result<Position, AppendDocBatchError> {
     let append_result = if force_commit {
         let encoded_mrecords = doc_batch
-            .docs()
-            .map(|doc| MRecord::Doc(doc).encode())
+            .into_docs()
+            .map(|(_doc_uid, doc)| MRecord::Doc(doc).encode())
             .chain(once(MRecord::Commit.encode()));
+
+        #[cfg(feature = "failpoints")]
         fail_point!("ingester:append_records", |_| {
             let io_error = io::Error::from(io::ErrorKind::PermissionDenied);
             Err(AppendDocBatchError::Io(io_error))
         });
+
         mrecordlog
             .append_records(queue_id, None, encoded_mrecords)
             .await
     } else {
-        let encoded_mrecords = doc_batch.docs().map(|doc| MRecord::Doc(doc).encode());
+        let encoded_mrecords = doc_batch
+            .into_docs()
+            .map(|(_doc_uid, doc)| MRecord::Doc(doc).encode());
+
+        #[cfg(feature = "failpoints")]
         fail_point!("ingester:append_records", |_| {
             let io_error = io::Error::from(io::ErrorKind::PermissionDenied);
             Err(AppendDocBatchError::Io(io_error))
         });
+
         mrecordlog
             .append_records(queue_id, None, encoded_mrecords)
             .await
@@ -82,12 +91,6 @@ pub(super) async fn append_non_empty_doc_batch(
             panic!("`append_records` should be called with `position_opt: None`")
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct MRecordLogUsage {
-    pub disk: ByteSize,
-    pub memory: ByteSize,
 }
 
 /// Error returned when the mrecordlog does not have enough capacity to store some records.
@@ -118,30 +121,27 @@ pub(super) fn check_enough_capacity(
     disk_capacity: ByteSize,
     memory_capacity: ByteSize,
     requested_capacity: ByteSize,
-) -> Result<MRecordLogUsage, NotEnoughCapacityError> {
-    let disk_usage = ByteSize(mrecordlog.disk_usage() as u64);
+) -> Result<(), NotEnoughCapacityError> {
+    let wal_usage = mrecordlog.resource_usage();
+    let disk_used = ByteSize(wal_usage.disk_used_bytes as u64);
 
-    if disk_usage + requested_capacity > disk_capacity {
+    if disk_used + requested_capacity > disk_capacity {
         return Err(NotEnoughCapacityError::Disk {
-            usage: disk_usage,
+            usage: disk_used,
             capacity: disk_capacity,
             requested: requested_capacity,
         });
     }
-    let memory_usage = ByteSize(mrecordlog.memory_usage() as u64);
+    let memory_used = ByteSize(wal_usage.memory_used_bytes as u64);
 
-    if memory_usage + requested_capacity > memory_capacity {
+    if memory_used + requested_capacity > memory_capacity {
         return Err(NotEnoughCapacityError::Memory {
-            usage: memory_usage,
+            usage: memory_used,
             capacity: memory_capacity,
             requested: requested_capacity,
         });
     }
-    let usage = MRecordLogUsage {
-        disk: disk_usage,
-        memory: memory_usage,
-    };
-    Ok(usage)
+    Ok(())
 }
 
 /// Deletes a queue from the WAL. Returns without error if the queue does not exist.
@@ -179,6 +179,7 @@ pub(super) fn queue_position_range(
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "failpoints"))]
     #[tokio::test]
     async fn test_append_non_empty_doc_batch() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -212,10 +213,13 @@ mod tests {
         assert_eq!(position, Position::offset(2u64));
     }
 
-    // This test should be run manually and independently of other tests with the `fail/failpoints`
-    // feature enabled.
+    // This test should be run manually and independently of other tests with the `failpoints`
+    // feature enabled:
+    // ```sh
+    // cargo test --manifest-path quickwit/Cargo.toml -p quickwit-ingest --features failpoints -- test_append_non_empty_doc_batch_io_error
+    // ```
+    #[cfg(feature = "failpoints")]
     #[tokio::test]
-    #[ignore]
     async fn test_append_non_empty_doc_batch_io_error() {
         let scenario = fail::FailScenario::setup();
         fail::cfg("ingester:append_records", "return").unwrap();

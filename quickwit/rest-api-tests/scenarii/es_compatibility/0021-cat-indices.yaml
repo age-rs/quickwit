@@ -11,14 +11,18 @@ expected:
   health: green
   index: gharchive
   pri: '1'
-  pri.store.size: 271.8kb
+  pri.store.size:
+      $expect: 270 < float(val[:-2]) < 280
   rep: '1'
   status: open
-  store.size: 271.8kb
+  store.size:
+      #272.4kb
+      $expect: 270 < float(val[:-2]) < 280
+  rep: '1'
   #uuid: gharchive:01HN2SDANHDN6WFAFNH7BBMQ8C
-- index: otel-logs-v0_7
+- index: otel-logs-v0_9
   docs.count: '0'
-- index: otel-traces-v0_7
+- index: otel-traces-v0_9
   docs.count: '0'
 ---
 method: [GET]
@@ -26,16 +30,22 @@ engines:
   - quickwit
 endpoint: "_cat/indices/gharchive?format=json"
 expected:
-- dataset.size: 222.8kb
+- dataset.size:
+    # 222.8kb
+    $expect: 220 < float(val[:-2]) < 230
   docs.count: '100'
   docs.deleted: '0'
   health: green
   index: gharchive
   pri: '1'
-  pri.store.size: 271.8kb
+  pri.store.size:
+      #272.4kb
+      $expect: 270 < float(val[:-2]) < 280
   rep: '1'
   status: open
-  store.size: 271.8kb
+  store.size:
+      # 272.4kb
+      $expect: 270 < float(val[:-2]) < 280
   #uuid: gharchive:01HN2SDANHDN6WFAFNH7BBMQ8C
 ---
 method: [GET]
@@ -72,17 +82,17 @@ engines:
 endpoint: "_cat/indices/gharchive?format=json&health=red"
 expected: []
 ---
+# Quickwit only supports JSON output. (Elastic has a table like text output.)
 method: [GET]
 engines:
   - quickwit
-  - elasticsearch
 endpoint: "_cat/indices/gharchive" # missing format=json
 status_code: 400
 ---
+# Quickwit does not supports the `v` parameter.
 method: [GET]
 engines:
   - quickwit
-  - elasticsearch
 endpoint: "_cat/indices/gharchive?format=json&v=true" # invalid h=true
 status_code: 400
 ---
@@ -92,4 +102,3 @@ engines:
   - elasticsearch
 endpoint: "_cat/indices/gharchive?format=json&b=b" # unsupported bytes parameter
 status_code: 400
-

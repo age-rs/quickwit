@@ -27,7 +27,7 @@ use quickwit_proto::search::{
     LeafSearchStreamRequest, LeafSearchStreamResponse, ListFieldsRequest, ListFieldsResponse,
     ReportSplitsRequest, ReportSplitsResponse,
 };
-use quickwit_proto::{set_parent_span_from_request_metadata, tonic, ServiceError};
+use quickwit_proto::{set_parent_span_from_request_metadata, tonic, GrpcServiceError};
 use quickwit_search::SearchService;
 use tracing::instrument;
 
@@ -93,8 +93,8 @@ impl grpc::SearchService for GrpcSearchAdapter {
             .0
             .leaf_search_stream(leaf_search_request)
             .await
-            .map_err(|err| err.grpc_error())?
-            .map_err(|err| err.grpc_error());
+            .map_err(|error| error.into_grpc_status())?
+            .map_err(|error| error.into_grpc_status());
         Ok(tonic::Response::new(Box::pin(leaf_search_result)))
     }
 
@@ -182,5 +182,16 @@ impl grpc::SearchService for GrpcSearchAdapter {
         set_parent_span_from_request_metadata(request.metadata());
         let resp = self.0.leaf_list_fields(request.into_inner()).await;
         convert_to_grpc_result(resp)
+    }
+
+    #[instrument(skip(self, request))]
+    async fn search_plan(
+        &self,
+        request: tonic::Request<quickwit_proto::search::SearchRequest>,
+    ) -> Result<tonic::Response<quickwit_proto::search::SearchPlanResponse>, tonic::Status> {
+        set_parent_span_from_request_metadata(request.metadata());
+        let search_request = request.into_inner();
+        let search_result = self.0.search_plan(search_request).await;
+        convert_to_grpc_result(search_result)
     }
 }

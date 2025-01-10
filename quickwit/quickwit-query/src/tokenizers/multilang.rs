@@ -66,8 +66,9 @@ static KOR_TOKENIZER: Lazy<LinderaTokenizer> = Lazy::new(|| {
 /// and uses the appropriate tokenizer for the detected language:
 /// - lindera for Chinese, Japanese, and Korean.
 /// - Quickwit's default tokenizer for other languages.
+///
 /// It is possible to bypass the language detection by prefixing the text with the language code
-/// followed by a colon. For example, `KOR:일본입니다` will be tokenized by the english tokenizer.
+/// followed by a colon. For example, `KOR:일본입니다` will be tokenized by the korean tokenizer.
 /// Current supported prefix are:
 /// - `KOR:` for Korean tokenizer
 /// - `JPN:` for Japanese tokenizer
@@ -152,7 +153,7 @@ pub enum MultiLanguageTokenStream<'a> {
     Simple(SimpleTokenStream<'a>),
 }
 
-impl<'a> TokenStream for MultiLanguageTokenStream<'a> {
+impl TokenStream for MultiLanguageTokenStream<'_> {
     fn advance(&mut self) -> bool {
         match self {
             MultiLanguageTokenStream::Empty => false,
@@ -187,7 +188,7 @@ pub struct LinderaTokenStream<'a> {
     pub token: &'a mut Token,
 }
 
-impl<'a> TokenStream for LinderaTokenStream<'a> {
+impl TokenStream for LinderaTokenStream<'_> {
     fn advance(&mut self) -> bool {
         if self.tokens.is_empty() {
             return false;

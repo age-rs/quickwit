@@ -116,7 +116,7 @@ quickwit run
 | Option | Description | Default |
 |-----------------|-------------|--------:|
 | `--config` | Config file location | `config/quickwit.yaml` |
-| `--service` | Services (indexer,searcher,janitor,metastore or control-plane) to run. If unspecified, all the supported services are started. |  |
+| `--service` | Services (`indexer`, `searcher`, `metastore`, `control-plane`, or `janitor`) to run. If unspecified, all the supported services are started. |  |
 
 *Examples*
 
@@ -141,7 +141,7 @@ curl "http://127.0.0.1:7280/api/v1/wikipedia/search?query=barack+obama"
 ```
 
 ## index
-Manages indexes: creates, deletes, ingests, searches, describes...
+Manages indexes: creates, updates, deletes, ingests, searches, describes...
 
 ### index create
 
@@ -180,6 +180,25 @@ quickwit index create --endpoint=http://127.0.0.1:7280 --index-config wikipedia_
 
 ```
 
+### index update
+
+Updates an index using an index config file.  
+`quickwit index update [args]`
+
+*Synopsis*
+
+```bash
+quickwit index update
+    --index <index>
+    --index-config <index-config>
+```
+
+*Options*
+
+| Option | Description |
+|-----------------|-------------|
+| `--index` | ID of the target index |
+| `--index-config` | Location of the index config file. |
 ### index clear
 
 Clears an index: deletes all splits and resets checkpoint.  
@@ -334,9 +353,9 @@ quickwit index ingest
 | `--index` | ID of the target index |
 | `--input-path` | Location of the input file. |
 | `--batch-size-limit` | Size limit of each submitted document batch. |
-| `--wait` | Wait for all documents to be commited and available for search before exiting |
+| `--wait` | Wait for all documents to be committed and available for search before exiting |
 | `--force` | Force a commit after the last document is sent, and wait for all documents to be committed and available for search before exiting |
-| `--commit-timeout` | Timeout for ingest operations that require waiting for the final commit (`--wait` or `--force`). This is different from the `commit_timeout_secs` indexing setting which sets the maximum time before commiting splits after their creation. |
+| `--commit-timeout` | Timeout for ingest operations that require waiting for the final commit (`--wait` or `--force`). This is different from the `commit_timeout_secs` indexing setting, which sets the maximum time before committing splits after their creation. |
 
 *Examples*
 
@@ -661,8 +680,8 @@ quickwit split list
 | Option | Description |
 |-----------------|-------------|
 | `--index` | Target index ID |
-| `--offset` | Number of splits to skip |
-| `--limit` | Maximum number of splits to retrieve |
+| `--offset` | Number of splits to skip. |
+| `--limit` | Maximum number of splits to retrieve. |
 | `--states` | Selects the splits whose states are included in this comma-separated list of states. Possible values are `staged`, `published`, and `marked`. |
 | `--create-date` | Selects the splits whose creation dates are before this date. |
 | `--start-date` | Selects the splits that contain documents after this date (time-series indexes only). |
@@ -818,6 +837,15 @@ Disables [telemetry](../telemetry.md) when set to any non-empty value.
 *Example*
 
 `QW_DISABLE_TELEMETRY=1 quickwit help`
+
+### QW_POSTGRES_SKIP_MIGRATIONS
+
+Don't run database migrations (but verify that migrations were run successfully before, and no that unknown migration was run).
+
+### QW_POSTGRES_SKIP_MIGRATION_LOCKING
+
+Don't lock the database during migration. This may increase compatibility with alternative databases using the PostgreSQL wire protocol. However, it
+is dangerous to use this if you can't guarantee that only one node will run the migrations.
 
 ### RUST_LOG
 

@@ -33,7 +33,7 @@ pub(super) const DEFAULT_NUMBER_OF_TRACES: i32 = 20;
 pub(super) fn build_jaeger_traces(spans: Vec<JaegerSpan>) -> anyhow::Result<Vec<JaegerTrace>> {
     let jaeger_traces: Vec<JaegerTrace> = spans
         .into_iter()
-        .group_by(|span| span.trace_id.clone())
+        .chunk_by(|span| span.trace_id.clone())
         .into_iter()
         .map(|(span_id, group)| JaegerTrace::new(span_id, group.collect()))
         .collect();
@@ -55,9 +55,11 @@ pub struct TracesSearchQueryParams {
     pub service: Option<String>,
     #[serde(default)]
     pub operation: Option<String>,
+    // these are microsecond precision
     pub start: Option<i64>,
     pub end: Option<i64>,
     pub tags: Option<String>,
+    // these are unit-suffixed numbers. in practice we only support precision up to the ms
     pub min_duration: Option<String>,
     pub max_duration: Option<String>,
     pub lookback: Option<String>,

@@ -22,7 +22,7 @@ use std::path::Path;
 
 use bytes::Buf;
 use mrecordlog::error::CreateQueueError;
-use mrecordlog::Record;
+use mrecordlog::{Record, ResourceUsage};
 use quickwit_actors::ActorContext;
 
 use crate::mrecordlog_async::MultiRecordLogAsync;
@@ -41,7 +41,15 @@ pub struct Queues {
 
 impl Queues {
     pub async fn open(queues_dir_path: &Path) -> crate::Result<Queues> {
-        tokio::fs::create_dir_all(queues_dir_path).await.unwrap();
+        tokio::fs::create_dir_all(queues_dir_path)
+            .await
+            .map_err(|error| {
+                IngestServiceError::IoError(format!(
+                    "failed to create WAL directory `{}`: {}",
+                    queues_dir_path.display(),
+                    error
+                ))
+            })?;
         let record_log = MultiRecordLogAsync::open(queues_dir_path).await?;
         Ok(Queues { record_log })
     }
@@ -205,18 +213,14 @@ impl Queues {
             queues: self
                 .record_log
                 .list_queues()
-                .filter_map(|real_queue_id| real_queue_id.strip_prefix(QUICKWIT_CF_PREFIX))
-                .map(|queue| queue.to_owned())
+                .flat_map(|real_queue_id| real_queue_id.strip_prefix(QUICKWIT_CF_PREFIX))
+                .map(|queue| queue.to_string())
                 .collect(),
         })
     }
 
-    pub(crate) fn disk_usage(&self) -> usize {
-        self.record_log.disk_usage()
-    }
-
-    pub(crate) fn memory_usage(&self) -> usize {
-        self.record_log.memory_usage()
+    pub(crate) fn resource_usage(&self) -> ResourceUsage {
+        self.record_log.resource_usage()
     }
 }
 
@@ -230,7 +234,7 @@ mod tests {
     use tokio::sync::watch;
 
     use super::Queues;
-    use crate::errors::IngestServiceError;
+    use crate::error::IngestServiceError;
     use crate::IngestApiService;
 
     const TEST_QUEUE_ID: &str = "my-queue";

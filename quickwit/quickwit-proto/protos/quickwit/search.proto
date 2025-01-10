@@ -33,7 +33,7 @@ service SearchService {
   //
   // It is like a regular search except that:
   // - the node should perform the search locally instead of dispatching
-  // it to other nodes.
+  //   it to other nodes.
   // - it should be applied on the given subset of splits
   // - Hit content is not fetched, and we instead return so called `PartialHit`.
   rpc LeafSearch(LeafSearchRequest) returns (LeafSearchResponse);
@@ -56,18 +56,18 @@ service SearchService {
   //
   // It is like a regular list term except that:
   // - the node should perform the listing locally instead of dispatching
-  // it to other nodes.
+  //   it to other nodes.
   // - it should be applied on the given subset of splits
   rpc LeafListTerms(LeafListTermsRequest) returns (LeafListTermsResponse);
 
   // Performs a scroll request.
   rpc Scroll(ScrollRequest) returns (SearchResponse);
 
-  // gRPC request used to store a key in the local storage of the targetted node.
+  // gRPC request used to store a key in the local storage of the targeted node.
   // This RPC is used in the mini distributed immutable KV store embedded in quickwit.
   rpc PutKV(PutKVRequest) returns (PutKVResponse);
 
-  // Gets a key from the local storage of the targetted node.
+  // Gets a key from the local storage of the targeted node.
   // This RPC is used in the mini distributed immutable KV store embedded in quickwit.
   rpc GetKV(GetKVRequest) returns (GetKVResponse);
 
@@ -76,6 +76,9 @@ service SearchService {
   rpc ListFields(ListFieldsRequest) returns (ListFieldsResponse);
 
   rpc LeafListFields(LeafListFieldsRequest) returns (ListFieldsResponse);
+
+  // Describe how a search would be processed.
+  rpc SearchPlan(SearchRequest) returns (SearchPlanResponse);
 }
 
 /// Scroll Request
@@ -123,14 +126,14 @@ message ListFieldsRequest {
   // Optional limit query to a list of fields
   // Wildcard expressions are supported.
   repeated string fields = 2;
-  
+
   // Time filter, expressed in seconds since epoch.
   // That filter is to be interpreted as the semi-open interval:
   // [start_timestamp, end_timestamp).
   optional int64 start_timestamp = 3;
   optional int64 end_timestamp = 4;
 
-  // Control if the the request will fail if split_ids contains a split that does not exist. 
+  // Control if the the request will fail if split_ids contains a split that does not exist.
   // optional bool fail_on_missing_index = 6;
 }
 
@@ -146,7 +149,7 @@ message LeafListFieldsRequest {
   // Optional limit query to a list of fields
   // Wildcard expressions are supported.
   repeated string fields = 4;
-  
+
 }
 
 message ListFieldsResponse {
@@ -296,6 +299,21 @@ message SearchResponse {
 
   // Scroll Id (only set if scroll_secs was set in the request)
   optional string scroll_id = 6;
+
+  // Returns the list of splits for which search failed.
+  // For the moment, the cause is unknown.
+  //
+  // It is up to the caller to decide whether to interpret
+  // this as an overall failure or to present the partial results
+  // to the end user.
+  repeated SplitSearchError failed_splits = 7;
+
+  // Total number of successful splits searched.
+  uint64 num_successful_splits = 8;
+}
+
+message SearchPlanResponse {
+  string result = 1;
 }
 
 message SplitSearchError {
@@ -309,22 +327,45 @@ message SplitSearchError {
   bool retryable_error = 3;
 }
 
+/// A LeafSearchRequest can span multiple indices.
+///
 message LeafSearchRequest {
-  // Search request. This is a perfect copy of the original search request,
-  // that was sent to root apart from the start_offset & max_hits params.
+  // Search request. This is a perfect copy of the original search request
+  // that was sent to root apart from the start_offset, max_hits params and index_id_patterns.
+  // index_id_patterns contains the actual index ids queried on that leaf.
   SearchRequest search_request = 1;
+
+  // List of leaf requests, one per index.
+  repeated LeafRequestRef leaf_requests = 7;
+
+  // List of unique doc_mappers serialized as json.
+  repeated string doc_mappers = 8;
+
+  // List of index uris
+  // Index URI. The index URI defines the location of the storage that contains the
+  // split files.
+  repeated string index_uris = 9;
+}
+
+message ResourceStats {
+    uint64 short_lived_cache_num_bytes = 1;
+    uint64 split_num_docs = 2;
+    uint64 warmup_microsecs = 3;
+    uint64 cpu_thread_pool_wait_microsecs = 4;
+    uint64 cpu_microsecs = 5;
+}
+
+/// LeafRequestRef references data in LeafSearchRequest to deduplicate data.
+message LeafRequestRef {
+  // The ordinal of the doc_mapper in `LeafSearchRequest.doc_mappers`
+  uint32 doc_mapper_ord = 1;
+
+  // The ordinal of the index uri in LeafSearchRequest.index_uris
+  uint32 index_uri_ord = 2;
 
   // Index split ids to apply the query on.
   // This ids are resolved from the index_uri defined in the search_request.
-  repeated SplitIdAndFooterOffsets split_offsets = 4;
-
-  // `DocMapper` as json serialized trait.
-  string doc_mapper = 5;
-
-  // Index URI. The index URI defines the location of the storage that contains the
-  // split files.
-  string index_uri = 6;
-
+  repeated SplitIdAndFooterOffsets split_offsets = 3;
 }
 
 message SplitIdAndFooterOffsets {
@@ -335,10 +376,12 @@ message SplitIdAndFooterOffsets {
   uint64 split_footer_start = 2;
   // The offset of the end of the footer in split bundle. The footer contains the file bundle metadata and the hotcache.
   uint64 split_footer_end = 3;
-  // The lowest timestamp appearing in the split
+  // The lowest timestamp appearing in the split, in seconds since epoch
   optional int64 timestamp_start = 4;
-  // The highest timestamp appearing in the split
+  // The highest timestamp appearing in the split, in seconds since epoch
   optional int64 timestamp_end = 5;
+  // The number of docs in the split
+  uint64 num_docs = 6;
 }
 
 // Hits returned by a FetchDocRequest.
@@ -349,9 +392,9 @@ message SplitIdAndFooterOffsets {
 // For instance:
 // - it may contain a _source and a _dynamic field.
 // - since tantivy has no notion of cardinality,
-// all fields is  are arrays.
+//   all fields are arrays.
 // - since tantivy has no notion of object, the object is
-// flattened by concatenating the path to the root.
+//   flattened by concatenating the path to the root.
 //
 // See  `quickwit_search::convert_leaf_hit`
 message LeafHit {
@@ -429,15 +472,23 @@ message LeafSearchResponse {
   // The list of splits that failed. LeafSearchResponse can be an aggregation of results, so there may be multiple.
   repeated SplitSearchError failed_splits = 3;
 
-  // Total number of splits the leaf(s) were in charge of.
-  // num_attempted_splits = num_successful_splits + num_failed_splits.
+  // Total number of attempt to search into splits.
+  // We do have:
+  // `num_splits_requested == num_successful_splits + num_failed_splits.len()`
+  // But we do not necessarily have:
+  // `num_splits_requested = num_attempted_splits because of retries.`
   uint64 num_attempted_splits = 4;
+
+  // Total number of successful splits searched.
+  uint64 num_successful_splits = 7;
 
   // Deprecated json serialized intermediate aggregation_result.
   reserved 5;
 
   // postcard serialized intermediate aggregation_result.
   optional bytes intermediate_aggregation_result = 6;
+
+  ResourceStats resource_stats = 8;
 }
 
 message SnippetRequest {
@@ -526,8 +577,7 @@ message LeafListTermsResponse {
   // The list of splits that failed. LeafSearchResponse can be an aggregation of results, so there may be multiple.
   repeated SplitSearchError failed_splits = 3;
 
-  // Total number of splits the leaf(s) were in charge of.
-  // num_attempted_splits = num_successful_splits + num_failed_splits.
+  // Total number of single split search attempted.
   uint64 num_attempted_splits = 4;
 }
 

@@ -67,18 +67,21 @@ impl CatIndexQueryParams {
                         "Format {:?} is not supported. Only format=json is supported.",
                         format
                     ),
+                    None,
                 ));
             }
         } else {
             return Err(ElasticsearchError::new(
                 StatusCode::BAD_REQUEST,
                 "Only format=json is supported.".to_string(),
+                None,
             ));
         }
         let unsupported_parameter_error = |field: &str| {
             ElasticsearchError::new(
                 StatusCode::BAD_REQUEST,
                 format!("Parameter {:?} is not supported.", field),
+                None,
             )
         };
         if self.bytes.is_some() {
@@ -90,7 +93,6 @@ impl CatIndexQueryParams {
         if self.s.is_some() {
             return Err(unsupported_parameter_error("s"));
         }
-
         Ok(())
     }
 }
@@ -171,6 +173,29 @@ impl From<SplitMetadata> for ElasticsearchCatIndexResponse {
             rep: "1".to_string(),
             docs_count: split_metadata.as_split_info().num_docs as u64,
             ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ElasticsearchResolveIndexResponse {
+    pub indices: Vec<ElasticsearchResolveIndexEntryResponse>,
+    // Unused for the moment.
+    pub aliases: Vec<serde_json::Value>,
+    pub data_streams: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ElasticsearchResolveIndexEntryResponse {
+    pub name: String,
+    pub attributes: Vec<Status>,
+}
+
+impl From<IndexMetadata> for ElasticsearchResolveIndexEntryResponse {
+    fn from(index_metadata: IndexMetadata) -> Self {
+        ElasticsearchResolveIndexEntryResponse {
+            name: index_metadata.index_config.index_id.to_string(),
+            attributes: vec![Status::Open],
         }
     }
 }

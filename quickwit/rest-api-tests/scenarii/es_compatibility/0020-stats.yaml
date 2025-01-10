@@ -8,21 +8,21 @@ expected:
     primaries:
       docs:
         count: 100
-      store: 
-        size_in_bytes: 
+      store:
+        size_in_bytes:
           $expect: "val > 278300"
     total:
       segments:
         count: 1
       docs:
         count: 100
-  indices: 
+  indices:
     gharchive:
       primaries:
         docs:
           count: 100
-        store: 
-          size_in_bytes: 
+        store:
+          size_in_bytes:
             $expect: "val > 278300"
       total:
         segments:
@@ -45,7 +45,7 @@ expected:
         count: 1
       docs:
         count: 100
-  indices: 
+  indices:
     gharchive:
       primaries:
         docs:
@@ -59,7 +59,6 @@ expected:
 method: [GET]
 engines:
   - quickwit
-  - elasticsearch
 endpoint: "_stats"
 expected:
   _all:
@@ -71,7 +70,7 @@ expected:
         count: 1
       docs:
         count: 100
-  indices: 
+  indices:
     gharchive:
       primaries:
         docs:
@@ -90,5 +89,3 @@ expected:
           count: 0
         docs:
           count: 0
-
-

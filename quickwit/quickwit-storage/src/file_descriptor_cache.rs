@@ -119,6 +119,9 @@ impl FileDescriptorCache {
         self.fd_cache_metrics
             .in_cache_count
             .set(fd_cache_lock.len() as i64);
+        self.fd_cache_metrics
+            .evict_num_items
+            .inc_by(split_ids.len() as u64);
     }
 
     pub async fn get_or_open_split_file(
@@ -160,7 +163,11 @@ impl SplitFile {
         use std::os::unix::fs::FileExt;
         let file = self.clone();
         let buf = tokio::task::spawn_blocking(move || {
-            let mut buf = vec![0u8; range.len()];
+            let mut buf = Vec::with_capacity(range.len());
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                buf.set_len(range.len());
+            }
             file.0.file.read_exact_at(&mut buf, range.start as u64)?;
             io::Result::Ok(buf)
         })
@@ -223,7 +230,7 @@ mod tests {
         assert_eq!(cache_metrics.misses_num_items.get(), 10);
     }
 
-    // This mimicks Quickwit's workload where the fd cache is much smaller than the number of
+    // This mimics Quickwit's workload where the fd cache is much smaller than the number of
     // splits. Each search will read from the same split file, and the cache will help avoid
     // opening the file several times.
     #[tokio::test]

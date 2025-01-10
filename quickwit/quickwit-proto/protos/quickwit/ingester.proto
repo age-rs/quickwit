@@ -32,7 +32,7 @@ service IngesterService {
   rpc OpenReplicationStream(stream SynReplicationMessage) returns (stream AckReplicationMessage);
 
   // Streams records from a leader or a follower. The client can optionally specify a range of positions to fetch,
-  // otherwise the stream will go undefinitely or until the shard is closed.
+  // otherwise the stream will go indefinitely or until the shard is closed.
   rpc OpenFetchStream(OpenFetchStreamRequest) returns (stream FetchMessage);
 
   // Streams status updates, called "observations", from an ingester.
@@ -51,12 +51,8 @@ service IngesterService {
   // Closes a set of shards. This RPC is called by the control plane.
   rpc CloseShards(CloseShardsRequest) returns (CloseShardsResponse);
 
-  // Pings an ingester to check if it is ready to host shards and serve requests.
-  rpc Ping(PingRequest) returns (PingResponse);
-
   // Decommissions the ingester.
   rpc Decommission(DecommissionRequest) returns (DecommissionResponse);
-
 }
 
 message RetainShardsForSource {
@@ -98,14 +94,18 @@ message PersistSuccess {
   string source_id = 3;
   quickwit.ingest.ShardId shard_id = 4;
   quickwit.ingest.Position replication_position_inclusive = 5;
+  uint32 num_persisted_docs = 6;
+  repeated quickwit.ingest.ParseFailure parse_failures = 7;
 }
+
 
 enum PersistFailureReason {
   PERSIST_FAILURE_REASON_UNSPECIFIED = 0;
   PERSIST_FAILURE_REASON_SHARD_NOT_FOUND = 1;
   PERSIST_FAILURE_REASON_SHARD_CLOSED = 2;
-  PERSIST_FAILURE_REASON_RATE_LIMITED = 3;
-  PERSIST_FAILURE_REASON_RESOURCE_EXHAUSTED = 4;
+  PERSIST_FAILURE_REASON_SHARD_RATE_LIMITED = 3;
+  PERSIST_FAILURE_REASON_WAL_FULL = 4;
+  PERSIST_FAILURE_REASON_TIMEOUT = 5;
 }
 
 message PersistFailure {
@@ -192,7 +192,7 @@ enum ReplicateFailureReason {
   REPLICATE_FAILURE_REASON_SHARD_NOT_FOUND = 1;
   REPLICATE_FAILURE_REASON_SHARD_CLOSED = 2;
   reserved 3; // REPLICATE_FAILURE_REASON_RATE_LIMITED = 3;
-  REPLICATE_FAILURE_REASON_RESOURCE_EXHAUSTED = 4;
+  REPLICATE_FAILURE_REASON_WAL_FULL = 4;
 }
 
 message ReplicateFailure {
@@ -252,25 +252,42 @@ message FetchEof {
 }
 
 message InitShardsRequest {
-  repeated quickwit.ingest.Shard shards = 1;
+  reserved 1;
+  repeated InitShardSubrequest subrequests = 2;
+}
+
+message InitShardSubrequest {
+  uint32 subrequest_id = 1;
+  quickwit.ingest.Shard shard = 2;
+  string doc_mapping_json = 3;
+  bool validate_docs = 4;
 }
 
 message InitShardsResponse {
+  repeated InitShardSuccess successes = 1;
+  repeated InitShardFailure failures = 2;
+}
+
+message InitShardSuccess {
+  uint32 subrequest_id = 1;
+  quickwit.ingest.Shard shard = 2;
+}
+
+message InitShardFailure {
+  uint32 subrequest_id = 1;
+  quickwit.common.IndexUid index_uid = 2;
+  string source_id = 3;
+  quickwit.ingest.ShardId shard_id = 4;
+  // InitShardFailureReason reason = 5;
 }
 
 message CloseShardsRequest {
-  repeated quickwit.ingest.ShardIds shards = 1;
+  reserved 1;
+  repeated quickwit.ingest.ShardPKey shard_pkeys = 2;
 }
 
 message CloseShardsResponse {
-}
-
-message PingRequest {
-  string leader_id = 1;
-  optional string follower_id = 2;
-}
-
-message PingResponse {
+  repeated quickwit.ingest.ShardPKey successes = 1;
 }
 
 message DecommissionRequest {

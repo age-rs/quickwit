@@ -25,13 +25,13 @@ use quickwit_config::{ConfigFormat, SourceConfig};
 use quickwit_indexing::actors::IndexingServiceCounters;
 pub use quickwit_ingest::CommitType;
 use quickwit_metastore::{IndexMetadata, Split, SplitInfo};
+use quickwit_proto::ingest::Shard;
 use quickwit_search::SearchResponseRest;
 use quickwit_serve::{ListSplitsQueryParams, ListSplitsResponse, SearchRequestQueryString};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use reqwest::{Client, ClientBuilder, Method, StatusCode, Url};
 use serde::Serialize;
 use serde_json::json;
-use tracing::warn;
 
 use crate::error::Error;
 use crate::models::{ApiResponse, IngestSource, Timeout};
@@ -120,8 +120,8 @@ pub struct QuickwitClientBuilder {
     ingest_timeout: Timeout,
     /// Timeout for the ingest operations that require waiting for commit.
     commit_timeout: Timeout,
-    /// Experimental: if true, use the ingest v2 endpoint.
-    ingest_v2: bool,
+    /// Forces use of ingest v1.
+    use_legacy_ingest: bool,
 }
 
 impl QuickwitClientBuilder {
@@ -133,7 +133,7 @@ impl QuickwitClientBuilder {
             search_timeout: DEFAULT_CLIENT_SEARCH_TIMEOUT,
             ingest_timeout: DEFAULT_CLIENT_INGEST_TIMEOUT,
             commit_timeout: DEFAULT_CLIENT_COMMIT_TIMEOUT,
-            ingest_v2: false,
+            use_legacy_ingest: false,
         }
     }
 
@@ -147,12 +147,6 @@ impl QuickwitClientBuilder {
         self
     }
 
-    pub fn enable_ingest_v2(mut self) -> Self {
-        warn!("ingest v2 experimental feature enabled!");
-        self.ingest_v2 = true;
-        self
-    }
-
     pub fn search_timeout(mut self, timeout: Timeout) -> Self {
         self.search_timeout = timeout;
         self
@@ -160,6 +154,12 @@ impl QuickwitClientBuilder {
 
     pub fn ingest_timeout(mut self, timeout: Timeout) -> Self {
         self.ingest_timeout = timeout;
+        self
+    }
+
+    // TODO(#5604)
+    pub fn use_legacy_ingest(mut self, use_legacy_ingest: bool) -> Self {
+        self.use_legacy_ingest = use_legacy_ingest;
         self
     }
 
@@ -176,7 +176,7 @@ impl QuickwitClientBuilder {
             search_timeout: self.search_timeout,
             ingest_timeout: self.ingest_timeout,
             commit_timeout: self.commit_timeout,
-            ingest_v2: self.ingest_v2,
+            use_legacy_ingest: self.use_legacy_ingest,
         }
     }
 }
@@ -192,16 +192,11 @@ pub struct QuickwitClient {
     ingest_timeout: Timeout,
     /// Timeout for the ingest operations that require waiting for commit.
     commit_timeout: Timeout,
-    // TODO remove me after Quickwit 0.7 release.
-    // If true, rely on ingest v2
-    ingest_v2: bool,
+    /// Forces use of ingest v1.
+    use_legacy_ingest: bool,
 }
 
 impl QuickwitClient {
-    pub fn enable_ingest_v2(&mut self) {
-        self.ingest_v2 = true;
-    }
-
     pub async fn search(
         &self,
         index_id: &str,
@@ -257,11 +252,12 @@ impl QuickwitClient {
         index_id: &str,
         ingest_source: IngestSource,
         batch_size_limit_opt: Option<usize>,
-        on_ingest_event: Option<&(dyn Fn(IngestEvent) + Sync)>,
+        mut on_ingest_event: Option<&mut (dyn FnMut(IngestEvent) + Sync)>,
         last_block_commit: CommitType,
     ) -> Result<(), Error> {
-        let ingest_path = if self.ingest_v2 {
-            format!("{index_id}/ingest-v2")
+        // TODO(#5604)
+        let ingest_path = if self.use_legacy_ingest {
+            format!("{index_id}/ingest?use_legacy_ingest=true")
         } else {
             format!("{index_id}/ingest")
         };
@@ -295,16 +291,16 @@ impl QuickwitClient {
                     )
                     .await?;
                 if response.status_code() == StatusCode::TOO_MANY_REQUESTS {
-                    if let Some(event_fn) = &on_ingest_event {
+                    if let Some(event_fn) = &mut on_ingest_event {
                         event_fn(IngestEvent::Sleep)
                     }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 } else {
                     response.check().await?;
                     break;
                 }
             }
-            if let Some(event_fn) = on_ingest_event {
+            if let Some(event_fn) = &mut on_ingest_event {
                 event_fn(IngestEvent::IngestedDocBatch(batch.len()))
             }
         }
@@ -331,12 +327,12 @@ impl<'a> IndexClient<'a> {
 
     pub async fn create(
         &self,
-        index_config: impl ToString,
+        index_config: impl AsRef<[u8]>,
         config_format: ConfigFormat,
         overwrite: bool,
     ) -> Result<IndexMetadata, Error> {
         let header_map = header_from_config_format(config_format);
-        let body = Bytes::from(index_config.to_string());
+        let body = Bytes::copy_from_slice(index_config.as_ref());
         let response = self
             .transport
             .send(
@@ -344,6 +340,30 @@ impl<'a> IndexClient<'a> {
                 "indexes",
                 Some(header_map),
                 Some(&[("overwrite", overwrite)]),
+                Some(body),
+                self.timeout,
+            )
+            .await?;
+        let index_metadata = response.deserialize().await?;
+        Ok(index_metadata)
+    }
+
+    pub async fn update(
+        &self,
+        index_id: &str,
+        index_config: impl AsRef<[u8]>,
+        config_format: ConfigFormat,
+    ) -> Result<IndexMetadata, Error> {
+        let header_map = header_from_config_format(config_format);
+        let body = Bytes::copy_from_slice(index_config.as_ref());
+        let path = format!("indexes/{index_id}");
+        let response = self
+            .transport
+            .send::<()>(
+                Method::PUT,
+                &path,
+                Some(header_map),
+                None,
                 Some(body),
                 self.timeout,
             )
@@ -473,11 +493,11 @@ impl<'a> SourceClient<'a> {
 
     pub async fn create(
         &self,
-        source_config_input: impl ToString,
+        source_config_input: impl AsRef<[u8]>,
         config_format: ConfigFormat,
     ) -> Result<SourceConfig, Error> {
         let header_map = header_from_config_format(config_format);
-        let source_config_bytes: Bytes = Bytes::from(source_config_input.to_string());
+        let source_config_bytes = Bytes::copy_from_slice(source_config_input.as_ref());
         let response = self
             .transport
             .send::<()>(
@@ -556,6 +576,16 @@ impl<'a> SourceClient<'a> {
             .await?;
         response.check().await?;
         Ok(())
+    }
+
+    pub async fn get_shards(&self, source_id: &str) -> Result<Vec<Shard>, Error> {
+        let path = format!("{}/{source_id}/shards", self.sources_root_url());
+        let response = self
+            .transport
+            .send::<()>(Method::GET, &path, None, None, None, self.timeout)
+            .await?;
+        let source_config = response.deserialize().await?;
+        Ok(source_config)
     }
 }
 

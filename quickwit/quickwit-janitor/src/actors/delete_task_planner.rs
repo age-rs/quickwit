@@ -37,7 +37,7 @@ use quickwit_proto::metastore::{
 };
 use quickwit_proto::search::SearchRequest;
 use quickwit_proto::types::IndexUid;
-use quickwit_search::{jobs_to_leaf_requests, IndexMetasForLeafSearch, SearchJob, SearchJobPlacer};
+use quickwit_search::{jobs_to_leaf_request, IndexMetasForLeafSearch, SearchJob, SearchJobPlacer};
 use serde::Serialize;
 use tantivy::Inventory;
 use tracing::{debug, info};
@@ -209,9 +209,11 @@ impl DeleteTaskPlanner {
                     self.merge_split_downloader_mailbox.clone(),
                 )
                 .await?;
+                let index_label =
+                    quickwit_common::metrics::index_label(self.index_uid.index_id.as_str());
                 JANITOR_METRICS
                     .ongoing_num_delete_operations_total
-                    .with_label_values([&self.index_uid.index_id])
+                    .with_label_values([index_label])
                     .set(self.ongoing_delete_operations_inventory.list().len() as i64);
             }
         }
@@ -325,17 +327,15 @@ impl DeleteTaskPlanner {
                     index_uri,
                 },
             );
-            let leaf_search_request = jobs_to_leaf_requests(
+            let leaf_search_request = jobs_to_leaf_request(
                 &search_request,
                 &search_indexes_metas,
                 vec![search_job.clone()],
             )?;
-            for leaf_request in leaf_search_request {
-                let response = search_client.leaf_search(leaf_request).await?;
-                ctx.record_progress();
-                if response.num_hits > 0 {
-                    return Ok(true);
-                }
+            let response = search_client.leaf_search(leaf_search_request).await?;
+            ctx.record_progress();
+            if response.num_hits > 0 {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -357,7 +357,8 @@ impl DeleteTaskPlanner {
         let stale_splits = ctx
             .protect_future(self.metastore.list_stale_splits(list_stale_splits_request))
             .await?
-            .deserialize_splits()?;
+            .deserialize_splits()
+            .await?;
         debug!(
             index_id = index_uid.index_id,
             last_delete_opstamp = last_delete_opstamp,
@@ -469,7 +470,7 @@ mod tests {
         for doc in docs {
             test_sandbox.add_documents(vec![doc]).await?;
         }
-        let mut metastore = test_sandbox.metastore();
+        let metastore = test_sandbox.metastore();
         let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
         let index_metadata = metastore
             .index_metadata(index_metadata_request)
@@ -522,7 +523,7 @@ mod tests {
             move |request: LeafSearchRequest| {
                 // Search on body:delete should return one hit only on the last split
                 // that should contains the doc.
-                if request.split_offsets[0].split_id == split_id_with_doc_to_delete
+                if request.leaf_requests[0].split_offsets[0].split_id == split_id_with_doc_to_delete
                     && request.search_request.as_ref().unwrap().query_ast == body_delete_ast
                 {
                     return Ok(LeafSearchResponse {

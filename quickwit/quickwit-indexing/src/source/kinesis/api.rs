@@ -119,7 +119,7 @@ pub(crate) async fn list_shards(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "kinesis-localstack-tests"))]
 pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
@@ -207,13 +207,9 @@ pub(crate) mod tests {
                     .await
             })
             .await?;
-            exclusive_start_stream_name = response
-                .stream_names
-                .as_ref()
-                .and_then(|names| names.last())
-                .cloned();
-            has_more_streams = response.has_more_streams.unwrap_or_default();
-            stream_names.extend(response.stream_names.unwrap_or_default());
+            exclusive_start_stream_name = response.stream_names.last().cloned();
+            has_more_streams = response.has_more_streams;
+            stream_names.extend(response.stream_names);
         }
         Ok(stream_names)
     }
@@ -282,8 +278,7 @@ pub(crate) mod tests {
                 interval.tick().await;
                 let stream_status = describe_stream(kinesis_client, stream_name)
                     .await?
-                    .stream_status
-                    .ok_or_else(|| anyhow!("AWS did not return a stream status"))?;
+                    .stream_status;
 
                 if stream_status_predicate(stream_status) {
                     return Ok(());
@@ -310,6 +305,7 @@ mod kinesis_localstack_tests {
         wait_for_active_stream, DEFAULT_RETRY_PARAMS,
     };
 
+    #[ignore]
     #[tokio::test]
     async fn test_create_stream() -> anyhow::Result<()> {
         let stream_name = append_random_suffix("test-create-stream");
@@ -317,15 +313,13 @@ mod kinesis_localstack_tests {
         create_stream(&kinesis_client, &stream_name, 1).await?;
         wait_for_active_stream(&kinesis_client, &stream_name).await??;
         let description_summary = describe_stream(&kinesis_client, &stream_name).await?;
-        assert_eq!(description_summary.stream_name.as_ref(), Some(&stream_name));
-        assert_eq!(
-            description_summary.stream_status,
-            Some(StreamStatus::Active)
-        );
+        assert_eq!(description_summary.stream_name, stream_name);
+        assert_eq!(description_summary.stream_status, StreamStatus::Active,);
         teardown(&kinesis_client, &stream_name).await;
         Ok(())
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_delete_stream() -> anyhow::Result<()> {
         let (kinesis_client, stream_name) = setup("test-delete-stream", 1).await?;
@@ -343,6 +337,7 @@ mod kinesis_localstack_tests {
         Ok(())
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_get_records() -> anyhow::Result<()> {
         let (kinesis_client, stream_name) = setup("test-get-records", 2).await?;
@@ -369,28 +364,10 @@ mod kinesis_localstack_tests {
         )
         .await?;
 
-        let records = get_records_output.records.unwrap_or_default();
+        let records = get_records_output.records;
         assert_eq!(records.len(), 2);
-        assert_eq!(
-            std::str::from_utf8(
-                records[0]
-                    .data
-                    .as_ref()
-                    .map(|blob| blob.as_ref())
-                    .unwrap_or(&[])
-            )?,
-            "Record #00"
-        );
-        assert_eq!(
-            std::str::from_utf8(
-                records[1]
-                    .data
-                    .as_ref()
-                    .map(|blob| blob.as_ref())
-                    .unwrap_or(&[])
-            )?,
-            "Record #01"
-        );
+        assert_eq!(std::str::from_utf8(records[0].data.as_ref())?, "Record #00");
+        assert_eq!(std::str::from_utf8(records[1].data.as_ref())?, "Record #01");
         teardown(&kinesis_client, &stream_name).await;
         Ok(())
     }
@@ -424,7 +401,7 @@ mod kinesis_localstack_tests {
                 shard_iterator.unwrap(),
             )
             .await?;
-            assert_eq!(get_records_output.records.unwrap_or_default().len(), 1);
+            assert_eq!(get_records_output.records.len(), 1);
         }
         {
             let starting_sequence_number = sequence_numbers.get(&0).unwrap().first().cloned();
@@ -444,12 +421,13 @@ mod kinesis_localstack_tests {
                 shard_iterator.unwrap(),
             )
             .await?;
-            assert_eq!(get_records_output.records.unwrap_or_default().len(), 0)
+            assert_eq!(get_records_output.records.len(), 0)
         }
         teardown(&kinesis_client, &stream_name).await;
         Ok(())
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_list_shards() -> anyhow::Result<()> {
         let (kinesis_client, stream_name) = setup("test-list-shards", 2).await?;
@@ -461,8 +439,8 @@ mod kinesis_localstack_tests {
         )
         .await?;
         assert_eq!(shards.len(), 2);
-        assert_eq!(shards[0].shard_id, Some(make_shard_id(0)));
-        assert_eq!(shards[1].shard_id, Some(make_shard_id(1)));
+        assert_eq!(shards[0].shard_id, make_shard_id(0));
+        assert_eq!(shards[1].shard_id, make_shard_id(1));
         teardown(&kinesis_client, &stream_name).await;
         Ok(())
     }

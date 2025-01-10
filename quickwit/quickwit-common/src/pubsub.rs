@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex as TokioMutex;
-use tracing::warn;
 
+use crate::rate_limited_warn;
 use crate::type_map::TypeMap;
 
 const EVENT_SUBSCRIPTION_CALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -42,7 +42,7 @@ pub trait EventSubscriber<E>: Send + Sync + 'static {
 impl<E, F> EventSubscriber<E> for F
 where
     E: Event,
-    F: Fn(E) + Send + Sync + 'static,
+    F: FnMut(E) + Send + Sync + 'static,
 {
     async fn handle_event(&mut self, event: E) {
         (self)(event);
@@ -54,6 +54,7 @@ type EventSubscriptions<E> = HashMap<usize, EventSubscription<E>>;
 /// The event broker makes it possible to
 /// - emit specific local events
 /// - subscribe to these local events
+///
 /// The event broker is not distributed in itself. Only events emitted
 /// locally will be received by the subscribers.
 ///
@@ -192,7 +193,8 @@ impl<E: Event> EventSubscription<E> {
         let log_timeout_task_handle = tokio::task::spawn(async move {
             tokio::time::sleep(EVENT_SUBSCRIPTION_CALLBACK_TIMEOUT).await;
             let event_name = std::any::type_name::<E>();
-            warn!(
+            rate_limited_warn!(
+                limit_per_min = 10,
                 "{subscriber_name}'s handler for {event_name} did not finished within {}ms",
                 EVENT_SUBSCRIPTION_CALLBACK_TIMEOUT.as_millis()
             );
@@ -219,7 +221,10 @@ impl<E: Event> EventSubscription<E> {
             .is_err()
             {
                 let event_name = std::any::type_name::<E>();
-                warn!("{subscriber_name}'s handler for {event_name} timed out, abort");
+                rate_limited_warn!(
+                    limit_per_min = 10,
+                    "{subscriber_name}'s handler for {event_name} timed out, abort"
+                );
             }
         };
         tokio::task::spawn(fut);

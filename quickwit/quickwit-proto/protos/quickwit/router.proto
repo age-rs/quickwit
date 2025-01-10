@@ -57,6 +57,8 @@ message IngestSuccess {
   quickwit.ingest.ShardId shard_id = 4;
   // Replication position inclusive.
   quickwit.ingest.Position replication_position_inclusive = 5;
+  uint32 num_ingested_docs = 6;
+  repeated quickwit.ingest.ParseFailure parse_failures = 7;
 }
 
 enum IngestFailureReason {
@@ -65,8 +67,12 @@ enum IngestFailureReason {
   INGEST_FAILURE_REASON_SOURCE_NOT_FOUND = 2;
   INGEST_FAILURE_REASON_INTERNAL = 3;
   INGEST_FAILURE_REASON_NO_SHARDS_AVAILABLE = 4;
-  INGEST_FAILURE_REASON_RATE_LIMITED = 5;
-  INGEST_FAILURE_REASON_RESOURCE_EXHAUSTED = 6;
+  INGEST_FAILURE_REASON_SHARD_RATE_LIMITED = 5;
+  INGEST_FAILURE_REASON_WAL_FULL = 6;
+  INGEST_FAILURE_REASON_TIMEOUT = 7;
+  INGEST_FAILURE_REASON_ROUTER_LOAD_SHEDDING = 8;
+  INGEST_FAILURE_REASON_LOAD_SHEDDING = 9;
+  INGEST_FAILURE_REASON_CIRCUIT_BREAKER = 10;
 }
 
 message IngestFailure {

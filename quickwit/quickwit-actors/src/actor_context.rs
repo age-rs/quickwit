@@ -241,7 +241,7 @@ impl<A: Actor> ActorContext<A> {
     /// This method hides logic to prevent an actor from being identified
     /// as frozen if the destination actor channel is saturated, and we
     /// are simply experiencing back pressure.
-    pub async fn send_message<DestActor: Actor, M>(
+    pub async fn send_message<DestActor, M>(
         &self,
         mailbox: &Mailbox<DestActor>,
         msg: M,
@@ -260,7 +260,7 @@ impl<A: Actor> ActorContext<A> {
             .await
     }
 
-    pub async fn ask<DestActor: Actor, M, T>(
+    pub async fn ask<DestActor, M, T>(
         &self,
         mailbox: &Mailbox<DestActor>,
         msg: M,
@@ -278,7 +278,7 @@ impl<A: Actor> ActorContext<A> {
 
     /// Similar to `send_message`, except this method
     /// waits asynchronously for the actor reply.
-    pub async fn ask_for_res<DestActor: Actor, M, T, E>(
+    pub async fn ask_for_res<DestActor, M, T, E>(
         &self,
         mailbox: &Mailbox<DestActor>,
         msg: M,
@@ -339,8 +339,11 @@ impl<A: Actor> ActorContext<A> {
         self.self_mailbox.try_send_message(msg)
     }
 
-    /// Schedules a message that will be sent to the high-priority
-    /// queue of the actor Mailbox once `after_duration` has elapsed.
+    /// Schedules a message that will be sent to the high-priority queue of the
+    /// actor Mailbox once `after_duration` has elapsed.
+    ///
+    /// Note that this holds a reference to the actor mailbox until the message
+    /// is actually sent.
     pub fn schedule_self_msg<M>(&self, after_duration: Duration, message: M)
     where
         A: DeferableReplyHandler<M>,

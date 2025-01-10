@@ -18,23 +18,61 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use once_cell::sync::Lazy;
-use quickwit_common::metrics::{new_counter, IntCounter};
+use quickwit_common::metrics::{
+    new_counter, new_counter_vec, new_gauge_vec, new_histogram_vec, HistogramVec, IntCounter,
+    IntCounterVec, IntGaugeVec,
+};
 
-pub struct RestMetrics {
-    pub http_requests_total: IntCounter,
+pub struct ServeMetrics {
+    pub http_requests_total: IntCounterVec<2>,
+    pub request_duration_secs: HistogramVec<2>,
+    pub ongoing_requests: IntGaugeVec<1>,
+    pub pending_requests: IntGaugeVec<1>,
+    pub circuit_break_total: IntCounter,
 }
 
-impl Default for RestMetrics {
+impl Default for ServeMetrics {
     fn default() -> Self {
-        RestMetrics {
-            http_requests_total: new_counter(
+        let circuit_break_total = new_counter(
+            "circuit_break_total",
+            "Circuit breaker counter",
+            "grpc",
+            &[],
+        );
+        ServeMetrics {
+            http_requests_total: new_counter_vec(
                 "http_requests_total",
-                "Total number of HTTP requests received",
+                "Total number of HTTP requests processed.",
                 "",
+                &[],
+                ["method", "status_code"],
             ),
+            request_duration_secs: new_histogram_vec(
+                "request_duration_secs",
+                "Response time in seconds",
+                "",
+                &[],
+                ["method", "status_code"],
+                quickwit_common::metrics::exponential_buckets(0.02, 2.0, 8).unwrap(),
+            ),
+            ongoing_requests: new_gauge_vec(
+                "ongoing_requests",
+                "Number of ongoing requests.",
+                "",
+                &[],
+                ["endpoint_group"],
+            ),
+            pending_requests: new_gauge_vec(
+                "pending_requests",
+                "Number of pending requests.",
+                "",
+                &[],
+                ["endpoint_group"],
+            ),
+            circuit_break_total,
         }
     }
 }
 
 /// Serve counters exposes a bunch a set of metrics about the request received to quickwit.
-pub static SERVE_METRICS: Lazy<RestMetrics> = Lazy::new(RestMetrics::default);
+pub static SERVE_METRICS: Lazy<ServeMetrics> = Lazy::new(ServeMetrics::default);

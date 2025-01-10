@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use prost::Message;
 use prost_types::{Duration as WellKnownDuration, Timestamp as WellKnownTimestamp};
 use quickwit_config::JaegerConfig;
@@ -45,7 +45,8 @@ use quickwit_proto::jaeger::storage::v1::{
 };
 use quickwit_proto::opentelemetry::proto::trace::v1::status::StatusCode as OtlpStatusCode;
 use quickwit_proto::search::{CountHits, ListTermsRequest, SearchRequest};
-use quickwit_query::query_ast::{BoolQuery, QueryAst, RangeQuery, TermQuery};
+use quickwit_query::query_ast::{BoolQuery, QueryAst, RangeQuery, TermQuery, UserInputQuery};
+use quickwit_query::BooleanOperand;
 use quickwit_search::{FindTraceIdsCollector, SearchService};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -60,8 +61,6 @@ use tracing::{debug, error, instrument, warn, Span as RuntimeSpan};
 
 use crate::metrics::JAEGER_SERVICE_METRICS;
 
-#[cfg(test)]
-mod integration_tests;
 mod metrics;
 
 // OpenTelemetry to Jaeger Transformation
@@ -193,6 +192,7 @@ impl JaegerService {
         operation_name: &'static str,
         request_start: Instant,
         index_id_patterns: Vec<String>,
+        root_only: bool,
     ) -> JaegerResult<SpanStream> {
         debug!(request=?request, "`find_traces` request");
 
@@ -212,6 +212,7 @@ impl JaegerService {
                 operation_name,
                 request_start,
                 index_id_patterns,
+                root_only,
             )
             .await?;
         Ok(response)
@@ -239,6 +240,7 @@ impl JaegerService {
                 operation_name,
                 request_start,
                 index_id_patterns,
+                false,
             )
             .await?;
         Ok(response)
@@ -302,6 +304,7 @@ impl JaegerService {
         operation_name: &'static str,
         request_start: Instant,
         index_id_patterns: Vec<String>,
+        root_only: bool,
     ) -> Result<SpanStream, Status> {
         if trace_ids.is_empty() {
             let (_tx, rx) = mpsc::channel(1);
@@ -317,6 +320,20 @@ impl JaegerService {
                 value,
             };
             query.should.push(term_query.into());
+        }
+        if root_only {
+            // we do this so we don't error on old indexes, and instead return both root and non
+            // root spans
+            let is_root = UserInputQuery {
+                user_text: "NOT is_root:false".to_string(),
+                default_fields: None,
+                default_operator: BooleanOperand::And,
+                lenient: true,
+            };
+            let mut new_query = BoolQuery::default();
+            new_query.must.push(query.into());
+            new_query.must.push(is_root.into());
+            query = new_query;
         }
 
         let query_ast: QueryAst = query.into();
@@ -525,6 +542,9 @@ impl SpanReaderPlugin for JaegerService {
             "find_traces",
             Instant::now(),
             index_id_patterns,
+            false, /* if we use true, Jaeger will display "1 Span", and display an empty trace
+                    * when clicking on the ui (but display the full trace after reloading the
+                    * page) */
         )
         .await
         .map(Response::new)
@@ -752,7 +772,7 @@ fn qw_span_to_jaeger_span(qw_span_json: &str) -> Result<JaegerSpan, Status> {
     qw_span.resource_attributes.remove("service.name");
     let process = Some(JaegerProcess {
         service_name: qw_span.service_name,
-        tags: otlp_attributes_to_jaeger_tags(qw_span.resource_attributes)?,
+        tags: otlp_attributes_to_jaeger_tags(qw_span.resource_attributes),
     });
     let logs: Vec<JaegerLog> = qw_span
         .events
@@ -760,7 +780,7 @@ fn qw_span_to_jaeger_span(qw_span_json: &str) -> Result<JaegerSpan, Status> {
         .map(qw_event_to_jaeger_log)
         .collect::<Result<_, _>>()?;
 
-    let mut tags = otlp_attributes_to_jaeger_tags(qw_span.span_attributes)?;
+    let mut tags = otlp_attributes_to_jaeger_tags(qw_span.span_attributes);
     inject_dropped_count_tags(
         &mut tags,
         qw_span.span_dropped_attributes_count,
@@ -924,55 +944,90 @@ fn inject_span_status_tags(tags: &mut Vec<JaegerKeyValue>, span_status: QwSpanSt
     };
 }
 
-/// Converts OpenTelemetry attributes to Jaeger tags.
+/// Converts OpenTelemetry attributes to Jaeger tags. Objects are flattened with
+/// their keys prefixed with the parent keys delimited by a dot.
+///
 /// <https://opentelemetry.io/docs/specs/otel/trace/sdk_exporters/jaeger/#attributes>
 fn otlp_attributes_to_jaeger_tags(
-    attributes: HashMap<String, JsonValue>,
-) -> Result<Vec<JaegerKeyValue>, Status> {
-    let mut tags = Vec::with_capacity(attributes.len());
-    for (key, value) in attributes {
-        let mut tag = JaegerKeyValue {
-            key,
-            v_type: ValueType::String as i32,
-            v_str: String::new(),
-            v_bool: false,
-            v_int64: 0,
-            v_float64: 0.0,
-            v_binary: Vec::new(),
-        };
-        match value {
-            // Array values MUST be serialized to string like a JSON list.
-            JsonValue::Array(values) => {
-                tag.v_type = ValueType::String as i32;
-                tag.v_str = serde_json::to_string(&values)
-                    .expect("A vec of `serde_json::Value` values should be JSON serializable.");
-            }
-            JsonValue::Bool(value) => {
-                tag.v_type = ValueType::Bool as i32;
-                tag.v_bool = value;
-            }
-            JsonValue::Number(number) => {
-                if let Some(value) = number.as_i64() {
-                    tag.v_type = ValueType::Int64 as i32;
-                    tag.v_int64 = value;
-                } else if let Some(value) = number.as_f64() {
-                    tag.v_type = ValueType::Float64 as i32;
-                    tag.v_float64 = value
+    attributes: impl IntoIterator<Item = (String, JsonValue)>,
+) -> Vec<JaegerKeyValue> {
+    otlp_attributes_to_jaeger_tags_inner(attributes, None)
+}
+
+/// Inner helper for `otpl_attributes_to_jaeger_tags` recursive call
+///
+/// PERF: as long as `attributes` IntoIterator implementation correctly sets the
+/// lower bound then collect should allocate efficiently. Note that the flat map
+/// may cause more allocations as we cannot predict the number of elements in the
+/// iterator.
+fn otlp_attributes_to_jaeger_tags_inner(
+    attributes: impl IntoIterator<Item = (String, JsonValue)>,
+    parent_key: Option<&str>,
+) -> Vec<JaegerKeyValue> {
+    attributes
+        .into_iter()
+        .map(|(key, value)| {
+            let key = parent_key
+                .map(|parent_key| format!("{parent_key}.{key}"))
+                .unwrap_or(key);
+            match value {
+                JsonValue::Array(values) => {
+                    Either::Left(Some(JaegerKeyValue {
+                        key,
+                        v_type: ValueType::String as i32,
+                        // Array values MUST be serialized to string like a JSON list.
+                        v_str: serde_json::to_string(&values).expect(
+                            "A vec of `serde_json::Value` values should be JSON serializable.",
+                        ),
+                        ..Default::default()
+                    }))
+                }
+                JsonValue::Bool(v_bool) => Either::Left(Some(JaegerKeyValue {
+                    key,
+                    v_type: ValueType::Bool as i32,
+                    v_bool,
+                    ..Default::default()
+                })),
+                JsonValue::Number(number) => {
+                    let value = if let Some(v_int64) = number.as_i64() {
+                        Some(JaegerKeyValue {
+                            key,
+                            v_type: ValueType::Int64 as i32,
+                            v_int64,
+                            ..Default::default()
+                        })
+                    } else if let Some(v_float64) = number.as_f64() {
+                        Some(JaegerKeyValue {
+                            key,
+                            v_type: ValueType::Float64 as i32,
+                            v_float64,
+                            ..Default::default()
+                        })
+                    } else {
+                        // Print some error rather than silently ignoring the value.
+                        warn!("ignoring unrepresentable number value: {number:?}");
+                        None
+                    };
+
+                    Either::Left(value)
+                }
+                JsonValue::String(v_str) => Either::Left(Some(JaegerKeyValue {
+                    key,
+                    v_type: ValueType::String as i32,
+                    v_str,
+                    ..Default::default()
+                })),
+                JsonValue::Null => {
+                    // No use including null values in the tags, so ignore
+                    Either::Left(None)
+                }
+                JsonValue::Object(value) => {
+                    Either::Right(otlp_attributes_to_jaeger_tags_inner(value, Some(&key)))
                 }
             }
-            JsonValue::String(value) => {
-                tag.v_type = ValueType::String as i32;
-                tag.v_str = value
-            }
-            _ => {
-                return Err(Status::internal(format!(
-                    "Failed to serialize attributes: unexpected type `{value:?}`"
-                )))
-            }
-        };
-        tags.push(tag);
-    }
-    Ok(tags)
+        })
+        .flat_map(|e| e.into_iter())
+        .collect()
 }
 
 /// Converts OpenTelemetry links to Jaeger span references.
@@ -1016,7 +1071,7 @@ fn qw_event_to_jaeger_log(event: QwEvent) -> Result<JaegerLog, Status> {
     let insert_event_name =
         !event.event_name.is_empty() && !event.event_attributes.contains_key("event");
 
-    let mut fields = otlp_attributes_to_jaeger_tags(event.event_attributes)?;
+    let mut fields = otlp_attributes_to_jaeger_tags(event.event_attributes);
 
     if insert_event_name {
         fields.push(JaegerKeyValue {
@@ -1168,7 +1223,8 @@ mod tests {
                 quickwit_query::query_ast::UserInputQuery {
                     user_text: "query".to_string(),
                     default_fields: None,
-                    default_operator: quickwit_query::BooleanOperand::And
+                    default_operator: quickwit_query::BooleanOperand::And,
+                    lenient: false,
                 }
                 .into()
             );
@@ -1939,18 +1995,29 @@ mod tests {
 
     #[test]
     fn test_otlp_attributes_to_jaeger_tags() {
-        let attributes = HashMap::from_iter([
+        let mut tags = otlp_attributes_to_jaeger_tags([
             ("array_int".to_string(), json!([1, 2])),
             ("array_str".to_string(), json!(["foo", "bar"])),
             ("bool".to_string(), json!(true)),
             ("float".to_string(), json!(1.0)),
             ("integer".to_string(), json!(1)),
             ("string".to_string(), json!("foo")),
+            (
+                "object".to_string(),
+                json!({
+                    "array_int": [1,2],
+                    "array_str": ["foo", "bar"],
+                    "bool": true,
+                    "float": 1.0,
+                    "integer": 1,
+                    "string": "foo",
+                }),
+            ),
         ]);
-        let mut tags = otlp_attributes_to_jaeger_tags(attributes).unwrap();
         tags.sort_by(|left, right| left.key.cmp(&right.key));
 
-        assert_eq!(tags.len(), 6);
+        // a tag for the 6 keys in the root, plus 6 more for the nested keys
+        assert_eq!(tags.len(), 12);
 
         assert_eq!(tags[0].key, "array_int");
         assert_eq!(tags[0].v_type(), ValueType::String);
@@ -1972,9 +2039,33 @@ mod tests {
         assert_eq!(tags[4].v_type(), ValueType::Int64);
         assert_eq!(tags[4].v_int64, 1);
 
-        assert_eq!(tags[5].key, "string");
+        assert_eq!(tags[5].key, "object.array_int");
         assert_eq!(tags[5].v_type(), ValueType::String);
-        assert_eq!(tags[5].v_str, "foo");
+        assert_eq!(tags[5].v_str, "[1,2]");
+
+        assert_eq!(tags[6].key, "object.array_str");
+        assert_eq!(tags[6].v_type(), ValueType::String);
+        assert_eq!(tags[6].v_str, r#"["foo","bar"]"#);
+
+        assert_eq!(tags[7].key, "object.bool");
+        assert_eq!(tags[7].v_type(), ValueType::Bool);
+        assert!(tags[7].v_bool);
+
+        assert_eq!(tags[8].key, "object.float");
+        assert_eq!(tags[8].v_type(), ValueType::Float64);
+        assert_eq!(tags[8].v_float64, 1.0);
+
+        assert_eq!(tags[9].key, "object.integer");
+        assert_eq!(tags[9].v_type(), ValueType::Int64);
+        assert_eq!(tags[9].v_int64, 1);
+
+        assert_eq!(tags[10].key, "object.string");
+        assert_eq!(tags[10].v_type(), ValueType::String);
+        assert_eq!(tags[10].v_str, "foo");
+
+        assert_eq!(tags[11].key, "string");
+        assert_eq!(tags[11].v_type(), ValueType::String);
+        assert_eq!(tags[11].v_str, "foo");
     }
 
     #[test]
@@ -2162,6 +2253,7 @@ mod tests {
                 message: Some("An error occurred.".to_string()),
             },
             parent_span_id: Some(SpanId::new([3; 8])),
+            is_root: Some(false),
             events: vec![QwEvent {
                 event_timestamp_nanos: 1000500003,
                 event_name: "event_name".to_string(),

@@ -31,6 +31,7 @@ use warp::reject::Rejection;
 use warp::{Filter, Reply};
 
 use crate::format::{extract_config_format, extract_format_from_qs};
+use crate::rest::recover_fn;
 use crate::rest_api_response::into_rest_api_response;
 use crate::with_arg;
 
@@ -55,6 +56,8 @@ pub(crate) fn index_template_api_handlers(
         .or(update_index_template_handler(metastore.clone()))
         .or(delete_index_template_handler(metastore.clone()))
         .or(list_index_templates_handler(metastore.clone()))
+        .recover(recover_fn)
+        .boxed()
 }
 
 fn create_index_template_handler(
@@ -76,14 +79,14 @@ fn create_index_template_handler(
     path = "/templates",
     request_body = VersionedIndexTemplate,
     responses(
-        (status = 200, description = "The index template was successfuly created.")
+        (status = 200, description = "The index template was successfully created.")
     ),
 )]
 /// Creates a new index template.
 async fn create_index_template(
     body: Bytes,
     config_format: ConfigFormat,
-    mut metastore: MetastoreServiceClient,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<IndexTemplate> {
     let index_template: IndexTemplate =
         config_format
@@ -123,14 +126,14 @@ fn get_index_template_handler(
     tag = "Templates",
     path = "/templates/{template_id}",
     responses(
-        (status = 200, description = "The index template was successfuly retrieved."),
+        (status = 200, description = "The index template was successfully retrieved."),
         (status = 404, description = "The index template was not found.")
     ),
 )]
 /// Retrieves the index template identified by `template_id`.
 async fn get_index_template(
     template_id: IndexTemplateId,
-    mut metastore: MetastoreServiceClient,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<IndexTemplate> {
     let get_index_template_request = GetIndexTemplateRequest { template_id };
     let get_index_template_response = metastore
@@ -159,7 +162,7 @@ fn update_index_template_handler(
     tag = "Templates",
     path = "/templates/{template_id}",
     responses(
-        (status = 200, description = "The index template was successfuly retrieved."),
+        (status = 200, description = "The index template was successfully retrieved."),
         (status = 404, description = "The index template was not found.")
     ),
 )]
@@ -168,7 +171,7 @@ async fn update_index_template(
     template_id: IndexTemplateId,
     body: Bytes,
     config_format: ConfigFormat,
-    mut metastore: MetastoreServiceClient,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<IndexTemplate> {
     let mut json_value: JsonValue =
         config_format
@@ -214,14 +217,14 @@ fn delete_index_template_handler(
     tag = "Templates",
     path = "/templates/{template_id}",
     responses(
-        (status = 200, description = "The index template was successfuly deleted."),
+        (status = 200, description = "The index template was successfully deleted."),
         (status = 404, description = "The index template was not found.")
     ),
 )]
 /// Deletes the index template identified by the provided `template_id`.
 async fn delete_index_template(
     template_id: IndexTemplateId,
-    mut metastore: MetastoreServiceClient,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<()> {
     let template_ids = vec![template_id];
     let delete_index_templates_request = DeleteIndexTemplatesRequest { template_ids };
@@ -247,12 +250,12 @@ fn list_index_templates_handler(
     tag = "Templates",
     path = "/templates",
     responses(
-        (status = 200, description = "The index template was successfuly retrieved."),
+        (status = 200, description = "The index template was successfully retrieved."),
     ),
 )]
 /// Retrieves all the index templates stored in the metastore.
 async fn list_index_templates(
-    mut metastore: MetastoreServiceClient,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<Vec<IndexTemplate>> {
     let list_index_templates_request = ListIndexTemplatesRequest {};
     let list_index_templates_response = metastore
@@ -272,6 +275,7 @@ async fn list_index_templates(
 mod tests {
     use quickwit_proto::metastore::{
         EmptyResponse, EntityKind, GetIndexTemplateResponse, ListIndexTemplatesResponse,
+        MockMetastoreService,
     };
     use serde_json::json;
 
@@ -279,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_index_template() {
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_create_index_template()
             .return_once(|request| {
@@ -293,7 +297,7 @@ mod tests {
 
                 Ok(EmptyResponse {})
             });
-        let metastore = MetastoreServiceClient::from(mock_metastore);
+        let metastore = MetastoreServiceClient::from_mock(mock_metastore);
         let create_index_template_handler = create_index_template_handler(metastore);
         let response = warp::test::request()
             .path("/templates")
@@ -311,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_index_template() {
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_get_index_template()
             .withf(|request| request.template_id == "test-template-foo")
@@ -337,7 +341,7 @@ mod tests {
                 };
                 Ok(response)
             });
-        let metastore = MetastoreServiceClient::from(mock_metastore);
+        let metastore = MetastoreServiceClient::from_mock(mock_metastore);
         let get_index_template_handler = get_index_template_handler(metastore);
 
         let response = warp::test::request()
@@ -360,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_index_template() {
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_create_index_template()
             .return_once(|request| {
@@ -374,14 +378,14 @@ mod tests {
 
                 Ok(EmptyResponse {})
             });
-        let metastore = MetastoreServiceClient::from(mock_metastore);
+        let metastore = MetastoreServiceClient::from_mock(mock_metastore);
         let update_index_template_handler = update_index_template_handler(metastore);
         let response = warp::test::request()
             .path("/templates/test-template-foo")
             .method("PUT")
             .json(&json!({
                 "version": "0.7",
-                "template_id": "test-template-bar", // This `template_id` should be ignored and overriden by the path parameter.
+                "template_id": "test-template-bar", // This `template_id` should be ignored and overridden by the path parameter.
                 "index_id_patterns": ["test-index-foo*"],
                 "doc_mapping": {},
             }))
@@ -392,14 +396,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_index_template() {
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_delete_index_templates()
             .return_once(|request| {
                 assert_eq!(request.template_ids, ["test-template-foo"]);
                 Ok(EmptyResponse {})
             });
-        let metastore = MetastoreServiceClient::from(mock_metastore);
+        let metastore = MetastoreServiceClient::from_mock(mock_metastore);
         let delete_index_template_handler = delete_index_template_handler(metastore);
         let response = warp::test::request()
             .path("/templates/test-template-foo")
@@ -411,7 +415,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_index_templates() {
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_list_index_templates()
             .return_once(|_request| {
@@ -428,7 +432,7 @@ mod tests {
                 };
                 Ok(response)
             });
-        let metastore = MetastoreServiceClient::from(mock_metastore);
+        let metastore = MetastoreServiceClient::from_mock(mock_metastore);
         let list_index_templates_handler = list_index_templates_handler(metastore);
         let response = warp::test::request()
             .path("/templates")

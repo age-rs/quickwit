@@ -23,6 +23,7 @@ use prost::Message;
 use quickwit_proto::search::{
     CountHits, LeafSearchResponse, SearchRequest, SplitIdAndFooterOffsets,
 };
+use quickwit_proto::types::SplitId;
 use quickwit_storage::{MemorySizedCache, OwnedBytes};
 
 /// A cache to memoize `leaf_search_single_split` results.
@@ -82,7 +83,7 @@ impl LeafSearchCache {
 #[derive(Debug, Hash, PartialEq, Eq)]
 struct CacheKey {
     /// The split this entry refers to
-    split_id: String,
+    split_id: SplitId,
     /// The request this matches. The timerange of the request was removed.
     request: SearchRequest,
     /// The effective time range of the request, that is, the intersection of the timerange
@@ -191,7 +192,8 @@ impl std::ops::RangeBounds<i64> for Range {
 #[cfg(test)]
 mod tests {
     use quickwit_proto::search::{
-        LeafSearchResponse, PartialHit, SearchRequest, SortValue, SplitIdAndFooterOffsets,
+        LeafSearchResponse, PartialHit, ResourceStats, SearchRequest, SortValue,
+        SplitIdAndFooterOffsets,
     };
 
     use super::LeafSearchCache;
@@ -206,6 +208,7 @@ mod tests {
             split_footer_end: 100,
             timestamp_start: None,
             timestamp_end: None,
+            num_docs: 0,
         };
 
         let split_2 = SplitIdAndFooterOffsets {
@@ -214,6 +217,7 @@ mod tests {
             split_footer_end: 100,
             timestamp_start: None,
             timestamp_end: None,
+            num_docs: 0,
         };
 
         let query_1 = SearchRequest {
@@ -239,7 +243,8 @@ mod tests {
         let result = LeafSearchResponse {
             failed_splits: Vec::new(),
             intermediate_aggregation_result: None,
-            num_attempted_splits: 0,
+            num_attempted_splits: 1,
+            num_successful_splits: 1,
             num_hits: 1234,
             partial_hits: vec![PartialHit {
                 doc_id: 1,
@@ -248,6 +253,7 @@ mod tests {
                 sort_value2: None,
                 split_id: "split_1".to_string(),
             }],
+            resource_stats: None,
         };
 
         assert!(cache.get(split_1.clone(), query_1.clone()).is_none());
@@ -268,6 +274,7 @@ mod tests {
             split_footer_end: 100,
             timestamp_start: Some(100),
             timestamp_end: Some(199),
+            num_docs: 0,
         };
         let split_2 = SplitIdAndFooterOffsets {
             split_id: "split_2".to_string(),
@@ -275,6 +282,7 @@ mod tests {
             split_footer_end: 100,
             timestamp_start: Some(150),
             timestamp_end: Some(249),
+            num_docs: 0,
         };
         let split_3 = SplitIdAndFooterOffsets {
             split_id: "split_3".to_string(),
@@ -282,6 +290,7 @@ mod tests {
             split_footer_end: 100,
             timestamp_start: Some(150),
             timestamp_end: Some(249),
+            num_docs: 0,
         };
 
         let query_1 = SearchRequest {
@@ -325,7 +334,8 @@ mod tests {
         let result = LeafSearchResponse {
             failed_splits: Vec::new(),
             intermediate_aggregation_result: None,
-            num_attempted_splits: 0,
+            num_attempted_splits: 1,
+            num_successful_splits: 1,
             num_hits: 1234,
             partial_hits: vec![PartialHit {
                 doc_id: 1,
@@ -334,6 +344,7 @@ mod tests {
                 sort_value2: None,
                 split_id: "split_1".to_string(),
             }],
+            resource_stats: Some(ResourceStats::default()),
         };
 
         // for split_1, 1 and 1bis cover different timestamp ranges

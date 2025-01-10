@@ -1,5 +1,3 @@
-version: "3.9"
-
 # By default, this docker compose script maps all services to localhost only.
 # If you need to make services available outside of your machine, add
 # appropriate service mappings to the .env file. See .env.example file for
@@ -17,6 +15,8 @@ version: "3.9"
 # first if they are already tagged latest and volumes if their content is
 # incompatible with the latest version, as in case of postgres.
 
+name: quickwit
+
 networks:
   default:
     name: quickwit-network
@@ -27,7 +27,7 @@ networks:
 
 services:
   localstack:
-    image: localstack/localstack:${LOCALSTACK_VERSION:-2.3.2}
+    image: localstack/localstack:${LOCALSTACK_VERSION:-3.5.0}
     container_name: localstack
     ports:
       - "${MAP_HOST_LOCALSTACK:-127.0.0.1}:4566:4566"
@@ -37,7 +37,7 @@ services:
       - all
       - localstack
     environment:
-      SERVICES: kinesis,s3
+      SERVICES: kinesis,s3,sqs
       PERSISTENCE: 1
     volumes:
       - .localstack:/etc/localstack/init/ready.d
@@ -53,7 +53,7 @@ services:
     image: postgres:${POSTGRES_VERSION:-12.17-alpine}
     container_name: postgres
     ports:
-      - "${MAP_HOST_POSTGRESS:-127.0.0.1}:5432:5432"
+      - "${MAP_HOST_POSTGRES:-127.0.0.1}:5432:5432"
     profiles:
       - all
       - postgres
@@ -79,7 +79,7 @@ services:
       - "${MAP_HOST_PULSAR:-127.0.0.1}:6650:6650"
       - "${MAP_HOST_PULSAR:-127.0.0.1}:8081:8080"
     environment:
-      PULSAR_MEM: "-Xms256M -Xmx256M"
+      PULSAR_MEM: "-Xms384M -Xmx384M"
     profiles:
       - all
       - pulsar
@@ -161,7 +161,7 @@ services:
     command: -scheme http
 
   grafana:
-    image: grafana/grafana-oss:${GRAFANA_VERSION:-9.4.7}
+    image: grafana/grafana-oss:${GRAFANA_VERSION:-10.4.1}
     container_name: grafana
     ports:
       - "${MAP_HOST_GRAFANA:-127.0.0.1}:3000:3000"
@@ -173,6 +173,8 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
     volumes:
+      - grafana_conf:/etc/grafana
+      - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
 
@@ -232,7 +234,9 @@ services:
       - gcp-pubsub
 
 volumes:
-  localstack_data:
-  postgres_data:
   azurite_data:
   fake_gcs_server_data:
+  grafana_conf:
+  grafana_data:
+  localstack_data:
+  postgres_data:

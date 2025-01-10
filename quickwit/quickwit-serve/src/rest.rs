@@ -17,44 +17,45 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::net::SocketAddr;
+use std::fmt::Formatter;
 use std::sync::Arc;
 
 use hyper::http::HeaderValue;
-use hyper::{http, Method};
+use hyper::{http, Method, StatusCode};
 use quickwit_common::tower::BoxFutureInfaillible;
-use quickwit_proto::ServiceErrorCode;
+use quickwit_config::{disable_ingest_v1, enable_ingest_v2};
+use quickwit_search::SearchService;
+use tokio::net::TcpListener;
 use tower::make::Shared;
 use tower::ServiceBuilder;
-use tower_http::compression::predicate::{DefaultPredicate, Predicate, SizeAbove};
+use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
+use warp::filters::log::Info;
 use warp::{redirect, Filter, Rejection, Reply};
 
 use crate::cluster_api::cluster_handler;
-use crate::debugging_api::debugging_handler;
 use crate::decompression::{CorruptedData, UnsupportedEncoding};
 use crate::delete_task_api::delete_task_api_handlers;
+use crate::developer_api::developer_api_routes;
 use crate::elasticsearch_api::elastic_api_handlers;
 use crate::health_check_api::health_check_handlers;
 use crate::index_api::index_management_handlers;
 use crate::indexing_api::indexing_get_handler;
 use crate::ingest_api::ingest_api_handlers;
 use crate::jaeger_api::jaeger_api_handlers;
-use crate::log_level_handler::log_level_handler;
 use crate::metrics_api::metrics_handler;
 use crate::node_info_handler::node_info_handler;
 use crate::otlp_api::otlp_ingest_api_handlers;
 use crate::rest_api_response::{RestApiError, RestApiResponse};
-use crate::search_api::{search_get_handler, search_post_handler, search_stream_handler};
+use crate::search_api::{
+    search_get_handler, search_plan_get_handler, search_plan_post_handler, search_post_handler,
+    search_stream_handler,
+};
 use crate::template_api::index_template_api_handlers;
 use crate::ui_handler::ui_handler;
 use crate::{BodyFormat, BuildInfo, QuickwitServices, RuntimeInfo};
-
-/// The minimum size a response body must be in order to
-/// be automatically compressed with gzip.
-const MINIMUM_RESPONSE_COMPRESSION_SIZE: u16 = 10 << 10;
 
 #[derive(Debug)]
 pub(crate) struct InvalidJsonRequest(pub serde_json::Error);
@@ -66,43 +67,117 @@ pub(crate) struct InvalidArgument(pub String);
 
 impl warp::reject::Reject for InvalidArgument {}
 
+#[derive(Debug)]
+pub struct TooManyRequests;
+
+impl warp::reject::Reject for TooManyRequests {}
+
+impl std::fmt::Display for TooManyRequests {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "too many requests")
+    }
+}
+
+#[derive(Debug)]
+pub struct InternalError(pub String);
+
+impl warp::reject::Reject for InternalError {}
+
+impl std::fmt::Display for InternalError {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "internal error: {}", self.0)
+    }
+}
+
+/// Env variable key to define the minimum size above which a response should be compressed.
+/// If unset, no compression is applied.
+const QW_MINIMUM_COMPRESSION_SIZE_KEY: &str = "QW_MINIMUM_COMPRESSION_SIZE";
+
+#[derive(Clone, Copy)]
+struct CompressionPredicate {
+    size_above_opt: Option<SizeAbove>,
+}
+
+impl CompressionPredicate {
+    fn from_env() -> CompressionPredicate {
+        let minimum_compression_size_opt: Option<u16> = quickwit_common::get_from_env_opt::<usize>(
+            QW_MINIMUM_COMPRESSION_SIZE_KEY,
+        )
+        .map(|minimum_compression_size: usize| {
+            u16::try_from(minimum_compression_size).unwrap_or(u16::MAX)
+        });
+        let size_above_opt = minimum_compression_size_opt.map(SizeAbove::new);
+        CompressionPredicate { size_above_opt }
+    }
+}
+
+impl Predicate for CompressionPredicate {
+    fn should_compress<B>(&self, response: &http::Response<B>) -> bool
+    where B: hyper::body::HttpBody {
+        if let Some(size_above) = self.size_above_opt {
+            size_above.should_compress(response)
+        } else {
+            false
+        }
+    }
+}
+
 /// Starts REST services.
 pub(crate) async fn start_rest_server(
-    rest_listen_addr: SocketAddr,
+    tcp_listener: TcpListener,
     quickwit_services: Arc<QuickwitServices>,
     readiness_trigger: BoxFutureInfaillible<()>,
     shutdown_signal: BoxFutureInfaillible<()>,
 ) -> anyhow::Result<()> {
-    let request_counter = warp::log::custom(|_| {
-        crate::SERVE_METRICS.http_requests_total.inc();
+    let request_counter = warp::log::custom(|info: Info| {
+        let elapsed = info.elapsed();
+        let status = info.status();
+        let label_values: [&str; 2] = [info.method().as_str(), status.as_str()];
+        crate::SERVE_METRICS
+            .request_duration_secs
+            .with_label_values(label_values)
+            .observe(elapsed.as_secs_f64());
+        crate::SERVE_METRICS
+            .http_requests_total
+            .with_label_values(label_values)
+            .inc();
     });
     // Docs routes
     let api_doc = warp::path("openapi.json")
         .and(warp::get())
-        .map(|| warp::reply::json(&crate::openapi::build_docs()));
+        .map(|| warp::reply::json(&crate::openapi::build_docs()))
+        .recover(recover_fn)
+        .boxed();
 
     // `/health/*` routes.
     let health_check_routes = health_check_handlers(
         quickwit_services.cluster.clone(),
         quickwit_services.indexing_service_opt.clone(),
         quickwit_services.janitor_service_opt.clone(),
-    );
+    )
+    .boxed();
 
     // `/metrics` route.
-    let metrics_routes = warp::path("metrics").and(warp::get()).map(metrics_handler);
-
-    // `/debugging` route.
-    let control_plane_service = quickwit_services.control_plane_service.clone();
-    let debugging_routes = warp::path("debugging")
+    let metrics_routes = warp::path("metrics")
         .and(warp::get())
-        .then(move || debugging_handler(control_plane_service.clone()));
+        .map(metrics_handler)
+        .recover(recover_fn)
+        .boxed();
 
+    // `/api/developer/*` route.
+    let developer_routes = developer_api_routes(
+        quickwit_services.cluster.clone(),
+        quickwit_services.env_filter_reload_fn.clone(),
+    )
+    .boxed();
     // `/api/v1/*` routes.
     let api_v1_root_route = api_v1_routes(quickwit_services.clone());
 
     let redirect_root_to_ui_route = warp::path::end()
         .and(warp::get())
-        .map(|| redirect(http::Uri::from_static("/ui/search")));
+        .map(|| redirect(http::Uri::from_static("/ui/search")))
+        .recover(recover_fn)
+        .boxed();
 
     let extra_headers = warp::reply::with::headers(
         quickwit_services
@@ -119,47 +194,62 @@ pub(crate) async fn start_rest_server(
         .or(ui_handler())
         .or(health_check_routes)
         .or(metrics_routes)
-        .or(debugging_routes)
+        .or(developer_routes)
         .with(request_counter)
-        .recover(recover_fn)
+        .recover(recover_fn_final)
         .with(extra_headers)
         .boxed();
 
     let warp_service = warp::service(rest_routes);
-    let compression_predicate =
-        DefaultPredicate::new().and(SizeAbove::new(MINIMUM_RESPONSE_COMPRESSION_SIZE));
+    let compression_predicate = CompressionPredicate::from_env().and(NotForContentType::IMAGES);
     let cors = build_cors(&quickwit_services.node_config.rest_config.cors_allow_origins);
 
     let service = ServiceBuilder::new()
         .layer(
             CompressionLayer::new()
+                .zstd(true)
                 .gzip(true)
+                .quality(tower_http::CompressionLevel::Fastest)
                 .compress_when(compression_predicate),
         )
         .layer(cors)
         .service(warp_service);
 
+    let rest_listen_addr = tcp_listener.local_addr()?;
     info!(
         rest_listen_addr=?rest_listen_addr,
-        "Starting REST server listening on {rest_listen_addr}."
+        "starting REST server listening on {rest_listen_addr}"
     );
 
+    let rest_listener_std = tcp_listener.into_std()?;
     // `graceful_shutdown()` seems to be blocking in presence of existing connections.
     // The following approach of dropping the serve supposedly is not bullet proof, but it seems to
     // work in our unit test.
     //
     // See more of the discussion here:
     // https://github.com/hyperium/hyper/issues/2386
+
     let serve_fut = async move {
         tokio::select! {
-             res = hyper::Server::bind(&rest_listen_addr).serve(Shared::new(service)) => { res }
+             res = hyper::Server::from_tcp(rest_listener_std)?.serve(Shared::new(service)) => { res }
              _ = shutdown_signal => { Ok(()) }
         }
     };
-
     let (serve_res, _trigger_res) = tokio::join!(serve_fut, readiness_trigger);
     serve_res?;
     Ok(())
+}
+
+fn search_routes(
+    search_service: Arc<dyn SearchService>,
+) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
+    search_get_handler(search_service.clone())
+        .or(search_post_handler(search_service.clone()))
+        .or(search_plan_get_handler(search_service.clone()))
+        .or(search_plan_post_handler(search_service.clone()))
+        .or(search_stream_handler(search_service))
+        .recover(recover_fn)
+        .boxed()
 }
 
 fn api_v1_routes(
@@ -167,59 +257,66 @@ fn api_v1_routes(
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     let api_v1_root_url = warp::path!("api" / "v1" / ..);
     api_v1_root_url.and(
-        cluster_handler(quickwit_services.cluster.clone())
-            .or(node_info_handler(
-                BuildInfo::get(),
-                RuntimeInfo::get(),
-                quickwit_services.node_config.clone(),
-            ))
-            .or(log_level_handler(
-                quickwit_services.env_filter_reload_fn.clone(),
-            ))
-            .or(indexing_get_handler(
-                quickwit_services.indexing_service_opt.clone(),
-            ))
-            .or(search_get_handler(quickwit_services.search_service.clone()))
-            .or(search_post_handler(
-                quickwit_services.search_service.clone(),
-            ))
-            .or(search_stream_handler(
-                quickwit_services.search_service.clone(),
-            ))
-            .or(ingest_api_handlers(
-                quickwit_services.ingest_router_service.clone(),
-                quickwit_services.ingest_service.clone(),
-                quickwit_services.node_config.ingest_api_config.clone(),
-            ))
-            .or(otlp_ingest_api_handlers(
-                quickwit_services.otlp_logs_service_opt.clone(),
-                quickwit_services.otlp_traces_service_opt.clone(),
-            ))
-            .or(index_management_handlers(
-                quickwit_services.index_manager.clone(),
-                quickwit_services.node_config.clone(),
-            ))
-            .or(delete_task_api_handlers(
-                quickwit_services.metastore_client.clone(),
-            ))
-            .or(jaeger_api_handlers(
-                quickwit_services.jaeger_service_opt.clone(),
-            ))
-            .or(elastic_api_handlers(
-                quickwit_services.node_config.clone(),
-                quickwit_services.search_service.clone(),
-                quickwit_services.ingest_service.clone(),
-                quickwit_services.ingest_router_service.clone(),
-                quickwit_services.metastore_client.clone(),
-                quickwit_services.index_manager.clone(),
-            ))
-            .or(index_template_api_handlers(
-                quickwit_services.metastore_client.clone(),
-            )),
+        elastic_api_handlers(
+            quickwit_services.cluster.clone(),
+            quickwit_services.node_config.clone(),
+            quickwit_services.search_service.clone(),
+            quickwit_services.ingest_service.clone(),
+            quickwit_services.ingest_router_service.clone(),
+            quickwit_services.metastore_client.clone(),
+            quickwit_services.index_manager.clone(),
+            !disable_ingest_v1(),
+            enable_ingest_v2(),
+        )
+        .or(cluster_handler(quickwit_services.cluster.clone()))
+        .boxed()
+        .or(node_info_handler(
+            BuildInfo::get(),
+            RuntimeInfo::get(),
+            quickwit_services.node_config.clone(),
+        ))
+        .boxed()
+        .or(indexing_get_handler(
+            quickwit_services.indexing_service_opt.clone(),
+        ))
+        .boxed()
+        .or(search_routes(quickwit_services.search_service.clone()))
+        .boxed()
+        .or(ingest_api_handlers(
+            quickwit_services.ingest_router_service.clone(),
+            quickwit_services.ingest_service.clone(),
+            quickwit_services.node_config.ingest_api_config.clone(),
+            !disable_ingest_v1(),
+            enable_ingest_v2(),
+        ))
+        .boxed()
+        .or(otlp_ingest_api_handlers(
+            quickwit_services.otlp_logs_service_opt.clone(),
+            quickwit_services.otlp_traces_service_opt.clone(),
+        ))
+        .boxed()
+        .or(index_management_handlers(
+            quickwit_services.index_manager.clone(),
+            quickwit_services.node_config.clone(),
+        ))
+        .boxed()
+        .or(delete_task_api_handlers(
+            quickwit_services.metastore_client.clone(),
+        ))
+        .boxed()
+        .or(jaeger_api_handlers(
+            quickwit_services.jaeger_service_opt.clone(),
+        ))
+        .boxed()
+        .or(index_template_api_handlers(
+            quickwit_services.metastore_client.clone(),
+        ))
+        .boxed(),
     )
 }
 
 /// This function returns a formatted error based on the given rejection reason.
+///
 /// The ordering of rejection processing is very important, we need to start
 /// with the most specific rejections and end with the most generic. If not, Quickwit
 /// will return useless errors to the user.
@@ -231,100 +328,119 @@ fn api_v1_routes(
 // More on this here: https://github.com/seanmonstar/warp/issues/388.
 // We may use this work on the PR is merged: https://github.com/seanmonstar/warp/pull/909.
 pub async fn recover_fn(rejection: Rejection) -> Result<impl Reply, Rejection> {
-    let err = get_status_with_error(rejection);
-    let status_code = err.service_code.to_http_status_code();
+    let error = get_status_with_error(rejection)?;
+    let status_code = error.status_code;
     Ok(RestApiResponse::new::<(), _>(
-        &Err(err),
+        &Err(error),
         status_code,
-        &BodyFormat::default(),
+        BodyFormat::default(),
     ))
 }
 
-fn get_status_with_error(rejection: Rejection) -> RestApiError {
+pub async fn recover_fn_final(rejection: Rejection) -> Result<impl Reply, Rejection> {
+    let error = get_status_with_error(rejection).unwrap_or_else(|rejection: Rejection| {
+        if rejection.is_not_found() {
+            RestApiError {
+                status_code: StatusCode::NOT_FOUND,
+                message: "Route not found".to_string(),
+            }
+        } else {
+            error!("REST server error: {:?}", rejection);
+            RestApiError {
+                status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "internal server error".to_string(),
+            }
+        }
+    });
+    let status_code = error.status_code;
+    Ok(RestApiResponse::new::<(), _>(
+        &Err(error),
+        status_code,
+        BodyFormat::default(),
+    ))
+}
+
+fn get_status_with_error(rejection: Rejection) -> Result<RestApiError, Rejection> {
     if let Some(error) = rejection.find::<crate::format::UnsupportedMediaType>() {
-        RestApiError {
-            service_code: ServiceErrorCode::UnsupportedMediaType,
+        Ok(RestApiError {
+            status_code: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             message: error.to_string(),
-        }
-    } else if rejection.is_not_found() {
-        RestApiError {
-            service_code: ServiceErrorCode::NotFound,
-            message: "Route not found".to_string(),
-        }
+        })
     } else if let Some(error) = rejection.find::<serde_qs::Error>() {
-        RestApiError {
-            service_code: ServiceErrorCode::BadRequest,
+        Ok(RestApiError {
+            status_code: StatusCode::BAD_REQUEST,
             message: error.to_string(),
-        }
+        })
     } else if let Some(error) = rejection.find::<InvalidJsonRequest>() {
         // Happens when the request body could not be deserialized correctly.
-        RestApiError {
-            service_code: ServiceErrorCode::BadRequest,
+        Ok(RestApiError {
+            status_code: StatusCode::BAD_REQUEST,
             message: error.0.to_string(),
-        }
-    } else if let Some(error) = rejection.find::<InvalidArgument>() {
-        // Happens when the url path or request body contains invalid argument(s).
-        RestApiError {
-            service_code: ServiceErrorCode::BadRequest,
-            message: error.0.to_string(),
-        }
+        })
     } else if let Some(error) = rejection.find::<warp::filters::body::BodyDeserializeError>() {
         // Happens when the request body could not be deserialized correctly.
-        RestApiError {
-            service_code: ServiceErrorCode::BadRequest,
+        Ok(RestApiError {
+            status_code: StatusCode::BAD_REQUEST,
             message: error.to_string(),
-        }
+        })
     } else if let Some(error) = rejection.find::<warp::reject::UnsupportedMediaType>() {
-        RestApiError {
-            service_code: ServiceErrorCode::UnsupportedMediaType,
+        Ok(RestApiError {
+            status_code: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             message: error.to_string(),
-        }
+        })
     } else if let Some(error) = rejection.find::<UnsupportedEncoding>() {
-        RestApiError {
-            service_code: ServiceErrorCode::UnsupportedMediaType,
+        Ok(RestApiError {
+            status_code: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             message: error.to_string(),
-        }
+        })
     } else if let Some(error) = rejection.find::<CorruptedData>() {
-        RestApiError {
-            service_code: ServiceErrorCode::BadRequest,
+        Ok(RestApiError {
+            status_code: StatusCode::BAD_REQUEST,
             message: error.to_string(),
-        }
+        })
     } else if let Some(error) = rejection.find::<warp::reject::InvalidQuery>() {
-        RestApiError {
-            service_code: ServiceErrorCode::BadRequest,
+        Ok(RestApiError {
+            status_code: StatusCode::BAD_REQUEST,
             message: error.to_string(),
-        }
+        })
     } else if let Some(error) = rejection.find::<warp::reject::LengthRequired>() {
-        RestApiError {
-            service_code: ServiceErrorCode::BadRequest,
+        Ok(RestApiError {
+            status_code: StatusCode::LENGTH_REQUIRED,
             message: error.to_string(),
-        }
+        })
     } else if let Some(error) = rejection.find::<warp::reject::MissingHeader>() {
-        RestApiError {
-            service_code: ServiceErrorCode::BadRequest,
+        Ok(RestApiError {
+            status_code: StatusCode::BAD_REQUEST,
             message: error.to_string(),
-        }
+        })
     } else if let Some(error) = rejection.find::<warp::reject::InvalidHeader>() {
-        RestApiError {
-            service_code: ServiceErrorCode::BadRequest,
+        Ok(RestApiError {
+            status_code: StatusCode::BAD_REQUEST,
             message: error.to_string(),
-        }
-    } else if let Some(error) = rejection.find::<warp::reject::MethodNotAllowed>() {
-        RestApiError {
-            service_code: ServiceErrorCode::MethodNotAllowed,
-            message: error.to_string(),
-        }
+        })
     } else if let Some(error) = rejection.find::<warp::reject::PayloadTooLarge>() {
-        RestApiError {
-            service_code: ServiceErrorCode::BadRequest,
+        Ok(RestApiError {
+            status_code: StatusCode::PAYLOAD_TOO_LARGE,
             message: error.to_string(),
-        }
+        })
+    } else if let Some(err) = rejection.find::<TooManyRequests>() {
+        Ok(RestApiError {
+            status_code: StatusCode::TOO_MANY_REQUESTS,
+            message: err.to_string(),
+        })
+    } else if let Some(error) = rejection.find::<InvalidArgument>() {
+        // Happens when the url path or request body contains invalid argument(s).
+        Ok(RestApiError {
+            status_code: StatusCode::BAD_REQUEST,
+            message: error.0.to_string(),
+        })
+    } else if let Some(error) = rejection.find::<warp::reject::MethodNotAllowed>() {
+        Ok(RestApiError {
+            status_code: StatusCode::METHOD_NOT_ALLOWED,
+            message: error.to_string(),
+        })
     } else {
-        error!("REST server error: {:?}", rejection);
-        RestApiError {
-            service_code: ServiceErrorCode::Internal,
-            message: "internal server error".to_string(),
-        }
+        Err(rejection)
     }
 }
 
@@ -375,6 +491,7 @@ mod tests {
     use tower::Service;
 
     use super::*;
+    use crate::rest::recover_fn_final;
 
     pub(crate) fn ingest_service_client() -> IngestServiceClient {
         let universe = quickwit_actors::Universe::new();
@@ -605,11 +722,10 @@ mod tests {
             HeaderName::from_static("x-custom-header-2"),
             HeaderValue::from_static("custom-value-2"),
         );
-        let metastore_client = MetastoreServiceClient::from(MetastoreServiceClient::mock());
+        let metastore_client = MetastoreServiceClient::mocked();
         let index_service =
             IndexService::new(metastore_client.clone(), StorageResolver::unconfigured());
-        let control_plane_service =
-            ControlPlaneServiceClient::from(ControlPlaneServiceClient::mock());
+        let control_plane_client = ControlPlaneServiceClient::mocked();
         let transport = ChannelTransport::default();
         let cluster = create_cluster_for_test(Vec::new(), &[], &transport, false)
             .await
@@ -618,14 +734,14 @@ mod tests {
             _report_splits_subscription_handle_opt: None,
             _local_shards_update_listener_handle_opt: None,
             cluster,
-            control_plane_service,
+            control_plane_server_opt: None,
+            control_plane_client,
             indexing_service_opt: None,
             index_manager: index_service,
             ingest_service: ingest_service_client(),
-            ingester_service_opt: None,
-            ingest_router_service: IngestRouterServiceClient::from(
-                IngestRouterServiceClient::mock(),
-            ),
+            ingest_router_opt: None,
+            ingest_router_service: IngestRouterServiceClient::mocked(),
+            ingester_opt: None,
             janitor_service_opt: None,
             otlp_logs_service_opt: None,
             otlp_traces_service_opt: None,
@@ -638,7 +754,7 @@ mod tests {
         };
 
         let handler = api_v1_routes(Arc::new(quickwit_services))
-            .recover(recover_fn)
+            .recover(recover_fn_final)
             .with(warp::reply::with::headers(
                 node_config.rest_config.extra_headers.clone(),
             ));

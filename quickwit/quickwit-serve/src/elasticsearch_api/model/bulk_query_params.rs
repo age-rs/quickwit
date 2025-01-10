@@ -25,6 +25,8 @@ use serde::Deserialize;
 pub struct ElasticBulkOptions {
     #[serde(default)]
     pub refresh: ElasticRefresh,
+    #[serde(default)]
+    pub use_legacy_ingest: bool,
 }
 
 /// ?refresh parameter for elasticsearch bulk request
@@ -66,7 +68,7 @@ impl From<ElasticRefresh> for CommitTypeV2 {
         match val {
             ElasticRefresh::False => Self::Auto,
             ElasticRefresh::True => Self::Force,
-            ElasticRefresh::WaitFor => Self::Wait,
+            ElasticRefresh::WaitFor => Self::WaitFor,
         }
     }
 }
@@ -112,7 +114,7 @@ mod tests {
             serde_qs::from_str::<ElasticBulkOptions>("refresh=wait")
                 .unwrap_err()
                 .to_string(),
-            "unknown variant `wait`, expected one of `false`, `true`, `wait_for`"
+            "unknown variant `wait`, expected one of `false`, ``, `true`, `wait_for`"
         );
     }
 }

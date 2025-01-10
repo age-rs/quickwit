@@ -19,8 +19,9 @@
 
 use serde::Deserialize;
 
+use super::LeniencyBool;
 use crate::elastic_query_dsl::{
-    ConvertableToQueryAst, ElasticQueryDslInner, StringOrStructForSerialization,
+    ConvertibleToQueryAst, ElasticQueryDslInner, StringOrStructForSerialization,
 };
 use crate::query_ast::{FullTextParams, FullTextQuery, QueryAst};
 use crate::{BooleanOperand, MatchAllOrNone, OneFieldMap};
@@ -42,14 +43,11 @@ pub(crate) struct MatchQueryParams {
     pub(crate) operator: BooleanOperand,
     #[serde(default)]
     pub(crate) zero_terms_query: MatchAllOrNone,
-    // Regardless of this option Quickwit behaves in elasticsearch definition of
-    // lenient. We include this property here just to accept user queries containing
-    // this option.
-    #[serde(default, rename = "lenient")]
-    pub(crate) _lenient: bool,
+    #[serde(default)]
+    pub(crate) lenient: LeniencyBool,
 }
 
-impl ConvertableToQueryAst for MatchQuery {
+impl ConvertibleToQueryAst for MatchQuery {
     fn convert_to_query_ast(self) -> anyhow::Result<QueryAst> {
         let full_text_params = FullTextParams {
             tokenizer: None,
@@ -60,6 +58,7 @@ impl ConvertableToQueryAst for MatchQuery {
             field: self.field,
             text: self.params.query,
             params: full_text_params,
+            lenient: self.params.lenient,
         }))
     }
 }
@@ -88,7 +87,7 @@ impl From<String> for MatchQueryParams {
             query,
             zero_terms_query: Default::default(),
             operator: Default::default(),
-            _lenient: false,
+            lenient: false,
         }
     }
 }
@@ -137,7 +136,7 @@ mod tests {
                 query: "hello".to_string(),
                 operator: BooleanOperand::And,
                 zero_terms_query: crate::MatchAllOrNone::MatchAll,
-                _lenient: false,
+                lenient: false,
             },
         };
         let ast = match_query.convert_to_query_ast().unwrap();
@@ -145,6 +144,7 @@ mod tests {
             field,
             text,
             params,
+            lenient: _,
         }) = ast
         else {
             panic!()

@@ -158,7 +158,7 @@ json:
     query_string:
       default_field: payload.description
       lenient: true
-      query: "Jour* AND unix"
+      query: "Jou*al AND unix"
 expected:
   hits:
     total:
@@ -170,7 +170,7 @@ json:
     query_string:
       default_field: payload.description
       lenient: true
-      query: "jour* AND unix"
+      query: "jou*al AND unix"
 expected:
   hits:
     total:
@@ -199,3 +199,68 @@ expected:
   hits:
     total:
       value: 1
+---
+json:
+  query:
+    regexp:
+      payload.description:
+          value: "jour.*"
+expected:
+  hits:
+    total:
+      value: 3
+---
+json:
+  query:
+    query_string:
+      default_field: actor.id
+      query: ">=10791466"
+      lenient: true
+expected:
+  hits:
+    total:
+      value: 2
+---
+json:
+  query:
+    query_string:
+      default_field: actor.id
+      query: ">10791466"
+      lenient: true
+expected:
+  hits:
+    total:
+      value: 1
+---
+json:
+  query:
+    query_string:
+      query: "true"
+      fields: ["public", "public.notdefined", "notdefined"]
+      lenient: true
+expected:
+  hits:
+    total:
+      value: 100
+---
+# trailing wildcard
+json:
+  query:
+    query_string:
+      query: "jour*"
+      fields: ["payload.description", "payload.notdefined", "notdefined"]
+      lenient: true
+expected:
+  hits:
+    total:
+      value: 3
+---
+# elasticsearch accepts this query
+engines:
+  - quickwit
+json:
+  query:
+    query_string:
+      query: "true"
+      fields: ["public", "public.notdefined"]
+status_code: 400

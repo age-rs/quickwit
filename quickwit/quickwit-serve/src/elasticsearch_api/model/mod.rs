@@ -30,8 +30,11 @@ mod stats;
 
 pub use bulk_body::BulkAction;
 pub use bulk_query_params::ElasticBulkOptions;
-pub use cat_indices::{CatIndexQueryParams, ElasticsearchCatIndexResponse};
-pub use error::ElasticsearchError;
+pub use cat_indices::{
+    CatIndexQueryParams, ElasticsearchCatIndexResponse, ElasticsearchResolveIndexEntryResponse,
+    ElasticsearchResolveIndexResponse,
+};
+pub use error::{ElasticException, ElasticsearchError};
 pub use field_capability::{
     build_list_field_request_for_es_api, convert_to_es_field_capabilities_response,
     FieldCapabilityQueryParams, FieldCapabilityRequestBody, FieldCapabilityResponse,
@@ -57,7 +60,7 @@ pub struct SortField {
 #[serde(rename_all = "snake_case")]
 pub enum ElasticDateFormat {
     /// Sort values are in milliseconds by default to ease migration from ES.
-    /// We allow the user to sepecify nanoseconds if needed.
+    /// We allow the user to specify nanoseconds if needed.
     /// We add `Int` to the name to avoid confusion ES variant `EpochMillis` which,
     /// returns milliseconds as strings.
     EpochNanosInt,

@@ -51,6 +51,11 @@ impl PublisherType {
     }
 }
 
+/// Disconnect the merge planner loop back.
+/// This message is used to cut the merge pipeline loop, and let it terminate.
+#[derive(Debug)]
+pub(crate) struct DisconnectMergePlanner;
+
 #[derive(Clone)]
 pub struct Publisher {
     publisher_type: PublisherType,
@@ -94,6 +99,21 @@ impl Actor for Publisher {
             PublisherType::MainPublisher => QueueCapacity::Bounded(1),
             PublisherType::MergePublisher => QueueCapacity::Unbounded,
         }
+    }
+}
+
+#[async_trait]
+impl Handler<DisconnectMergePlanner> for Publisher {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _: DisconnectMergePlanner,
+        _ctx: &ActorContext<Self>,
+    ) -> Result<(), quickwit_actors::ActorExitStatus> {
+        info!("disconnecting merge planner mailbox");
+        self.merge_planner_mailbox_opt = None;
+        Ok(())
     }
 }
 
@@ -147,7 +167,7 @@ impl Handler<SplitsUpdate> for Publisher {
             );
             return Ok(());
         }
-        info!(new_splits=?split_ids, checkpoint_delta=?checkpoint_delta_opt, "publish-new-splits");
+        info!("publish-new-splits");
         if let Some(source_mailbox) = self.source_mailbox_opt.as_ref() {
             if let Some(checkpoint) = checkpoint_delta_opt {
                 // We voluntarily do not log anything here.
@@ -199,7 +219,7 @@ mod tests {
         IndexCheckpointDelta, PartitionId, SourceCheckpoint, SourceCheckpointDelta,
     };
     use quickwit_metastore::{PublishSplitsRequestExt, SplitMetadata};
-    use quickwit_proto::metastore::EmptyResponse;
+    use quickwit_proto::metastore::{EmptyResponse, MockMetastoreService};
     use quickwit_proto::types::{IndexUid, Position};
     use tracing::Span;
 
@@ -210,7 +230,7 @@ mod tests {
     async fn test_publisher_publish_operation() {
         let universe = Universe::with_accelerated_time();
         let ref_index_uid: IndexUid = IndexUid::for_test("index", 1);
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         let ref_index_uid_clone = ref_index_uid.clone();
         mock_metastore
             .expect_publish_splits()
@@ -233,7 +253,7 @@ mod tests {
 
         let publisher = Publisher::new(
             PublisherType::MainPublisher,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             Some(merge_planner_mailbox),
             Some(source_mailbox),
         );
@@ -286,7 +306,7 @@ mod tests {
     async fn test_publisher_publish_operation_with_empty_splits() {
         let universe = Universe::with_accelerated_time();
         let ref_index_uid: IndexUid = IndexUid::for_test("index", 1);
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         let ref_index_uid_clone = ref_index_uid.clone();
         mock_metastore
             .expect_publish_splits()
@@ -309,7 +329,7 @@ mod tests {
 
         let publisher = Publisher::new(
             PublisherType::MainPublisher,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             Some(merge_planner_mailbox),
             Some(source_mailbox),
         );
@@ -359,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn test_publisher_replace_operation() {
         let universe = Universe::with_accelerated_time();
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         let ref_index_uid: IndexUid = IndexUid::for_test("index", 1);
         let ref_index_uid_clone = ref_index_uid.clone();
         mock_metastore
@@ -377,7 +397,7 @@ mod tests {
         let (merge_planner_mailbox, merge_planner_inbox) = universe.create_test_mailbox();
         let publisher = Publisher::new(
             PublisherType::MainPublisher,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             Some(merge_planner_mailbox),
             None,
         );
@@ -411,13 +431,13 @@ mod tests {
     #[tokio::test]
     async fn publisher_acquires_publish_lock() {
         let universe = Universe::with_accelerated_time();
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore.expect_publish_splits().never();
         let (merge_planner_mailbox, merge_planner_inbox) = universe.create_test_mailbox();
 
         let publisher = Publisher::new(
             PublisherType::MainPublisher,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             Some(merge_planner_mailbox),
             None,
         );

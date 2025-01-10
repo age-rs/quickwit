@@ -33,7 +33,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 /// A `PartitionId` uniquely identifies a partition for a given source.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct PartitionId(pub Arc<String>);
 
 impl PartitionId {
@@ -334,7 +334,6 @@ impl SourceCheckpoint {
     ) -> Result<(), IncompatibleCheckpointDelta> {
         self.check_compatibility(&delta)?;
         debug!(delta=?delta, checkpoint=?self, "applying delta to checkpoint");
-
         for (partition_id, partition_position) in delta.per_partition {
             self.per_partition
                 .insert(partition_id, partition_position.to);
@@ -372,7 +371,7 @@ impl fmt::Debug for SourceCheckpoint {
 /// we are not trying to add documents to the index that were already indexed.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexCheckpointDelta {
-    pub source_id: String,
+    pub source_id: SourceId,
     pub source_delta: SourceCheckpointDelta,
 }
 

@@ -21,7 +21,6 @@ use std::collections::hash_map::Entry;
 use std::num::NonZeroU32;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -33,18 +32,17 @@ use quickwit_actors::{
     Actor, ActorContext, ActorExitStatus, Command, Handler, Mailbox, QueueCapacity,
 };
 use quickwit_common::io::IoControls;
+use quickwit_common::metrics::GaugeGuard;
 use quickwit_common::runtimes::RuntimeType;
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_config::IndexingSettings;
 use quickwit_doc_mapper::DocMapper;
 use quickwit_metastore::checkpoint::{IndexCheckpointDelta, SourceCheckpointDelta};
-use quickwit_proto::indexing::{
-    CpuCapacity, IndexingPipelineId, PipelineMetrics, PIPELINE_FULL_CAPACITY,
-};
+use quickwit_proto::indexing::{IndexingPipelineId, PipelineMetrics};
 use quickwit_proto::metastore::{
     LastDeleteOpstampRequest, MetastoreService, MetastoreServiceClient,
 };
-use quickwit_proto::types::PublishToken;
+use quickwit_proto::types::{DocMappingUid, PublishToken};
 use quickwit_query::get_quickwit_fastfield_normalizer_manager;
 use serde::Serialize;
 use tantivy::schema::Schema;
@@ -52,10 +50,11 @@ use tantivy::store::{Compressor, ZstdCompressor};
 use tantivy::tokenizer::TokenizerManager;
 use tantivy::{DateTime, IndexBuilder, IndexSettings};
 use tokio::runtime::Handle;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 use tracing::{info, info_span, warn, Span};
 use ulid::Ulid;
 
+use crate::actors::cooperative_indexing::{CooperativeIndexingCycle, CooperativeIndexingPeriod};
 use crate::actors::IndexSerializer;
 use crate::models::{
     CommitTrigger, EmptySplit, IndexedSplitBatchBuilder, IndexedSplitBuilder, NewPublishLock,
@@ -99,10 +98,11 @@ struct IndexerState {
     publish_lock: PublishLock,
     publish_token_opt: Option<PublishToken>,
     schema: Schema,
+    doc_mapping_uid: DocMappingUid,
     tokenizer_manager: TokenizerManager,
     max_num_partitions: NonZeroU32,
     index_settings: IndexSettings,
-    cooperative_indexing_permits: Option<Arc<Semaphore>>,
+    cooperative_indexing_opt: Option<CooperativeIndexingCycle>,
 }
 
 impl IndexerState {
@@ -131,6 +131,7 @@ impl IndexerState {
             self.pipeline_id.clone(),
             partition_id,
             last_delete_opstamp,
+            self.doc_mapping_uid,
             self.indexing_directory.clone(),
             index_builder,
             io_controls,
@@ -151,10 +152,10 @@ impl IndexerState {
         other_split_opt: &'a mut Option<IndexedSplitBuilder>,
         counter: &'a mut IndexerCounters,
         ctx: &ActorContext<Indexer>,
-    ) -> anyhow::Result<&'a mut IndexedSplitBuilder> {
+    ) -> anyhow::Result<(&'a mut IndexedSplitBuilder, bool)> {
         let num_splits = splits.len();
         match splits.entry(partition_id) {
-            Entry::Occupied(indexed_split) => Ok(indexed_split.into_mut()),
+            Entry::Occupied(indexed_split) => Ok((indexed_split.into_mut(), false)),
             Entry::Vacant(vacant_entry) => {
                 if num_splits as u32 >= self.max_num_partitions.get() {
                     // In order to avoid exceeding max_num_partitions, we map the document to the
@@ -172,11 +173,11 @@ impl IndexerState {
                         )?;
                         *other_split_opt = Some(new_other_split);
                     }
-                    Ok(other_split_opt.as_mut().unwrap())
+                    Ok((other_split_opt.as_mut().unwrap(), true))
                 } else {
                     let indexed_split =
                         self.create_indexed_split_builder(partition_id, last_delete_opstamp, ctx)?;
-                    Ok(vacant_entry.insert(indexed_split))
+                    Ok((vacant_entry.insert(indexed_split), true))
                 }
             }
         }
@@ -194,13 +195,12 @@ impl IndexerState {
             workbench_id=%workbench_id,
         );
         let indexing_span = info_span!(parent: batch_parent_span.id(), "indexer");
-        let indexing_permit =
-            if let Some(cooperative_indexing_permits) = &self.cooperative_indexing_permits {
-                let indexing_permit: OwnedSemaphorePermit = ctx
-                    .protect_future(cooperative_indexing_permits.clone().acquire_owned())
-                    .await
-                    .expect("The semaphore should never be closed.");
-                Some(indexing_permit)
+        let cooperative_indexing_period =
+            if let Some(cooperative_indexing) = &self.cooperative_indexing_opt {
+                Some(
+                    ctx.protect_future(cooperative_indexing.cooperative_indexing_period())
+                        .await,
+                )
             } else {
                 None
             };
@@ -224,19 +224,27 @@ impl IndexerState {
         let publish_lock = self.publish_lock.clone();
         let publish_token_opt = self.publish_token_opt.clone();
 
+        let mut split_builders_guard =
+            GaugeGuard::from_gauge(&crate::metrics::INDEXER_METRICS.split_builders);
+        split_builders_guard.add(1);
+
         let workbench = IndexingWorkbench {
             workbench_id,
-            create_instant: Instant::now(),
             batch_parent_span,
             _indexing_span: indexing_span,
             indexed_splits: FnvHashMap::with_capacity_and_hasher(250, Default::default()),
             other_indexed_split_opt: None,
             checkpoint_delta,
-            indexing_permit,
             publish_lock,
             publish_token_opt,
             last_delete_opstamp,
-            memory_usage: ByteSize(0),
+            memory_usage: GaugeGuard::from_gauge(
+                &quickwit_common::metrics::MEMORY_METRICS
+                    .in_flight
+                    .index_writer,
+            ),
+            cooperative_indexing_period,
+            split_builders_guard,
         };
         Ok(workbench)
     }
@@ -294,7 +302,7 @@ impl IndexerState {
             .source_delta
             .extend(batch.checkpoint_delta)
             .context("batch delta does not follow indexer checkpoint")?;
-        let mut memory_usage_delta: u64 = 0;
+        let mut memory_usage_delta: i64 = 0;
         counters.num_doc_batches_in_workbench += 1;
         for doc in batch.docs {
             let ProcessedDoc {
@@ -304,7 +312,7 @@ impl IndexerState {
                 num_bytes,
             } = doc;
             counters.num_docs_in_workbench += 1;
-            let indexed_split: &mut IndexedSplitBuilder = self.get_or_create_indexed_split(
+            let (indexed_split, split_created) = self.get_or_create_indexed_split(
                 partition,
                 *last_delete_opstamp,
                 indexed_splits,
@@ -313,6 +321,11 @@ impl IndexerState {
                 ctx,
             )?;
             let mem_usage_before = indexed_split.index_writer.mem_usage() as u64;
+            if split_created {
+                // The split was just created. We need to account for the initial index writer's
+                // memory usage.
+                memory_usage_delta += mem_usage_before as i64;
+            }
             indexed_split.split_attrs.uncompressed_docs_size_in_bytes += num_bytes as u64;
             indexed_split.split_attrs.num_docs += 1;
             if let Some(timestamp) = timestamp_opt {
@@ -324,10 +337,10 @@ impl IndexerState {
                 .add_document(doc)
                 .context("failed to add document")?;
             let mem_usage_after = indexed_split.index_writer.mem_usage() as u64;
-            memory_usage_delta += mem_usage_after - mem_usage_before;
+            memory_usage_delta += mem_usage_after as i64 - mem_usage_before as i64;
             ctx.record_progress();
         }
-        *memory_usage = ByteSize(memory_usage.as_u64() + memory_usage_delta);
+        memory_usage.add(memory_usage_delta);
         Ok(())
     }
 }
@@ -335,8 +348,6 @@ impl IndexerState {
 /// A workbench hosts the set of `IndexedSplit` that are being built.
 struct IndexingWorkbench {
     workbench_id: Ulid,
-    create_instant: Instant,
-    // This span is used for the entire lifetime of the splits batch creations
     // This span is meant to be passed through the pipeline.
     batch_parent_span: Span,
     // Span for the in-memory indexing (done in the Indexer actor).
@@ -346,14 +357,15 @@ struct IndexingWorkbench {
     other_indexed_split_opt: Option<IndexedSplitBuilder>,
 
     checkpoint_delta: IndexCheckpointDelta,
-    indexing_permit: Option<OwnedSemaphorePermit>,
     publish_lock: PublishLock,
     publish_token_opt: Option<PublishToken>,
     // On workbench creation, we fetch from the metastore the last delete task opstamp.
     // We use this value to set the `delete_opstamp` of the workbench splits.
     last_delete_opstamp: u64,
     // Number of bytes declared as used by tantivy.
-    memory_usage: ByteSize,
+    memory_usage: GaugeGuard<'static>,
+    split_builders_guard: GaugeGuard<'static>,
+    cooperative_indexing_period: Option<CooperativeIndexingPeriod>,
 }
 
 pub struct Indexer {
@@ -388,37 +400,47 @@ impl Actor for Indexer {
         false
     }
 
+    async fn initialize(&mut self, ctx: &ActorContext<Self>) -> Result<(), ActorExitStatus> {
+        if let Some(cooperative_indexing_cycle) = &self.indexer_state.cooperative_indexing_opt {
+            let initial_sleep_duration = cooperative_indexing_cycle.initial_sleep_duration();
+            ctx.pause();
+            ctx.schedule_self_msg(initial_sleep_duration, Command::Resume);
+        }
+        Ok(())
+    }
+
     async fn on_drained_messages(
         &mut self,
         ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
-        if self.indexer_state.cooperative_indexing_permits.is_none() {
-            return Ok(());
-        }
-        let Some(indexing_workbench) = &self.indexing_workbench_opt else {
+        let Some(indexing_workbench) = &mut self.indexing_workbench_opt else {
             return Ok(());
         };
 
-        let elapsed = indexing_workbench.create_instant.elapsed();
+        let Some(cooperative_indexing_period) =
+            indexing_workbench.cooperative_indexing_period.take()
+        else {
+            return Ok(());
+        };
+
         let uncompressed_num_bytes = indexing_workbench
             .indexed_splits
             .values()
             .map(|split| split.split_attrs.uncompressed_docs_size_in_bytes)
             .sum::<u64>();
-        self.update_pipeline_metrics(elapsed, uncompressed_num_bytes);
+
+        // This also drops the indexing permit.
+        let (sleep_duration, pipeline_metrics) =
+            cooperative_indexing_period.end_of_work(uncompressed_num_bytes);
+
+        self.counters.pipeline_metrics_opt = Some(pipeline_metrics);
 
         self.send_to_serializer(CommitTrigger::Drained, ctx).await?;
 
-        let commit_timeout = self.indexer_state.indexing_settings.commit_timeout();
-        if elapsed >= commit_timeout {
-            return Ok(());
+        if !sleep_duration.is_zero() {
+            ctx.pause();
+            ctx.schedule_self_msg(sleep_duration, Command::Resume);
         }
-
-        // Time to take a nap.
-        let sleep_for = commit_timeout - elapsed;
-
-        ctx.pause();
-        ctx.schedule_self_msg(sleep_for, Command::Resume);
 
         Ok(())
     }
@@ -518,11 +540,11 @@ impl Handler<NewPublishToken> for Indexer {
 impl Indexer {
     pub fn new(
         pipeline_id: IndexingPipelineId,
-        doc_mapper: Arc<dyn DocMapper>,
+        doc_mapper: Arc<DocMapper>,
         metastore: MetastoreServiceClient,
         indexing_directory: TempDirectory,
         indexing_settings: IndexingSettings,
-        cooperative_indexing_permits: Option<Arc<Semaphore>>,
+        cooperative_indexing_permits_opt: Option<Arc<Semaphore>>,
         index_serializer_mailbox: Mailbox<IndexSerializer>,
     ) -> Self {
         let schema = doc_mapper.schema();
@@ -534,8 +556,15 @@ impl Indexer {
             docstore_blocksize: indexing_settings.docstore_blocksize,
             docstore_compression,
             docstore_compress_dedicated_thread: true,
-            ..Default::default()
         };
+        let cooperative_indexing_opt: Option<CooperativeIndexingCycle> =
+            cooperative_indexing_permits_opt.map(|cooperative_indexing_permits| {
+                CooperativeIndexingCycle::new(
+                    &pipeline_id,
+                    indexing_settings.commit_timeout(),
+                    cooperative_indexing_permits,
+                )
+            });
         Self {
             indexer_state: IndexerState {
                 pipeline_id,
@@ -545,10 +574,11 @@ impl Indexer {
                 publish_lock: PublishLock::default(),
                 publish_token_opt: None,
                 schema,
+                doc_mapping_uid: doc_mapper.doc_mapping_uid(),
                 tokenizer_manager: tokenizer_manager.tantivy_manager().clone(),
                 index_settings,
                 max_num_partitions: doc_mapper.max_num_partitions(),
-                cooperative_indexing_permits,
+                cooperative_indexing_opt,
             },
             index_serializer_mailbox,
             indexing_workbench_opt: None,
@@ -556,23 +586,11 @@ impl Indexer {
         }
     }
 
-    fn update_pipeline_metrics(&mut self, elapsed: Duration, uncompressed_num_bytes: u64) {
-        let commit_timeout = self.indexer_state.indexing_settings.commit_timeout();
-        let pipeline_throughput_fraction =
-            (elapsed.as_micros() as f32 / commit_timeout.as_micros() as f32).min(1.0f32);
-        let cpu_millis: CpuCapacity = PIPELINE_FULL_CAPACITY * pipeline_throughput_fraction;
-        self.counters.pipeline_metrics_opt = Some(PipelineMetrics {
-            cpu_millis,
-            throughput_mb_per_sec: (uncompressed_num_bytes / (1u64 + elapsed.as_micros() as u64))
-                as u16,
-        });
-    }
-
     fn memory_usage(&self) -> ByteSize {
         if let Some(workbench) = &self.indexing_workbench_opt {
-            workbench.memory_usage
+            ByteSize(workbench.memory_usage.get() as u64)
         } else {
-            ByteSize(0)
+            ByteSize(0u64)
         }
     }
 
@@ -591,7 +609,8 @@ impl Indexer {
                 ctx,
             )
             .await?;
-        if self.memory_usage() >= self.indexer_state.indexing_settings.resources.heap_size {
+        let memory_usage = self.memory_usage();
+        if memory_usage >= self.indexer_state.indexing_settings.resources.heap_size {
             self.send_to_serializer(CommitTrigger::MemoryLimit, ctx)
                 .await?;
         }
@@ -622,14 +641,13 @@ impl Indexer {
             publish_lock,
             publish_token_opt,
             batch_parent_span,
-            indexing_permit,
+            memory_usage,
+            split_builders_guard,
             ..
         }) = self.indexing_workbench_opt.take()
         else {
             return Ok(());
         };
-        // Dropping the indexing permit explicitly here for enhanced readability.
-        drop(indexing_permit);
 
         let mut splits: Vec<IndexedSplitBuilder> = indexed_splits.into_values().collect();
 
@@ -674,6 +692,8 @@ impl Indexer {
                 publish_token_opt,
                 commit_trigger,
                 batch_parent_span,
+                memory_usage,
+                _split_builders_guard: split_builders_guard,
             },
         )
         .await?;
@@ -692,10 +712,12 @@ mod tests {
     use std::time::Duration;
 
     use quickwit_actors::Universe;
-    use quickwit_doc_mapper::{default_doc_mapper_for_test, DefaultDocMapper};
+    use quickwit_doc_mapper::{default_doc_mapper_for_test, DocMapper};
     use quickwit_metastore::checkpoint::SourceCheckpointDelta;
-    use quickwit_proto::metastore::{EmptyResponse, LastDeleteOpstampResponse};
-    use quickwit_proto::types::{IndexUid, PipelineUid};
+    use quickwit_proto::metastore::{
+        EmptyResponse, LastDeleteOpstampResponse, MockMetastoreService,
+    };
+    use quickwit_proto::types::{IndexUid, NodeId, PipelineUid};
     use tantivy::{doc, DateTime};
 
     use super::*;
@@ -736,7 +758,7 @@ mod tests {
         let pipeline_id = IndexingPipelineId {
             index_uid: index_uid.clone(),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
@@ -749,20 +771,20 @@ mod tests {
         indexing_settings.split_num_docs_target = 3;
         let universe = Universe::with_accelerated_time();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
-        let mut metastore = MetastoreServiceClient::mock();
-        metastore.expect_publish_splits().never();
-        metastore
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore.expect_publish_splits().never();
+        mock_metastore
             .expect_last_delete_opstamp()
             .times(2)
             .returning(move |delete_opstamp_request| {
                 assert_eq!(delete_opstamp_request.index_uid(), &index_uid);
                 Ok(LastDeleteOpstampResponse::new(last_delete_opstamp))
             });
-        metastore.expect_publish_splits().never();
+        mock_metastore.expect_publish_splits().never();
         let indexer = Indexer::new(
             pipeline_id,
             doc_mapper,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             indexing_directory,
             indexing_settings,
             None,
@@ -770,8 +792,8 @@ mod tests {
         );
         let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
         indexer_mailbox
-            .send_message(ProcessedDocBatch {
-                docs: vec![
+            .send_message(ProcessedDocBatch::new(
+                vec![
                     ProcessedDoc {
                         doc: doc!(
                             body_field=>"this is a test document",
@@ -791,13 +813,13 @@ mod tests {
                         num_bytes: 30,
                     },
                 ],
-                checkpoint_delta: SourceCheckpointDelta::from_range(4..6),
-                force_commit: false,
-            })
+                SourceCheckpointDelta::from_range(4..6),
+                false,
+            ))
             .await?;
         indexer_mailbox
-            .send_message(ProcessedDocBatch {
-                docs: vec![
+            .send_message(ProcessedDocBatch::new(
+                vec![
                     ProcessedDoc {
                         doc: doc!(
                             body_field=>"this is a test document 3",
@@ -817,13 +839,13 @@ mod tests {
                         num_bytes: 30,
                     },
                 ],
-                checkpoint_delta: SourceCheckpointDelta::from_range(6..8),
-                force_commit: false,
-            })
+                SourceCheckpointDelta::from_range(6..8),
+                false,
+            ))
             .await?;
         indexer_mailbox
-            .send_message(ProcessedDocBatch {
-                docs: vec![ProcessedDoc {
+            .send_message(ProcessedDocBatch::new(
+                vec![ProcessedDoc {
                     doc: doc!(
                         body_field=>"this is a test document 5",
                         timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
@@ -832,9 +854,9 @@ mod tests {
                     partition: 1,
                     num_bytes: 30,
                 }],
-                checkpoint_delta: SourceCheckpointDelta::from_range(8..9),
-                force_commit: false,
-            })
+                SourceCheckpointDelta::from_range(8..9),
+                false,
+            ))
             .await?;
         let indexer_counters = indexer_handle.process_pending_and_observe().await.state;
         assert_eq!(
@@ -861,8 +883,7 @@ mod tests {
             index_checkpoint.source_delta,
             SourceCheckpointDelta::from_range(4..8)
         );
-        let first_split = batch.splits.into_iter().next().unwrap().finalize()?;
-        assert!(first_split.index.settings().sort_by_field.is_none());
+        batch.splits.into_iter().next().unwrap().finalize()?;
         universe.assert_quit().await;
         Ok(())
     }
@@ -874,7 +895,7 @@ mod tests {
         let pipeline_id = IndexingPipelineId {
             index_uid: index_uid.clone(),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
@@ -883,22 +904,22 @@ mod tests {
         let body_field = schema.get_field("body").unwrap();
         let indexing_directory = TempDirectory::for_test();
         let mut indexing_settings = IndexingSettings::for_test();
-        indexing_settings.resources.heap_size = ByteSize::mb(5);
+        indexing_settings.resources.heap_size = ByteSize::mb(16);
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
-        let mut metastore = MetastoreServiceClient::mock();
-        metastore.expect_publish_splits().never();
-        metastore
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore.expect_publish_splits().never();
+        mock_metastore
             .expect_last_delete_opstamp()
             .times(1..=2)
             .returning(move |last_delete_opstamp_request| {
                 assert_eq!(last_delete_opstamp_request.index_uid(), &index_uid);
                 Ok(LastDeleteOpstampResponse::new(last_delete_opstamp))
             });
-        metastore.expect_publish_splits().never();
+        mock_metastore.expect_publish_splits().never();
         let indexer = Indexer::new(
             pipeline_id,
             doc_mapper,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             indexing_directory,
             indexing_settings,
             None,
@@ -921,11 +942,11 @@ mod tests {
         };
         for i in 0..10_000 {
             indexer_mailbox
-                .send_message(ProcessedDocBatch {
-                    docs: vec![make_doc(i)],
-                    checkpoint_delta: SourceCheckpointDelta::from_range(i..i + 1),
-                    force_commit: false,
-                })
+                .send_message(ProcessedDocBatch::new(
+                    vec![make_doc(i)],
+                    SourceCheckpointDelta::from_range(i..i + 1),
+                    false,
+                ))
                 .await?;
             let output_messages: Vec<IndexedSplitBatchBuilder> =
                 index_serializer_inbox.drain_for_test_typed();
@@ -951,7 +972,7 @@ mod tests {
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
@@ -963,18 +984,18 @@ mod tests {
         let mut indexing_settings = IndexingSettings::for_test();
         indexing_settings.commit_timeout_secs = 1;
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
-        let mut metastore = MetastoreServiceClient::mock();
-        metastore.expect_publish_splits().never();
-        metastore
-            .expect_last_delete_opstamp()
-            .returning(move |_last_delete_opstamp_request| {
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore.expect_publish_splits().never();
+        mock_metastore.expect_last_delete_opstamp().returning(
+            move |_last_delete_opstamp_request| {
                 Ok(LastDeleteOpstampResponse::new(last_delete_opstamp))
-            });
-        metastore.expect_publish_splits().never();
+            },
+        );
+        mock_metastore.expect_publish_splits().never();
         let indexer = Indexer::new(
             pipeline_id,
             doc_mapper,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             indexing_directory,
             indexing_settings,
             None,
@@ -986,8 +1007,8 @@ mod tests {
             async move {
                 let mut position = 0;
                 while indexer_mailbox
-                    .send_message(ProcessedDocBatch {
-                        docs: vec![ProcessedDoc {
+                    .send_message(ProcessedDocBatch::new(
+                        vec![ProcessedDoc {
                             doc: doc!(
                                 body_field=>"this is a test document",
                                 timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
@@ -996,9 +1017,9 @@ mod tests {
                             partition: 1,
                             num_bytes: 30,
                         }],
-                        force_commit: false,
-                        checkpoint_delta: SourceCheckpointDelta::from_range(position..position + 1),
-                    })
+                        SourceCheckpointDelta::from_range(position..position + 1),
+                        false,
+                    ))
                     .await
                     .is_ok()
                 {
@@ -1035,7 +1056,7 @@ mod tests {
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
@@ -1046,17 +1067,17 @@ mod tests {
         let indexing_directory = TempDirectory::for_test();
         let indexing_settings = IndexingSettings::for_test();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
-        let mut metastore = MetastoreServiceClient::mock();
-        metastore.expect_publish_splits().never();
-        metastore
-            .expect_last_delete_opstamp()
-            .returning(move |_last_delete_opstamp_request| {
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore.expect_publish_splits().never();
+        mock_metastore.expect_last_delete_opstamp().returning(
+            move |_last_delete_opstamp_request| {
                 Ok(LastDeleteOpstampResponse::new(last_delete_opstamp))
-            });
+            },
+        );
         let indexer = Indexer::new(
             pipeline_id,
             doc_mapper,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             indexing_directory,
             indexing_settings,
             Some(Arc::new(Semaphore::new(1))),
@@ -1064,8 +1085,8 @@ mod tests {
         );
         let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
         indexer_mailbox
-            .send_message(ProcessedDocBatch {
-                docs: vec![ProcessedDoc {
+            .send_message(ProcessedDocBatch::new(
+                vec![ProcessedDoc {
                     doc: doc!(
                         body_field=>"this is a test document 5",
                         timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
@@ -1074,9 +1095,9 @@ mod tests {
                     partition: 1,
                     num_bytes: 30,
                 }],
-                checkpoint_delta: SourceCheckpointDelta::from_range(8..9),
-                force_commit: false,
-            })
+                SourceCheckpointDelta::from_range(8..9),
+                false,
+            ))
             .await
             .unwrap();
         let mut indexer_counters: IndexerCounters = Default::default();
@@ -1123,7 +1144,7 @@ mod tests {
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
@@ -1133,17 +1154,17 @@ mod tests {
         let indexing_directory = TempDirectory::for_test();
         let indexing_settings = IndexingSettings::for_test();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
-        let mut metastore = MetastoreServiceClient::mock();
-        metastore.expect_publish_splits().never();
-        metastore
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore.expect_publish_splits().never();
+        mock_metastore
             .expect_last_delete_opstamp()
             .once()
             .returning(move |_last_delete_opstamp_request| Ok(LastDeleteOpstampResponse::new(10)));
-        metastore.expect_publish_splits().never();
+        mock_metastore.expect_publish_splits().never();
         let indexer = Indexer::new(
             pipeline_id,
             doc_mapper,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             indexing_directory,
             indexing_settings,
             None,
@@ -1151,8 +1172,8 @@ mod tests {
         );
         let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
         indexer_mailbox
-            .send_message(ProcessedDocBatch {
-                docs: vec![ProcessedDoc {
+            .send_message(ProcessedDocBatch::new(
+                vec![ProcessedDoc {
                     doc: doc!(
                         body_field=>"this is a test document 5",
                         timestamp_field=> DateTime::from_timestamp_secs(1_662_529_435)
@@ -1161,9 +1182,9 @@ mod tests {
                     partition: 1,
                     num_bytes: 30,
                 }],
-                checkpoint_delta: SourceCheckpointDelta::from_range(8..9),
-                force_commit: false,
-            })
+                SourceCheckpointDelta::from_range(8..9),
+                false,
+            ))
             .await
             .unwrap();
         universe.send_exit_with_success(&indexer_mailbox).await?;
@@ -1203,30 +1224,30 @@ mod tests {
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
-        let doc_mapper: Arc<dyn DocMapper> = Arc::new(
-            serde_json::from_str::<DefaultDocMapper>(DOCMAPPER_WITH_PARTITION_JSON).unwrap(),
-        );
+        let doc_mapper: Arc<DocMapper> =
+            Arc::new(serde_json::from_str::<DocMapper>(DOCMAPPER_WITH_PARTITION_JSON).unwrap());
         let schema = doc_mapper.schema();
         let tenant_field = schema.get_field("tenant").unwrap();
         let body_field = schema.get_field("body").unwrap();
 
         let indexing_directory = TempDirectory::for_test();
-        let indexing_settings = IndexingSettings::for_test();
+        let mut indexing_settings = IndexingSettings::for_test();
+        indexing_settings.resources.heap_size = ByteSize::mb(100);
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
-        let mut metastore = MetastoreServiceClient::mock();
-        metastore.expect_publish_splits().never();
-        metastore
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore.expect_publish_splits().never();
+        mock_metastore
             .expect_last_delete_opstamp()
             .once()
             .returning(move |_last_delete_opstamp_request| Ok(LastDeleteOpstampResponse::new(10)));
-        metastore.expect_publish_splits().never();
+        mock_metastore.expect_publish_splits().never();
         let indexer = Indexer::new(
             pipeline_id,
             doc_mapper,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             indexing_directory,
             indexing_settings,
             None,
@@ -1234,8 +1255,8 @@ mod tests {
         );
         let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
         indexer_mailbox
-            .send_message(ProcessedDocBatch {
-                docs: vec![
+            .send_message(ProcessedDocBatch::new(
+                vec![
                     ProcessedDoc {
                         doc: doc!(
                             body_field=>"doc 2",
@@ -1255,9 +1276,9 @@ mod tests {
                         num_bytes: 30,
                     },
                 ],
-                checkpoint_delta: SourceCheckpointDelta::from_range(8..9),
-                force_commit: false,
-            })
+                SourceCheckpointDelta::from_range(8..9),
+                false,
+            ))
             .await?;
 
         let indexer_counters = indexer_handle.process_pending_and_observe().await.state;
@@ -1303,25 +1324,26 @@ mod tests {
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
-        let doc_mapper: Arc<dyn DocMapper> =
-            Arc::new(serde_json::from_str::<DefaultDocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
+        let doc_mapper: Arc<DocMapper> =
+            Arc::new(serde_json::from_str::<DocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
         let body_field = doc_mapper.schema().get_field("body").unwrap();
         let indexing_directory = TempDirectory::for_test();
-        let indexing_settings = IndexingSettings::for_test();
-        let mut metastore = MetastoreServiceClient::mock();
-        metastore
+        let mut indexing_settings = IndexingSettings::for_test();
+        indexing_settings.resources.heap_size = ByteSize::gb(5);
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
             .expect_last_delete_opstamp()
             .times(1)
             .returning(move |_last_delete_opstamp_request| Ok(LastDeleteOpstampResponse::new(10)));
-        metastore.expect_publish_splits().never();
+        mock_metastore.expect_publish_splits().never();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
         let indexer = Indexer::new(
             pipeline_id,
             doc_mapper,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             indexing_directory,
             indexing_settings,
             None,
@@ -1331,16 +1353,16 @@ mod tests {
 
         for partition in 0..100 {
             indexer_mailbox
-                .send_message(ProcessedDocBatch {
-                    docs: vec![ProcessedDoc {
+                .send_message(ProcessedDocBatch::new(
+                    vec![ProcessedDoc {
                         doc: doc!(body_field=>"doc {i}"),
                         timestamp_opt: None,
                         partition,
                         num_bytes: 30,
                     }],
-                    checkpoint_delta: SourceCheckpointDelta::from_range(partition..partition + 1),
-                    force_commit: false,
-                })
+                    SourceCheckpointDelta::from_range(partition..partition + 1),
+                    false,
+                ))
                 .await
                 .unwrap();
         }
@@ -1373,26 +1395,26 @@ mod tests {
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
-        let doc_mapper: Arc<dyn DocMapper> =
-            Arc::new(serde_json::from_str::<DefaultDocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
+        let doc_mapper: Arc<DocMapper> =
+            Arc::new(serde_json::from_str::<DocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
         let body_field = doc_mapper.schema().get_field("body").unwrap();
         let indexing_directory = TempDirectory::for_test();
         let mut indexing_settings = IndexingSettings::for_test();
         indexing_settings.split_num_docs_target = 1;
-        let mut metastore = MetastoreServiceClient::mock();
-        metastore
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
             .expect_last_delete_opstamp()
             .times(2)
             .returning(move |_last_delete_opstamp_request| Ok(LastDeleteOpstampResponse::new(10)));
-        metastore.expect_publish_splits().never();
+        mock_metastore.expect_publish_splits().never();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
         let indexer = Indexer::new(
             pipeline_id,
             doc_mapper,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             indexing_directory,
             indexing_settings,
             None,
@@ -1409,16 +1431,16 @@ mod tests {
                 .await
                 .unwrap();
             indexer_mailbox
-                .send_message(ProcessedDocBatch {
-                    docs: vec![ProcessedDoc {
+                .send_message(ProcessedDocBatch::new(
+                    vec![ProcessedDoc {
                         doc: doc!(body_field=>"doc 1"),
                         timestamp_opt: None,
                         partition: 0,
                         num_bytes: 30,
                     }],
-                    checkpoint_delta: SourceCheckpointDelta::from_range(0..1),
-                    force_commit: false,
-                })
+                    SourceCheckpointDelta::from_range(0..1),
+                    false,
+                ))
                 .await
                 .unwrap();
         }
@@ -1445,26 +1467,26 @@ mod tests {
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
-        let doc_mapper: Arc<dyn DocMapper> =
-            Arc::new(serde_json::from_str::<DefaultDocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
+        let doc_mapper: Arc<DocMapper> =
+            Arc::new(serde_json::from_str::<DocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
         let body_field = doc_mapper.schema().get_field("body").unwrap();
         let indexing_directory = TempDirectory::for_test();
         let mut indexing_settings = IndexingSettings::for_test();
         indexing_settings.split_num_docs_target = 1;
-        let mut metastore = MetastoreServiceClient::mock();
-        metastore
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
             .expect_last_delete_opstamp()
             .times(1)
             .returning(move |_last_delete_opstamp_request| Ok(LastDeleteOpstampResponse::new(10)));
-        metastore.expect_publish_splits().never();
+        mock_metastore.expect_publish_splits().never();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
         let indexer = Indexer::new(
             pipeline_id,
             doc_mapper,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             indexing_directory,
             indexing_settings,
             None,
@@ -1480,16 +1502,16 @@ mod tests {
         indexer_handle.process_pending_and_observe().await;
         publish_lock.kill().await;
         indexer_mailbox
-            .send_message(ProcessedDocBatch {
-                docs: vec![ProcessedDoc {
+            .send_message(ProcessedDocBatch::new(
+                vec![ProcessedDoc {
                     doc: doc!(body_field=>"doc 1"),
                     timestamp_opt: None,
                     partition: 0,
                     num_bytes: 30,
                 }],
-                checkpoint_delta: SourceCheckpointDelta::from_range(0..1),
-                force_commit: false,
-            })
+                SourceCheckpointDelta::from_range(0..1),
+                false,
+            ))
             .await
             .unwrap();
         universe
@@ -1510,25 +1532,25 @@ mod tests {
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
-        let doc_mapper: Arc<dyn DocMapper> =
-            Arc::new(serde_json::from_str::<DefaultDocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
+        let doc_mapper: Arc<DocMapper> =
+            Arc::new(serde_json::from_str::<DocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
         let body_field = doc_mapper.schema().get_field("body").unwrap();
         let indexing_directory = TempDirectory::for_test();
         let indexing_settings = IndexingSettings::for_test();
-        let mut metastore = MetastoreServiceClient::mock();
-        metastore
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
             .expect_last_delete_opstamp()
             .times(1)
             .returning(move |_last_delete_opstamp_request| Ok(LastDeleteOpstampResponse::new(10)));
-        metastore.expect_publish_splits().never();
+        mock_metastore.expect_publish_splits().never();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
         let indexer = Indexer::new(
             pipeline_id,
             doc_mapper,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             indexing_directory,
             indexing_settings,
             None,
@@ -1536,16 +1558,16 @@ mod tests {
         );
         let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
         indexer_mailbox
-            .send_message(ProcessedDocBatch {
-                docs: vec![ProcessedDoc {
+            .send_message(ProcessedDocBatch::new(
+                vec![ProcessedDoc {
                     doc: doc!(body_field=>"doc 1"),
                     timestamp_opt: None,
                     partition: 0,
                     num_bytes: 30,
                 }],
-                checkpoint_delta: SourceCheckpointDelta::from_range(0..1),
-                force_commit: true,
-            })
+                SourceCheckpointDelta::from_range(0..1),
+                true,
+            ))
             .await
             .unwrap();
         universe
@@ -1571,7 +1593,7 @@ mod tests {
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
@@ -1581,7 +1603,7 @@ mod tests {
         let commit_timeout = indexing_settings.commit_timeout();
         let universe = Universe::with_accelerated_time();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_publish_splits()
             .returning(move |publish_splits_request| {
@@ -1596,7 +1618,7 @@ mod tests {
         let indexer = Indexer::new(
             pipeline_id,
             doc_mapper,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             indexing_directory,
             indexing_settings,
             None,
@@ -1604,18 +1626,18 @@ mod tests {
         );
         let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
         indexer_mailbox
-            .send_message(ProcessedDocBatch {
-                docs: Vec::new(),
-                checkpoint_delta: SourceCheckpointDelta::from_range(4..6),
-                force_commit: false,
-            })
+            .send_message(ProcessedDocBatch::new(
+                Vec::new(),
+                SourceCheckpointDelta::from_range(4..6),
+                false,
+            ))
             .await?;
         indexer_mailbox
-            .send_message(ProcessedDocBatch {
-                docs: Vec::new(),
-                checkpoint_delta: SourceCheckpointDelta::from_range(6..8),
-                force_commit: false,
-            })
+            .send_message(ProcessedDocBatch::new(
+                Vec::new(),
+                SourceCheckpointDelta::from_range(6..8),
+                false,
+            ))
             .await?;
         universe
             .sleep(commit_timeout + Duration::from_secs(2))

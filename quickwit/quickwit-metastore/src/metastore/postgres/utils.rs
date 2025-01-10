@@ -26,13 +26,14 @@ use quickwit_common::uri::Uri;
 use quickwit_proto::metastore::{MetastoreError, MetastoreResult};
 use sea_query::{any, Expr, Func, Order, SelectStatement};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{ConnectOptions, Pool, Postgres};
+use sqlx::{ConnectOptions, Postgres};
 use tracing::error;
 use tracing::log::LevelFilter;
 
 use super::model::{Splits, ToTimestampFunc};
+use super::pool::TrackedPool;
 use super::tags::generate_sql_condition;
-use crate::metastore::FilterRange;
+use crate::metastore::{FilterRange, SortBy};
 use crate::{ListSplitsQuery, SplitMaturity, SplitMetadata};
 
 /// Establishes a connection to the given database URI.
@@ -43,17 +44,25 @@ pub(super) async fn establish_connection(
     acquire_timeout: Duration,
     idle_timeout_opt: Option<Duration>,
     max_lifetime_opt: Option<Duration>,
-) -> MetastoreResult<Pool<Postgres>> {
+    read_only: bool,
+) -> MetastoreResult<TrackedPool<Postgres>> {
     let pool_options = PgPoolOptions::new()
         .min_connections(min_connections as u32)
         .max_connections(max_connections as u32)
         .acquire_timeout(acquire_timeout)
         .idle_timeout(idle_timeout_opt)
         .max_lifetime(max_lifetime_opt);
-    let connect_options: PgConnectOptions = PgConnectOptions::from_str(connection_uri.as_str())?
-        .application_name("quickwit-metastore")
-        .log_statements(LevelFilter::Info);
-    pool_options
+
+    let mut connect_options: PgConnectOptions =
+        PgConnectOptions::from_str(connection_uri.as_str())?
+            .application_name("quickwit-metastore")
+            .log_statements(LevelFilter::Info);
+
+    if read_only {
+        // this isn't a security mechanism, only a safeguard against involontary missuse
+        connect_options = connect_options.options([("default_transaction_read_only", "on")]);
+    }
+    let sqlx_pool = pool_options
         .connect_with(connect_options)
         .await
         .map_err(|error| {
@@ -61,7 +70,9 @@ pub(super) async fn establish_connection(
             MetastoreError::Connection {
                 message: error.to_string(),
             }
-        })
+        })?;
+    let tracked_pool = TrackedPool::new(sqlx_pool);
+    Ok(tracked_pool)
 }
 
 /// Extends an existing SQL string with the generated filter range appended to the query.
@@ -90,12 +101,20 @@ pub(super) fn append_range_filters<V: Display>(
     };
 }
 
-pub(super) fn append_query_filters(sql: &mut SelectStatement, query: &ListSplitsQuery) {
-    // Note: `ListSplitsQuery` builder enforces a non empty `index_uids` list.
+pub(super) fn append_query_filters_and_order_by(
+    sql: &mut SelectStatement,
+    query: &ListSplitsQuery,
+) {
+    if let Some(index_uids) = &query.index_uids {
+        // Note: `ListSplitsQuery` builder enforces a non empty `index_uids` list.
+        // TODO we should explore IN VALUES, = ANY and similar constructs in case they perform
+        // better.
+        sql.cond_where(Expr::col(Splits::IndexUid).is_in(index_uids));
+    }
 
-    sql.cond_where(
-        Expr::col(Splits::IndexUid).is_in(query.index_uids.iter().map(|val| val.to_string())),
-    );
+    if let Some(node_id) = &query.node_id {
+        sql.cond_where(Expr::col(Splits::NodeId).eq(node_id));
+    };
 
     if !query.split_states.is_empty() {
         sql.cond_where(
@@ -173,6 +192,28 @@ pub(super) fn append_query_filters(sql: &mut SelectStatement, query: &ListSplits
     append_range_filters(sql, Splits::DeleteOpstamp, &query.delete_opstamp, |&val| {
         Expr::expr(val)
     });
+
+    if let Some((index_uid, split_id)) = &query.after_split {
+        sql.cond_where(
+            Expr::tuple([
+                Expr::col(Splits::IndexUid).into(),
+                Expr::col(Splits::SplitId).into(),
+            ])
+            .gt(Expr::tuple([Expr::value(index_uid), Expr::value(split_id)])),
+        );
+    }
+
+    match query.sort_by {
+        SortBy::Staleness => {
+            sql.order_by(Splits::DeleteOpstamp, Order::Asc)
+                .order_by(Splits::PublishTimestamp, Order::Asc);
+        }
+        SortBy::IndexUid => {
+            sql.order_by(Splits::IndexUid, Order::Asc)
+                .order_by(Splits::SplitId, Order::Asc);
+        }
+        SortBy::None => (),
+    }
 
     if let Some(limit) = query.limit {
         sql.limit(limit as u64);

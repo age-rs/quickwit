@@ -19,7 +19,6 @@
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use tantivy::json_utils::JsonTermWriter;
 use tantivy::query::{
     PhrasePrefixQuery as TantivyPhrasePrefixQuery, PhraseQuery as TantivyPhraseQuery,
     TermQuery as TantivyTermQuery,
@@ -79,16 +78,11 @@ impl FullTextParams {
             self.text_analyzer(text_indexing_options, tokenizer_manager)?;
         let mut token_stream = text_analyzer.token_stream(text);
         let mut tokens = Vec::new();
-        let mut term = Term::with_capacity(100);
-        let mut json_term_writer = JsonTermWriter::from_field_and_json_path(
-            field,
-            json_path,
-            json_options.is_expand_dots_enabled(),
-            &mut term,
-        );
         token_stream.process(&mut |token| {
-            json_term_writer.set_str(&token.text);
-            tokens.push((token.position, json_term_writer.term().clone()));
+            let mut term =
+                Term::from_field_json_path(field, json_path, json_options.is_expand_dots_enabled());
+            term.append_type_and_str(&token.text);
+            tokens.push((token.position, term));
         });
         Ok(tokens)
     }
@@ -149,6 +143,12 @@ impl FullTextParams {
                 Ok(TantivyBoolQuery::build_clause(operator, leaf_queries).into())
             }
             FullTextMode::Phrase { slop } => {
+                if !index_record_option.has_positions() {
+                    return Err(InvalidQuery::SchemaError(
+                        "Applied phrase query on field which does not have positions indexed"
+                            .to_string(),
+                    ));
+                }
                 let mut phrase_query = TantivyPhraseQuery::new_with_offset(terms);
                 phrase_query.set_slop(slop);
                 Ok(phrase_query.into())
@@ -183,8 +183,9 @@ pub enum FullTextMode {
     },
     BoolPrefix {
         operator: BooleanOperand,
-        // max_expansions correspond to the fuzzy stop of query evalution. It's not the same as the
-        // max_expansions of a PhrasePrefixQuery, where it's used for the range expansion.
+        // max_expansions correspond to the fuzzy stop of query evaluation. It's not the same as
+        // the max_expansions of a PhrasePrefixQuery, where it's used for the range
+        // expansion.
         max_expansions: u32,
     },
     // Act as Phrase with slop 0 if the field has positions,
@@ -226,6 +227,8 @@ pub struct FullTextQuery {
     pub field: String,
     pub text: String,
     pub params: FullTextParams,
+    /// Support missing fields
+    pub lenient: bool,
 }
 
 impl From<FullTextQuery> for QueryAst {
@@ -248,12 +251,13 @@ impl BuildTantivyAst for FullTextQuery {
             &self.params,
             schema,
             tokenizer_manager,
+            self.lenient,
         )
     }
 }
 
 impl FullTextQuery {
-    /// Returns the last term of the query assuming the query is targetting a string or a Json
+    /// Returns the last term of the query assuming the query is targeting a string or a Json
     /// field.
     ///
     /// This strange method is used to identify which term range should be warmed up for
@@ -267,8 +271,7 @@ impl FullTextQuery {
             return None;
         };
 
-        let (field, field_entry, json_path) =
-            find_field_or_hit_dynamic(&self.field, schema).ok()?;
+        let (field, field_entry, json_path) = find_field_or_hit_dynamic(&self.field, schema)?;
         let field_type: &FieldType = field_entry.field_type();
         match field_type {
             FieldType::Str(text_options) => {
@@ -322,6 +325,7 @@ mod tests {
                 mode: BooleanOperand::And.into(),
                 zero_terms_query: crate::MatchAllOrNone::MatchAll,
             },
+            lenient: false,
         };
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("body", TEXT);
@@ -347,6 +351,7 @@ mod tests {
                 mode: FullTextMode::Phrase { slop: 1 },
                 zero_terms_query: crate::MatchAllOrNone::MatchAll,
             },
+            lenient: false,
         };
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("body", TEXT);
@@ -377,6 +382,7 @@ mod tests {
                 mode: FullTextMode::Phrase { slop: 1 },
                 zero_terms_query: crate::MatchAllOrNone::MatchAll,
             },
+            lenient: false,
         };
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("body", TEXT);
@@ -406,6 +412,7 @@ mod tests {
                 mode: BooleanOperand::And.into(),
                 zero_terms_query: crate::MatchAllOrNone::MatchAll,
             },
+            lenient: false,
         };
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("body", TEXT);

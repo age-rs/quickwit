@@ -25,17 +25,25 @@ use std::ops::Deref;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 pub use ulid::Ulid;
 
+mod doc_mapping_uid;
+mod doc_uid;
 mod index_uid;
 mod pipeline_uid;
 mod position;
 mod shard_id;
 
+pub use doc_mapping_uid::DocMappingUid;
+pub use doc_uid::{DocUid, DocUidGenerator};
 pub use index_uid::IndexUid;
 pub use pipeline_uid::PipelineUid;
 pub use position::Position;
 pub use shard_id::ShardId;
+
+/// The size of an ULID in bytes. Use `ULID_LEN` for the length of Base32 encoded ULID strings.
+pub(crate) const ULID_SIZE: usize = 16;
 
 pub type IndexId = String;
 
@@ -56,6 +64,15 @@ pub fn queue_id(index_uid: &IndexUid, source_id: &str, shard_id: &ShardId) -> Qu
 }
 
 pub fn split_queue_id(queue_id: &str) -> Option<(IndexUid, SourceId, ShardId)> {
+    let parts_opt = split_queue_id_inner(queue_id);
+
+    if parts_opt.is_none() {
+        warn!("failed to parse queue ID `{queue_id}`: this should never happen, please report");
+    }
+    parts_opt
+}
+
+fn split_queue_id_inner(queue_id: &str) -> Option<(IndexUid, SourceId, ShardId)> {
     let mut parts = queue_id.split('/');
     let index_uid = parts.next()?;
     let source_id = parts.next()?;
@@ -83,12 +100,6 @@ impl Display for SourceUid {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(String);
-
-// #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-// pub struct GenerationId(u64);
-
-// #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-// pub struct NodeUid(NodeId, GenerationId);
 
 impl NodeId {
     /// Constructs a new [`NodeId`].
@@ -220,6 +231,12 @@ impl Borrow<str> for NodeIdRef {
     }
 }
 
+impl Display for NodeIdRef {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{}", &self.0)
+    }
+}
+
 impl<'a> From<&'a str> for &'a NodeIdRef {
     fn from(node_id: &'a str) -> &'a NodeIdRef {
         NodeIdRef::from_str(node_id)
@@ -261,6 +278,13 @@ impl ToOwned for NodeIdRef {
 
     fn to_owned(&self) -> Self::Owned {
         NodeId(self.0.to_string())
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl From<&NodeId> for sea_query::Value {
+    fn from(node_id: &NodeId) -> Self {
+        node_id.to_string().into()
     }
 }
 

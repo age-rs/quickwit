@@ -107,11 +107,16 @@ impl AzureBlobStorage {
             container_client,
             uri,
             prefix: PathBuf::new(),
-            multipart_policy: MultiPartPolicy::default(),
-            retry_params: RetryParams {
-                max_attempts: 3,
-                ..Default::default()
+            multipart_policy: MultiPartPolicy {
+                // Azure max part size is 100MB
+                // https://azure.microsoft.com/en-us/blog/general-availability-larger-block-blobs-in-azure-storage/
+                target_part_num_bytes: 100_000_000,
+                multipart_threshold_num_bytes: 100_000_000,
+                max_num_parts: 50_000, // Azure allows up to 50,000 blocks
+                max_object_num_bytes: 4_770_000_000_000u64, // Azure allows up to 4.77TB objects
+                max_concurrent_uploads: 100,
             },
+            retry_params: RetryParams::aggressive(),
         }
     }
 
@@ -134,15 +139,14 @@ impl AzureBlobStorage {
         use std::str::FromStr;
 
         let container_client = ClientBuilder::emulator().container_client(container);
+        let uri = Uri::from_str(&format!("azure://tester/{container}")).unwrap();
+
         Self {
             container_client,
-            uri: Uri::from_str(&format!("azure://tester/{container}")).unwrap(),
+            uri,
             prefix: PathBuf::new(),
             multipart_policy: MultiPartPolicy::default(),
-            retry_params: RetryParams {
-                max_attempts: 3,
-                ..Default::default()
-            },
+            retry_params: RetryParams::no_retries(),
         }
     }
 
@@ -173,7 +177,7 @@ impl AzureBlobStorage {
             StorageResolverError::InvalidConfig(message)
         })?;
         let (container_name, prefix) = parse_azure_uri(uri).ok_or_else(|| {
-            let message = format!("failed to extract container name from Azure URI: {uri}");
+            let message = format!("failed to extract container name from Azure URI `{uri}`");
             StorageResolverError::InvalidUri(message)
         })?;
         let azure_blob_storage =

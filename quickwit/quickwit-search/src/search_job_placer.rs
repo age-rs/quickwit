@@ -27,9 +27,11 @@ use anyhow::bail;
 use async_trait::async_trait;
 use quickwit_common::pubsub::EventSubscriber;
 use quickwit_common::rendezvous_hasher::{node_affinity, sort_by_rendez_vous_hash};
+use quickwit_common::SocketAddrLegacyHash;
 use quickwit_proto::search::{ReportSplit, ReportSplitsRequest};
+use tracing::{info, warn};
 
-use crate::{SearchServiceClient, SearcherPool};
+use crate::{SearchJob, SearchServiceClient, SearcherPool, SEARCH_METRICS};
 
 /// Job.
 /// The unit in which distributed search is performed.
@@ -76,10 +78,12 @@ impl EventSubscriber<ReportSplitsRequest> for SearchJobPlacer {
         for report_split in evt.report_splits {
             let node_addr = nodes
                 .keys()
-                .max_by_key(|node_addr| node_affinity(*node_addr, &report_split.split_id))
+                .max_by_key(|node_addr| {
+                    node_affinity(SocketAddrLegacyHash(node_addr), &report_split.split_id)
+                })
                 // This actually never happens thanks to the if-condition at the
                 // top of this function.
-                .expect("`nodes` should not be empty.");
+                .expect("`nodes` should not be empty");
             splits_per_node
                 .entry(*node_addr)
                 .or_default()
@@ -114,7 +118,7 @@ struct SocketAddrAndClient {
 
 impl Hash for SocketAddrAndClient {
     fn hash<H: Hasher>(&self, hasher: &mut H) {
-        self.socket_addr.hash(hasher);
+        SocketAddrLegacyHash(&self.socket_addr).hash(hasher);
     }
 }
 
@@ -149,43 +153,79 @@ impl SearchJobPlacer {
         mut jobs: Vec<J>,
         excluded_addrs: &HashSet<SocketAddr>,
     ) -> anyhow::Result<impl Iterator<Item = (SearchServiceClient, Vec<J>)>> {
-        let num_nodes = self.searcher_pool.len();
+        let mut all_nodes = self.searcher_pool.pairs();
 
-        let mut candidate_nodes: Vec<CandidateNodes> = self
-            .searcher_pool
-            .pairs()
+        if all_nodes.is_empty() {
+            bail!(
+                "failed to assign search jobs: there are no available searcher nodes in the \
+                 cluster"
+            );
+        }
+        if !excluded_addrs.is_empty() && excluded_addrs.len() < all_nodes.len() {
+            all_nodes.retain(|(grpc_addr, _)| !excluded_addrs.contains(grpc_addr));
+
+            // This should never happen, but... belt and suspenders policy.
+            if all_nodes.is_empty() {
+                bail!(
+                    "failed to assign search jobs: there are no searcher nodes candidates for \
+                     these jobs"
+                );
+            }
+            info!(
+                "excluded {} nodes from search job placement, {} remaining",
+                excluded_addrs.len(),
+                all_nodes.len()
+            );
+        }
+        let mut candidate_nodes: Vec<CandidateNode> = all_nodes
             .into_iter()
-            .filter(|(grpc_addr, _)| {
-                excluded_addrs.is_empty()
-                    || excluded_addrs.len() == num_nodes
-                    || !excluded_addrs.contains(grpc_addr)
-            })
-            .map(|(grpc_addr, client)| CandidateNodes {
+            .map(|(grpc_addr, client)| CandidateNode {
                 grpc_addr,
                 client,
                 load: 0,
             })
             .collect();
 
-        if candidate_nodes.is_empty() {
-            bail!(
-                "failed to assign search jobs. there are no available searcher nodes in the pool"
-            );
-        }
         jobs.sort_unstable_by(Job::compare_cost);
+
+        let num_nodes = candidate_nodes.len();
 
         let mut job_assignments: HashMap<SocketAddr, (SearchServiceClient, Vec<J>)> =
             HashMap::with_capacity(num_nodes);
 
+        let total_load: usize = jobs.iter().map(|job| job.cost()).sum();
+
+        // allow around 5% disparity. Round up so we never end up in a case where
+        // target_load * num_nodes < total_load
+        // some of our tests needs 2 splits to be put on 2 different searchers. It makes sense for
+        // these tests to keep doing so (testing root merge). Either we can make the allowed
+        // difference stricter, find the right split names ("split6" instead of "split2" works).
+        // or modify mock_split_meta() so that not all splits have the same job cost
+        // for now i went with the mock_split_meta() changes.
+        const ALLOWED_DIFFERENCE: usize = 105;
+        let target_load = (total_load * ALLOWED_DIFFERENCE).div_ceil(num_nodes * 100);
         for job in jobs {
             sort_by_rendez_vous_hash(&mut candidate_nodes, job.split_id());
-            // Select the least loaded node.
-            let chosen_node_idx = if candidate_nodes.len() >= 2 {
-                usize::from(candidate_nodes[0].load > candidate_nodes[1].load)
+
+            let (chosen_node_idx, chosen_node) = if let Some((idx, node)) = candidate_nodes
+                .iter_mut()
+                .enumerate()
+                .find(|(_pos, node)| node.load < target_load)
+            {
+                (idx, node)
             } else {
-                0
+                warn!("found no lightly loaded searcher for split, this should never happen");
+                (0, &mut candidate_nodes[0])
             };
-            let chosen_node = &mut candidate_nodes[chosen_node_idx];
+            let metric_node_idx = match chosen_node_idx {
+                0 => "0",
+                1 => "1",
+                _ => "> 1",
+            };
+            SEARCH_METRICS
+                .job_assigned_total
+                .with_label_values([metric_node_idx])
+                .inc();
             chosen_node.load += job.cost();
 
             job_assignments
@@ -214,30 +254,119 @@ impl SearchJobPlacer {
 }
 
 #[derive(Debug, Clone)]
-struct CandidateNodes {
+struct CandidateNode {
     pub grpc_addr: SocketAddr,
     pub client: SearchServiceClient,
     pub load: usize,
 }
 
-impl Hash for CandidateNodes {
+impl Hash for CandidateNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.grpc_addr.hash(state);
+        SocketAddrLegacyHash(&self.grpc_addr).hash(state);
     }
 }
 
-impl PartialEq for CandidateNodes {
+impl PartialEq for CandidateNode {
     fn eq(&self, other: &Self) -> bool {
         self.grpc_addr == other.grpc_addr
     }
 }
 
-impl Eq for CandidateNodes {}
+impl Eq for CandidateNode {}
+
+/// Groups jobs by index id and returns a list of `SearchJob` per index
+pub fn group_jobs_by_index_id(
+    jobs: Vec<SearchJob>,
+    cb: impl FnMut(Vec<SearchJob>) -> crate::Result<()>,
+) -> crate::Result<()> {
+    // Group jobs by index uid.
+    group_by(jobs, |job| &job.index_uid, cb)?;
+    Ok(())
+}
+
+/// Note: The data will be sorted.
+///
+/// Returns slices of the input data grouped by passed closure.
+pub fn group_by<T, K: Ord, F>(
+    mut data: Vec<T>,
+    compare_by: impl Fn(&T) -> &K,
+    mut callback: F,
+) -> crate::Result<()>
+where
+    F: FnMut(Vec<T>) -> crate::Result<()>,
+{
+    data.sort_by(|job1, job2| compare_by(job2).cmp(compare_by(job1)));
+    while !data.is_empty() {
+        let last_element = data.last().unwrap();
+        let count = data
+            .iter()
+            .rev()
+            .take_while(|&x| compare_by(x) == compare_by(last_element))
+            .count();
+
+        let group = data.split_off(data.len() - count);
+        callback(group)?;
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{searcher_pool_for_test, MockSearchService, SearchJob};
+
+    #[test]
+    fn test_group_by_1() {
+        let data = vec![1, 1, 2, 2, 2, 3, 4, 4, 5, 5, 5];
+        let mut outputs: Vec<Vec<i32>> = Vec::new();
+        group_by(
+            data,
+            |el| el,
+            |group| {
+                outputs.push(group);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 5);
+        assert_eq!(outputs[0], vec![1, 1]);
+        assert_eq!(outputs[1], vec![2, 2, 2]);
+        assert_eq!(outputs[2], vec![3]);
+        assert_eq!(outputs[3], vec![4, 4]);
+        assert_eq!(outputs[4], vec![5, 5, 5]);
+    }
+    #[test]
+    fn test_group_by_all_same() {
+        let data = vec![1, 1];
+        let mut outputs: Vec<Vec<i32>> = Vec::new();
+        group_by(
+            data,
+            |el| el,
+            |group| {
+                outputs.push(group);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], vec![1, 1]);
+    }
+    #[test]
+    fn test_group_by_empty() {
+        let data = vec![];
+        let mut outputs: Vec<Vec<i32>> = Vec::new();
+        group_by(
+            data,
+            |el| el,
+            |group| {
+                outputs.push(group);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 0);
+    }
 
     #[tokio::test]
     async fn test_search_job_placer() {
@@ -301,25 +430,82 @@ mod tests {
 
             let expected_searcher_addr_1: SocketAddr = ([127, 0, 0, 1], 1001).into();
             let expected_searcher_addr_2: SocketAddr = ([127, 0, 0, 1], 1002).into();
+            // on a small number of splits, we may be unbalanced
             let expected_assigned_jobs = vec![
                 (
                     expected_searcher_addr_1,
                     vec![
                         SearchJob::for_test("split5", 5),
                         SearchJob::for_test("split4", 4),
-                        SearchJob::for_test("split2", 2),
+                        SearchJob::for_test("split3", 3),
                     ],
                 ),
                 (
                     expected_searcher_addr_2,
                     vec![
                         SearchJob::for_test("split6", 6),
-                        SearchJob::for_test("split3", 3),
+                        SearchJob::for_test("split2", 2),
                         SearchJob::for_test("split1", 1),
                     ],
                 ),
             ];
             assert_eq!(assigned_jobs, expected_assigned_jobs);
+        }
+        {
+            let searcher_pool = searcher_pool_for_test([
+                ("127.0.0.1:1001", MockSearchService::new()),
+                ("127.0.0.1:1002", MockSearchService::new()),
+            ]);
+            let search_job_placer = SearchJobPlacer::new(searcher_pool);
+            let jobs = vec![
+                SearchJob::for_test("split1", 1000),
+                SearchJob::for_test("split2", 1),
+            ];
+            let mut assigned_jobs: Vec<(SocketAddr, Vec<SearchJob>)> = search_job_placer
+                .assign_jobs(jobs, &HashSet::default())
+                .await
+                .unwrap()
+                .map(|(client, jobs)| (client.grpc_addr(), jobs))
+                .collect();
+            assigned_jobs.sort_unstable_by_key(|(node_uid, _)| *node_uid);
+
+            let expected_searcher_addr_1: SocketAddr = ([127, 0, 0, 1], 1001).into();
+            let expected_searcher_addr_2: SocketAddr = ([127, 0, 0, 1], 1002).into();
+            let expected_assigned_jobs = vec![
+                (
+                    expected_searcher_addr_1,
+                    vec![SearchJob::for_test("split1", 1000)],
+                ),
+                (
+                    expected_searcher_addr_2,
+                    vec![SearchJob::for_test("split2", 1)],
+                ),
+            ];
+            assert_eq!(assigned_jobs, expected_assigned_jobs);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_job_placer_many_splits() {
+        let searcher_pool = searcher_pool_for_test([
+            ("127.0.0.1:1001", MockSearchService::new()),
+            ("127.0.0.1:1002", MockSearchService::new()),
+            ("127.0.0.1:1003", MockSearchService::new()),
+            ("127.0.0.1:1004", MockSearchService::new()),
+            ("127.0.0.1:1005", MockSearchService::new()),
+        ]);
+        let search_job_placer = SearchJobPlacer::new(searcher_pool);
+        let jobs = (0..1000)
+            .map(|id| SearchJob::for_test(&format!("split{id}"), 1))
+            .collect();
+        let jobs_len: Vec<usize> = search_job_placer
+            .assign_jobs(jobs, &HashSet::default())
+            .await
+            .unwrap()
+            .map(|(_, jobs)| jobs.len())
+            .collect();
+        for job_len in jobs_len {
+            assert!(job_len <= 1050 / 5);
         }
     }
 }

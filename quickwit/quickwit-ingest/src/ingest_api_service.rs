@@ -27,16 +27,17 @@ use quickwit_actors::{
 };
 use quickwit_common::runtimes::RuntimeType;
 use quickwit_common::tower::Cost;
-use tracing::info;
+use quickwit_proto::ingest::RateLimitingCause;
+use tracing::{error, info};
 use ulid::Ulid;
 
 use crate::metrics::INGEST_METRICS;
 use crate::notifications::Notifications;
 use crate::{
-    CommitType, CreateQueueIfNotExistsRequest, CreateQueueRequest, DocCommand, DropQueueRequest,
-    FetchRequest, FetchResponse, IngestRequest, IngestResponse, IngestServiceError,
-    ListQueuesRequest, ListQueuesResponse, MemoryCapacity, Queues, SuggestTruncateRequest,
-    TailRequest,
+    CommitType, CreateQueueIfNotExistsRequest, CreateQueueIfNotExistsResponse, CreateQueueRequest,
+    DocCommand, DropQueueRequest, FetchRequest, FetchResponse, IngestRequest, IngestResponse,
+    IngestServiceError, ListQueuesRequest, ListQueuesResponse, MemoryCapacity, Queues,
+    SuggestTruncateRequest, TailRequest,
 };
 
 impl Cost for IngestRequest {
@@ -153,15 +154,20 @@ impl IngestApiService {
             .find(|index_id| !self.queues.queue_exists(index_id));
 
         if let Some(index_id) = first_non_existing_queue_opt {
+            error!(
+                index_id,
+                partition_id = self.partition_id,
+                "could not find index"
+            );
             return Err(IngestServiceError::IndexNotFound {
                 index_id: index_id.to_string(),
             });
         }
-        let disk_usage = self.queues.disk_usage();
+        let disk_used = self.queues.resource_usage().disk_used_bytes;
 
-        if disk_usage > self.disk_limit {
+        if disk_used > self.disk_limit {
             info!("ingestion rejected due to disk limit");
-            return Err(IngestServiceError::RateLimited);
+            return Err(IngestServiceError::RateLimited(RateLimitingCause::WalFull));
         }
 
         if self
@@ -170,7 +176,7 @@ impl IngestApiService {
             .is_err()
         {
             info!("ingest request rejected due to memory limit");
-            return Err(IngestServiceError::RateLimited);
+            return Err(IngestServiceError::RateLimited(RateLimitingCause::WalFull));
         }
         let mut num_docs = 0usize;
         let mut notifications = Vec::new();
@@ -201,10 +207,10 @@ impl IngestApiService {
 
             num_docs += batch_num_docs;
             INGEST_METRICS
-                .ingested_num_bytes
+                .ingested_docs_bytes_valid
                 .inc_by(batch_num_bytes as u64);
             INGEST_METRICS
-                .ingested_num_docs
+                .ingested_docs_valid
                 .inc_by(batch_num_docs as u64);
         }
         // TODO we could fsync here and disable autosync to have better i/o perfs.
@@ -239,8 +245,8 @@ impl IngestApiService {
             .suggest_truncate(&request.index_id, request.up_to_position_included, ctx)
             .await?;
 
-        let memory_usage = self.queues.memory_usage();
-        let new_capacity = self.memory_limit - memory_usage;
+        let memory_used = self.queues.resource_usage().memory_used_bytes;
+        let new_capacity = self.memory_limit - memory_used;
         self.memory_capacity.reset_capacity(new_capacity);
 
         Ok(())
@@ -312,19 +318,27 @@ impl Handler<CreateQueueRequest> for IngestApiService {
 
 #[async_trait]
 impl Handler<CreateQueueIfNotExistsRequest> for IngestApiService {
-    type Reply = crate::Result<()>;
+    type Reply = crate::Result<CreateQueueIfNotExistsResponse>;
     async fn handle(
         &mut self,
         create_queue_inf_req: CreateQueueIfNotExistsRequest,
         ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
         if self.queues.queue_exists(&create_queue_inf_req.queue_id) {
-            return Ok(Ok(()));
+            let response = CreateQueueIfNotExistsResponse {
+                queue_id: create_queue_inf_req.queue_id,
+                created: false,
+            };
+            return Ok(Ok(response));
         }
         Ok(self
             .queues
             .create_queue(&create_queue_inf_req.queue_id, ctx)
-            .await)
+            .await
+            .map(|_| CreateQueueIfNotExistsResponse {
+                queue_id: create_queue_inf_req.queue_id,
+                created: true,
+            }))
     }
 }
 

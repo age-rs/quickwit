@@ -23,7 +23,7 @@ use std::path::Path;
 
 use bytes::Buf;
 use mrecordlog::error::*;
-use mrecordlog::{MultiRecordLog, Record, SyncPolicy};
+use mrecordlog::{MultiRecordLog, PersistAction, PersistPolicy, Record, ResourceUsage};
 use tokio::task::JoinError;
 use tracing::error;
 
@@ -35,7 +35,7 @@ pub struct MultiRecordLogAsync {
 impl MultiRecordLogAsync {
     fn take(&mut self) -> MultiRecordLog {
         let Some(mrecordlog) = self.mrecordlog_opt.take() else {
-            error!("wal is poisoned, aborting process");
+            error!("wal is poisoned (on write), aborting process");
             std::process::abort();
         };
         mrecordlog
@@ -43,23 +43,23 @@ impl MultiRecordLogAsync {
 
     fn mrecordlog_ref(&self) -> &MultiRecordLog {
         let Some(mrecordlog) = &self.mrecordlog_opt else {
-            error!("the mrecordlog is corrupted, aborting process");
+            error!("wal is poisoned (on read), aborting process");
             std::process::abort();
         };
         mrecordlog
     }
 
     pub async fn open(directory_path: &Path) -> Result<Self, ReadRecordError> {
-        Self::open_with_prefs(directory_path, SyncPolicy::OnAppend).await
+        Self::open_with_prefs(directory_path, PersistPolicy::Always(PersistAction::Flush)).await
     }
 
     pub async fn open_with_prefs(
         directory_path: &Path,
-        sync_policy: SyncPolicy,
+        persist_policy: PersistPolicy,
     ) -> Result<Self, ReadRecordError> {
         let directory_path = directory_path.to_path_buf();
         let mrecordlog = tokio::task::spawn(async move {
-            MultiRecordLog::open_with_prefs(&directory_path, sync_policy)
+            MultiRecordLog::open_with_prefs(&directory_path, persist_policy)
         })
         .await
         .map_err(|join_err| {
@@ -126,13 +126,21 @@ impl MultiRecordLogAsync {
 
     #[track_caller]
     #[cfg(test)]
-    pub fn assert_records_eq<R>(&self, queue_id: &str, range: R, expected_records: &[(u64, &str)])
-    where R: RangeBounds<u64> + 'static {
+    pub fn assert_records_eq<R>(
+        &self,
+        queue_id: &str,
+        range: R,
+        expected_records: &[(u64, [u8; 2], &str)],
+    ) where
+        R: RangeBounds<u64> + 'static,
+    {
         let records = self
             .range(queue_id, range)
             .unwrap()
             .map(|Record { position, payload }| {
-                (position, String::from_utf8(payload.into_owned()).unwrap())
+                let header: [u8; 2] = payload[..2].try_into().unwrap();
+                let payload = String::from_utf8(payload[2..].to_vec()).unwrap();
+                (position, header, payload)
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -142,7 +150,7 @@ impl MultiRecordLogAsync {
             expected_records.len(),
             records.len()
         );
-        for ((position, record), (expected_position, expected_record)) in
+        for ((position, header, payload), (expected_position, expected_header, expected_payload)) in
             records.iter().zip(expected_records.iter())
         {
             assert_eq!(
@@ -150,8 +158,12 @@ impl MultiRecordLogAsync {
                 "expected record at position `{expected_position}`, got `{position}`",
             );
             assert_eq!(
-                record, expected_record,
-                "expected record `{expected_record}`, got `{record}`",
+                header, expected_header,
+                "expected record header, `{expected_header:?}`, got `{header:?}`",
+            );
+            assert_eq!(
+                payload, expected_payload,
+                "expected record payload, `{expected_payload}`, got `{payload}`",
             );
         }
     }
@@ -185,11 +197,11 @@ impl MultiRecordLogAsync {
         self.mrecordlog_ref().last_record(queue)
     }
 
-    pub fn memory_usage(&self) -> usize {
-        self.mrecordlog_ref().memory_usage()
+    pub fn resource_usage(&self) -> ResourceUsage {
+        self.mrecordlog_ref().resource_usage()
     }
 
-    pub fn disk_usage(&self) -> usize {
-        self.mrecordlog_ref().disk_usage()
+    pub fn summary(&self) -> mrecordlog::QueuesSummary {
+        self.mrecordlog_ref().summary()
     }
 }
