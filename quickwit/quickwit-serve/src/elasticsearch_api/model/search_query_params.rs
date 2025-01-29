@@ -1,26 +1,21 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-use quickwit_proto::search::SortOrder;
 use quickwit_query::BooleanOperand;
 use quickwit_search::SearchError;
 use serde::{Deserialize, Serialize};
@@ -231,10 +226,16 @@ pub struct DeleteQueryParams {
     pub timeout: Option<String>,
 }
 
+/// Parses a string as if it was a json value string.
+fn parse_str_like_json<T: serde::de::DeserializeOwned>(s: &str) -> Option<T> {
+    let json_value = serde_json::Value::String(s.to_string());
+    serde_json::from_value::<T>(json_value).ok()
+}
+
 // Parse a single sort field parameter from ES sort query string parameter.
 fn parse_sort_field_str(sort_field_str: &str) -> Result<SortField, SearchError> {
     if let Some((field, order_str)) = sort_field_str.split_once(':') {
-        let order = SortOrder::from_str_name(order_str).ok_or_else(|| {
+        let order = parse_str_like_json(order_str).ok_or_else(|| {
             SearchError::InvalidArgument(format!(
                 "invalid sort order `{}`. expected `asc` or `desc`",
                 field
@@ -286,6 +287,11 @@ impl SearchQueryParams {
         })?;
         Ok(Some(duration))
     }
+
+    pub fn allow_partial_search_results(&self) -> bool {
+        // By default, elastic search allows partial results.
+        self.allow_partial_search_results.unwrap_or(true)
+    }
 }
 
 #[doc = "Whether to expand wildcard expression to concrete indices that are open, closed or both."]
@@ -312,14 +318,15 @@ impl FromStr for ExpandWildcards {
         }
     }
 }
-impl ToString for ExpandWildcards {
-    fn to_string(&self) -> String {
-        match &self {
-            Self::Open => "open".to_string(),
-            Self::Closed => "closed".to_string(),
-            Self::Hidden => "hidden".to_string(),
-            Self::None => "none".to_string(),
-            Self::All => "all".to_string(),
+
+impl fmt::Display for ExpandWildcards {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Open => write!(formatter, "open"),
+            Self::Closed => write!(formatter, "closed"),
+            Self::Hidden => write!(formatter, "hidden"),
+            Self::None => write!(formatter, "none"),
+            Self::All => write!(formatter, "all"),
         }
     }
 }
@@ -358,12 +365,59 @@ impl FromStr for SuggestMode {
         }
     }
 }
-impl ToString for SuggestMode {
-    fn to_string(&self) -> String {
-        match &self {
-            Self::Missing => "missing".to_string(),
-            Self::Popular => "popular".to_string(),
-            Self::Always => "always".to_string(),
+
+impl fmt::Display for SuggestMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Missing => write!(formatter, "missing"),
+            Self::Popular => write!(formatter, "popular"),
+            Self::Always => write!(formatter, "always"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use quickwit_proto::search::SortOrder;
+
+    use super::*;
+
+    #[derive(Deserialize, PartialEq, Eq, Debug)]
+    #[serde(rename_all = "snake_case")]
+    enum TestEnum {
+        FirstItem,
+        SecondItem,
+    }
+
+    #[test]
+    fn test_parse_str_like_json() {
+        assert_eq!(
+            parse_str_like_json::<TestEnum>("first_item").unwrap(),
+            TestEnum::FirstItem
+        );
+        assert!(parse_str_like_json::<TestEnum>("FirstItem").is_none());
+    }
+
+    #[test]
+    fn test_sort_order_qs() {
+        let sort_order_qs = parse_sort_field_str("timestamp:desc").unwrap();
+        assert_eq!(
+            sort_order_qs,
+            SortField {
+                field: "timestamp".to_string(),
+                order: SortOrder::Desc,
+                date_format: None
+            }
+        );
+        let sort_order_qs = parse_sort_field_str("timestamp:asc").unwrap();
+        assert_eq!(
+            sort_order_qs,
+            SortField {
+                field: "timestamp".to_string(),
+                order: SortOrder::Asc,
+                date_format: None
+            }
+        );
     }
 }

@@ -1,37 +1,36 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashSet;
+use std::pin::pin;
 use std::str::FromStr;
 
 use clap::{arg, ArgAction, ArgMatches, Command};
+use colored::Colorize;
 use futures::future::select;
 use itertools::Itertools;
 use quickwit_common::runtimes::RuntimesConfig;
 use quickwit_common::uri::{Protocol, Uri};
 use quickwit_config::service::QuickwitService;
 use quickwit_config::NodeConfig;
+use quickwit_serve::tcp_listener::DefaultTcpListenerResolver;
 use quickwit_serve::{serve_quickwit, BuildInfo, EnvFilterReloadFn};
 use quickwit_telemetry::payload::{QuickwitFeature, QuickwitTelemetryInfo, TelemetryEvent};
 use tokio::signal;
 use tracing::{debug, info};
 
+use crate::checklist::{BLUE_COLOR, RED_COLOR};
 use crate::{config_cli_arg, get_resolvers, load_node_config, start_actor_runtimes};
 
 pub fn build_run_command() -> Command {
@@ -50,6 +49,38 @@ pub fn build_run_command() -> Command {
 pub struct RunCliCommand {
     pub config_uri: Uri,
     pub services: Option<HashSet<QuickwitService>>,
+}
+
+async fn listen_interrupt() {
+    async fn ctrl_c() {
+        signal::ctrl_c()
+            .await
+            .expect("registering a signal handler for SIGINT should not fail");
+        // carriage return to hide the ^C echo from the terminal
+        print!("\r");
+    }
+    ctrl_c().await;
+    println!(
+        "{} Graceful shutdown initiated. Waiting for ingested data to be indexed. This may take a \
+         few minutes. Press Ctrl+C again to force shutdown.",
+        "❢".color(BLUE_COLOR)
+    );
+    tokio::spawn(async {
+        ctrl_c().await;
+        println!(
+            "{} Quickwit was forcefully shut down. Some data might not have been indexed.",
+            "✘".color(RED_COLOR)
+        );
+        std::process::exit(1);
+    });
+}
+
+async fn listen_sigterm() {
+    signal::unix::signal(signal::unix::SignalKind::terminate())
+        .expect("registering a signal handler for SIGTERM should not fail")
+        .recv()
+        .await;
+    info!("SIGTERM received");
 }
 
 impl RunCliCommand {
@@ -85,7 +116,7 @@ impl RunCliCommand {
 
         if let Some(services) = &self.services {
             info!(services = %services.iter().join(", "), "setting services from override");
-            node_config.enabled_services = services.clone();
+            node_config.enabled_services.clone_from(services);
         }
         let telemetry_handle_opt =
             quickwit_telemetry::start_telemetry_loop(quickwit_telemetry_info(&node_config));
@@ -94,26 +125,14 @@ impl RunCliCommand {
         let runtimes_config = RuntimesConfig::default();
         start_actor_runtimes(runtimes_config, &node_config.enabled_services)?;
         let shutdown_signal = Box::pin(async {
-            select(
-                Box::pin(async {
-                    signal::ctrl_c()
-                        .await
-                        .expect("registering a signal handler for SIGINT should not fail");
-                }),
-                Box::pin(async {
-                    signal::unix::signal(signal::unix::SignalKind::terminate())
-                        .expect("registering a signal handler for SIGTERM should not fail")
-                        .recv()
-                        .await;
-                }),
-            )
-            .await;
+            select(pin!(listen_interrupt()), pin!(listen_sigterm())).await;
         });
         let serve_result = serve_quickwit(
             node_config,
             runtimes_config,
             metastore_resolver,
             storage_resolver,
+            DefaultTcpListenerResolver,
             shutdown_signal,
             env_filter_reload_fn,
         )
@@ -127,6 +146,7 @@ impl RunCliCommand {
             telemetry_handle.terminate_telemetry().await;
         }
         serve_result?;
+        info!("quickwit successfully terminated");
         Ok(())
     }
 }

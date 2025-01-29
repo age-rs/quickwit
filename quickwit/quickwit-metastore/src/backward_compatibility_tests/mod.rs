@@ -1,27 +1,22 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Context};
-use quickwit_config::TestableForRegression;
+use quickwit_config::{IndexConfig, IndexTemplate, SourceConfig, TestableForRegression};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -46,7 +41,7 @@ use crate::{IndexMetadata, SplitMetadata};
 ///     #[serde(rename="0.2")]
 ///     V0_2(MyResourceV1) //< there was no change in this version.
 /// }
-const GLOBAL_QUICKWIT_RESOURCE_VERSION: &str = "0.7";
+const GLOBAL_QUICKWIT_RESOURCE_VERSION: &str = "0.9";
 
 /// This test makes sure that the resource is using the current `GLOBAL_QUICKWIT_RESOURCE_VERSION`.
 fn test_global_version<T: Serialize>(serializable: &T) -> anyhow::Result<()> {
@@ -192,15 +187,17 @@ where for<'a> T: Serialize {
 /// for JSON deserialization regression tests and runs them sequentially.
 ///
 /// - `test_name` is just the subdirectory name, for the type being test.
-/// - `test` is a function asserting the equality of the deserialized version
-/// and the expected version.
+/// - `test` is a function asserting the equality of the deserialized version and the expected
+///   version.
 pub(crate) fn test_json_backward_compatibility_helper<T>(test_name: &str) -> anyhow::Result<()>
 where T: TestableForRegression + std::fmt::Debug {
     let sample_instance: T = T::sample_for_regression();
+    test_global_version(&sample_instance).unwrap();
+
     let test_dir = Path::new("test-data").join(test_name);
-    test_global_version(&sample_instance).context("version is not the global version")?;
     test_backward_compatibility::<T>(&test_dir).context("backward-compatibility")?;
     test_and_update_expected_files::<T>(&test_dir).context("test-and-update")?;
+
     test_and_create_new_test::<T>(&test_dir, sample_instance)
         .context("test-and-create-new-test")?;
     Ok(())
@@ -217,6 +214,18 @@ fn test_index_metadata_backward_compatibility() {
 }
 
 #[test]
+fn test_index_config_global_version() {
+    let sample_instance = IndexConfig::sample_for_regression();
+    test_global_version(&sample_instance).unwrap();
+}
+
+#[test]
+fn test_source_config_global_version() {
+    let sample_instance = SourceConfig::sample_for_regression();
+    test_global_version(&sample_instance).unwrap();
+}
+
+#[test]
 fn test_file_backed_index_backward_compatibility() {
     test_json_backward_compatibility_helper::<FileBackedIndex>("file-backed-index").unwrap();
 }
@@ -224,4 +233,10 @@ fn test_file_backed_index_backward_compatibility() {
 #[test]
 fn test_file_backed_metastore_manifest_backward_compatibility() {
     test_json_backward_compatibility_helper::<Manifest>("manifest").unwrap();
+}
+
+#[test]
+fn test_index_template_global_version() {
+    let sample_instance = IndexTemplate::sample_for_regression();
+    test_global_version(&sample_instance).unwrap();
 }

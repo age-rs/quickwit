@@ -4,7 +4,7 @@
 
 1. Describe your service in a proto file.
 
-2. Define an error and a result type for your service. The error type must implement `From<tonic::Status>` and `Into<tonic::Status>`.
+2. Define an error and a result type for your service. The error type must implement `quickwit_proto::error::GrpcServiceError` and have at least the three following variants: `Internal`, `Timeout`, and `Unavailable`.
 
 3. Add the following dependencies to your project:
 
@@ -13,7 +13,6 @@
 async-trait = { workspace = true }
 bytes = { workspace = true }
 bytesize = { workspace = true }
-dyn-clone = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }
 prost = { workspace = true }
@@ -25,6 +24,7 @@ tower = { workspace = true }
 utoipa = { workspace = true }
 
 quickwit-actors = { workspace = true }
+quickwit-proto = { workspace = true }
 
 [dev-dependencies]
 mockall = { workspace = true }

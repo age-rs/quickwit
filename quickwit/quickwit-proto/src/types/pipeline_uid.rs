@@ -1,33 +1,29 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
+use serde::de::Error;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-/// The size of a ULID in bytes.
-pub(crate) const ULID_SIZE: usize = 16;
+use super::ULID_SIZE;
 
-/// A pipeline uid identify an indexing pipeline and an indexing task.
+/// A pipeline UID identifies an indexing pipeline and an indexing task.
 #[derive(Clone, Copy, Default, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct PipelineUid(Ulid);
 
@@ -44,13 +40,14 @@ impl Display for PipelineUid {
 }
 
 impl PipelineUid {
-    pub fn from_u128(ulid_u128: u128) -> PipelineUid {
-        PipelineUid(Ulid::from_bytes(ulid_u128.to_le_bytes()))
+    /// Creates a new random pipeline UID.
+    pub fn random() -> Self {
+        Self(Ulid::new())
     }
 
-    /// Creates a new random pipeline uid.
-    pub fn new() -> Self {
-        Self(Ulid::new())
+    #[cfg(any(test, feature = "testsuite"))]
+    pub fn for_test(ulid_u128: u128) -> PipelineUid {
+        Self(Ulid::from(ulid_u128))
     }
 }
 
@@ -59,7 +56,7 @@ impl FromStr for PipelineUid {
 
     fn from_str(pipeline_uid_str: &str) -> Result<PipelineUid, Self::Err> {
         let pipeline_ulid =
-            Ulid::from_string(pipeline_uid_str).map_err(|_| "invalid pipeline uid")?;
+            Ulid::from_string(pipeline_uid_str).map_err(|_| "invalid pipeline UID")?;
         Ok(PipelineUid(pipeline_ulid))
     }
 }
@@ -72,9 +69,8 @@ impl Serialize for PipelineUid {
 
 impl<'de> Deserialize<'de> for PipelineUid {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let ulid_str = String::deserialize(deserializer)?;
-        let ulid = Ulid::from_string(&ulid_str)
-            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let ulid_str: Cow<'de, str> = Cow::deserialize(deserializer)?;
+        let ulid = Ulid::from_string(&ulid_str).map_err(D::Error::custom)?;
         Ok(Self(ulid))
     }
 }
@@ -153,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_uid_prost_serde_roundtrip() {
-        let pipeline_uid = PipelineUid::new();
+        let pipeline_uid = PipelineUid::random();
 
         let encoded = pipeline_uid.encode_to_vec();
         assert_eq!(

@@ -1,29 +1,23 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 
 use itertools::Itertools;
-use quickwit_doc_mapper::{BinaryFormat, FieldMappingType};
 use quickwit_proto::ingest::Shard;
 use quickwit_proto::metastore::SourceType;
-use quickwit_proto::types::SourceId;
+use quickwit_proto::types::{DocMappingUid, SourceId};
 use serde::{Deserialize, Serialize};
 
 use super::shards::Shards;
@@ -34,30 +28,38 @@ use crate::{IndexMetadata, Split};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "version")]
 pub(crate) enum VersionedFileBackedIndex {
-    #[serde(rename = "0.7")]
+    #[serde(rename = "0.9")]
+    V0_9(FileBackedIndexV0_8),
     // Retro compatibility.
-    #[serde(alias = "0.6")]
-    #[serde(alias = "0.5")]
-    #[serde(alias = "0.4")]
-    V0_7(FileBackedIndexV0_7),
+    #[serde(alias = "0.8")]
+    #[serde(alias = "0.7")]
+    V0_8(FileBackedIndexV0_8),
 }
 
 impl From<FileBackedIndex> for VersionedFileBackedIndex {
     fn from(index: FileBackedIndex) -> Self {
-        VersionedFileBackedIndex::V0_7(index.into())
+        VersionedFileBackedIndex::V0_9(index.into())
     }
 }
 
 impl From<VersionedFileBackedIndex> for FileBackedIndex {
     fn from(index: VersionedFileBackedIndex) -> Self {
         match index {
-            VersionedFileBackedIndex::V0_7(v0_6) => v0_6.into(),
+            VersionedFileBackedIndex::V0_8(mut v0_8) => {
+                for shards in v0_8.shards.values_mut() {
+                    for shard in shards {
+                        shard.doc_mapping_uid = Some(DocMappingUid::default());
+                    }
+                }
+                v0_8.into()
+            }
+            VersionedFileBackedIndex::V0_9(v0_8) => v0_8.into(),
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct FileBackedIndexV0_7 {
+pub(crate) struct FileBackedIndexV0_8 {
     #[serde(rename = "index")]
     metadata: IndexMetadata,
     splits: Vec<Split>,
@@ -68,7 +70,7 @@ pub(crate) struct FileBackedIndexV0_7 {
     delete_tasks: Vec<DeleteTask>,
 }
 
-impl From<FileBackedIndex> for FileBackedIndexV0_7 {
+impl From<FileBackedIndex> for FileBackedIndexV0_8 {
     fn from(index: FileBackedIndex) -> Self {
         let splits = index
             .splits
@@ -104,36 +106,8 @@ impl From<FileBackedIndex> for FileBackedIndexV0_7 {
     }
 }
 
-impl From<FileBackedIndexV0_7> for FileBackedIndex {
-    fn from(mut index: FileBackedIndexV0_7) -> Self {
-        // if the index is otel-traces-v0_6, convert set bytes fields input and output format to hex
-        // to be compatible with the v0_6 version.
-        // TODO: remove after 0.8 release.
-        if index.metadata.index_id() == "otel-traces-v0_6" {
-            index
-                .metadata
-                .index_config
-                .doc_mapping
-                .field_mappings
-                .iter_mut()
-                .filter(|field_mapping| {
-                    field_mapping.name == "trace_id" || field_mapping.name == "span_id"
-                })
-                .for_each(|field_mapping| {
-                    if let FieldMappingType::Bytes(bytes_options, _) =
-                        &mut field_mapping.mapping_type
-                    {
-                        bytes_options.input_format = BinaryFormat::Hex;
-                        bytes_options.output_format = BinaryFormat::Hex;
-                    }
-                });
-        }
-        // Override split index_id to support old SplitMetadata format.
-        for split in index.splits.iter_mut() {
-            if split.split_metadata.index_uid.is_empty() {
-                split.split_metadata.index_uid = index.metadata.index_uid.clone();
-            }
-        }
+impl From<FileBackedIndexV0_8> for FileBackedIndex {
+    fn from(index: FileBackedIndexV0_8) -> Self {
         let mut per_source_shards: HashMap<SourceId, Shards> = index
             .shards
             .into_iter()

@@ -1,45 +1,44 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
+use std::error::Error;
 use std::sync::Arc;
 
 use bytesize::ByteSize;
 use quickwit_cluster::cluster_grpc_server;
 use quickwit_common::tower::BoxFutureInfaillible;
 use quickwit_config::service::QuickwitService;
+use quickwit_proto::developer::DeveloperServiceClient;
 use quickwit_proto::indexing::IndexingServiceClient;
 use quickwit_proto::jaeger::storage::v1::span_reader_plugin_server::SpanReaderPluginServer;
 use quickwit_proto::opentelemetry::proto::collector::logs::v1::logs_service_server::LogsServiceServer;
 use quickwit_proto::opentelemetry::proto::collector::trace::v1::trace_service_server::TraceServiceServer;
 use quickwit_proto::search::search_service_server::SearchServiceServer;
 use quickwit_proto::tonic::codegen::CompressionEncoding;
+use quickwit_proto::tonic::transport::server::TcpIncoming;
 use quickwit_proto::tonic::transport::Server;
+use tokio::net::TcpListener;
 use tracing::*;
 
+use crate::developer_api::DeveloperApiServer;
 use crate::search_api::GrpcSearchAdapter;
 use crate::{QuickwitServices, INDEXING_GRPC_SERVER_METRICS_LAYER};
 
 /// Starts and binds gRPC services to `grpc_listen_addr`.
 pub(crate) async fn start_grpc_server(
-    grpc_listen_addr: SocketAddr,
+    tcp_listener: TcpListener,
     max_message_size: ByteSize,
     services: Arc<QuickwitServices>,
     readiness_trigger: BoxFutureInfaillible<()>,
@@ -89,26 +88,22 @@ pub(crate) async fn start_grpc_server(
         .is_service_enabled(QuickwitService::Indexer)
     {
         enabled_grpc_services.insert("ingest-router");
-        Some(
-            services
-                .ingest_router_service
-                .as_grpc_service(max_message_size),
-        )
+
+        let ingest_router_service = services
+            .ingest_router_service
+            .as_grpc_service(max_message_size);
+        Some(ingest_router_service)
     } else {
         None
     };
-    let ingester_grpc_service = if services
-        .node_config
-        .is_service_enabled(QuickwitService::Indexer)
-    {
+
+    let ingester_grpc_service = if let Some(ingester_service) = services.ingester_service() {
         enabled_grpc_services.insert("ingester");
-        services
-            .ingester_service_opt
-            .as_ref()
-            .map(|ingester_service| ingester_service.as_grpc_service(max_message_size))
+        Some(ingester_service.as_grpc_service(max_message_size))
     } else {
         None
     };
+
     // Mount gRPC control plane service if `QuickwitService::ControlPlane` is enabled on node.
     let control_plane_grpc_service = if services
         .node_config
@@ -117,7 +112,7 @@ pub(crate) async fn start_grpc_server(
         enabled_grpc_services.insert("control-plane");
         Some(
             services
-                .control_plane_service
+                .control_plane_client
                 .as_grpc_service(max_message_size),
         )
     } else {
@@ -166,8 +161,17 @@ pub(crate) async fn start_grpc_server(
     } else {
         None
     };
+    let developer_grpc_service = {
+        enabled_grpc_services.insert("developer");
+
+        let developer_service = DeveloperApiServer::from_services(&services);
+
+        DeveloperServiceClient::new(developer_service)
+            .as_grpc_service(DeveloperApiServer::MAX_GRPC_MESSAGE_SIZE)
+    };
     let server_router = server
         .add_service(cluster_grpc_service)
+        .add_service(developer_grpc_service)
         .add_optional_service(control_plane_grpc_service)
         .add_optional_service(indexing_grpc_service)
         .add_optional_service(ingest_api_grpc_service)
@@ -179,12 +183,16 @@ pub(crate) async fn start_grpc_server(
         .add_optional_service(otlp_trace_grpc_service)
         .add_optional_service(search_grpc_service);
 
+    let grpc_listen_addr = tcp_listener.local_addr()?;
     info!(
         enabled_grpc_services=?enabled_grpc_services,
         grpc_listen_addr=?grpc_listen_addr,
-        "Starting gRPC server listening on {grpc_listen_addr}."
+        "starting gRPC server listening on {grpc_listen_addr}"
     );
-    let serve_fut = server_router.serve_with_shutdown(grpc_listen_addr, shutdown_signal);
+    // nodelay=true and keepalive=None are the default values for Server::builder()
+    let tcp_incoming = TcpIncoming::from_listener(tcp_listener, true, None)
+        .map_err(|err: Box<dyn Error + Send + Sync>| anyhow::anyhow!(err))?;
+    let serve_fut = server_router.serve_with_incoming_shutdown(tcp_incoming, shutdown_signal);
     let (serve_res, _trigger_res) = tokio::join!(serve_fut, readiness_trigger);
     serve_res?;
     Ok(())

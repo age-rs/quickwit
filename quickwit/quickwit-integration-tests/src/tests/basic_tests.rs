@@ -1,58 +1,37 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::str::FromStr;
 use std::time::Duration;
 
 use hyper::{Body, Method, Request, StatusCode};
 use quickwit_config::service::QuickwitService;
-use quickwit_rest_client::models::IngestSource;
-use quickwit_rest_client::rest_client::CommitType;
 use quickwit_serve::SearchRequestQueryString;
 
-use crate::test_utils::{ingest_with_retry, ClusterSandbox};
-
-fn get_ndjson_filepath(ndjson_dataset_filename: &str) -> String {
-    format!(
-        "{}/resources/tests/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        ndjson_dataset_filename
-    )
-}
+use crate::test_utils::ClusterSandboxBuilder;
 
 #[tokio::test]
 async fn test_ui_redirect_on_get() {
     quickwit_common::setup_logging_for_tests();
-    let sandbox = ClusterSandbox::start_standalone_node().await.unwrap();
+    let sandbox = ClusterSandboxBuilder::build_and_start_standalone().await;
     let node_config = sandbox.node_configs.first().unwrap();
     let client = hyper::Client::builder()
         .pool_idle_timeout(Duration::from_secs(30))
         .http2_only(true)
         .build_http();
-    let root_uri = format!(
-        "http://{}/",
-        node_config.node_config.rest_config.listen_addr
-    )
-    .parse::<hyper::Uri>()
-    .unwrap();
+    let root_uri = format!("http://{}/", node_config.0.rest_config.listen_addr)
+        .parse::<hyper::Uri>()
+        .unwrap();
     let response = client.get(root_uri.clone()).await.unwrap();
     assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
     let post_request = Request::builder()
@@ -68,11 +47,11 @@ async fn test_ui_redirect_on_get() {
 #[tokio::test]
 async fn test_standalone_server() {
     quickwit_common::setup_logging_for_tests();
-    let sandbox = ClusterSandbox::start_standalone_node().await.unwrap();
+    let sandbox = ClusterSandboxBuilder::build_and_start_standalone().await;
     {
         // The indexing service should be running.
         let counters = sandbox
-            .indexer_rest_client
+            .rest_client(QuickwitService::Indexer)
             .node_stats()
             .indexing()
             .await
@@ -83,11 +62,11 @@ async fn test_standalone_server() {
     {
         // Create an dynamic index.
         sandbox
-            .indexer_rest_client
+            .rest_client(QuickwitService::Indexer)
             .indexes()
             .create(
                 r#"
-                version: 0.7
+                version: 0.8
                 index_id: my-new-index
                 doc_mapping:
                   field_mappings:
@@ -103,7 +82,7 @@ async fn test_standalone_server() {
         // Index should be searchable
         assert_eq!(
             sandbox
-                .indexer_rest_client
+                .rest_client(QuickwitService::Indexer)
                 .search(
                     "my-new-index",
                     SearchRequestQueryString {
@@ -125,38 +104,21 @@ async fn test_standalone_server() {
 #[tokio::test]
 async fn test_multi_nodes_cluster() {
     quickwit_common::setup_logging_for_tests();
-    let nodes_services = vec![
-        HashSet::from_iter([QuickwitService::Searcher]),
-        HashSet::from_iter([QuickwitService::Metastore]),
-        HashSet::from_iter([QuickwitService::Indexer]),
-        HashSet::from_iter([QuickwitService::ControlPlane]),
-        HashSet::from_iter([QuickwitService::Janitor]),
-    ];
-    let sandbox = ClusterSandbox::start_cluster_nodes(&nodes_services)
-        .await
-        .unwrap();
-    sandbox.wait_for_cluster_num_ready_nodes(5).await.unwrap();
+    let sandbox = ClusterSandboxBuilder::default()
+        .add_node([QuickwitService::Searcher])
+        .add_node([QuickwitService::Metastore])
+        .add_node([QuickwitService::Indexer])
+        .add_node([QuickwitService::ControlPlane])
+        .add_node([QuickwitService::Janitor])
+        .build_and_start()
+        .await;
 
-    {
-        // Wait for indexer to fully start.
-        // The starting time is a bit long for a cluster.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let indexing_service_counters = sandbox
-            .indexer_rest_client
-            .node_stats()
-            .indexing()
-            .await
-            .unwrap();
-        assert_eq!(indexing_service_counters.num_running_pipelines, 0);
-    }
-
-    // Create index
     sandbox
-        .indexer_rest_client
+        .rest_client(QuickwitService::Indexer)
         .indexes()
         .create(
             r#"
-            version: 0.7
+            version: 0.8
             index_id: my-new-multi-node-index
             doc_mapping:
               field_mappings:
@@ -170,19 +132,20 @@ async fn test_multi_nodes_cluster() {
         )
         .await
         .unwrap();
+
     assert!(sandbox
-        .indexer_rest_client
+        .rest_client(QuickwitService::Indexer)
         .node_health()
         .is_live()
         .await
         .unwrap());
 
-    // Wait until indexing pipelines are started.
+    // Assert that at least 1 indexing pipelines is successfully started
     sandbox.wait_for_indexing_pipelines(1).await.unwrap();
 
-    // Check search is working.
+    // Check that search is working
     let search_response_empty = sandbox
-        .searcher_rest_client
+        .rest_client(QuickwitService::Searcher)
         .search(
             "my-new-multi-node-index",
             SearchRequestQueryString {
@@ -194,30 +157,5 @@ async fn test_multi_nodes_cluster() {
         .unwrap();
     assert_eq!(search_response_empty.num_hits, 0);
 
-    // Check that ingest request send to searcher is forwarded to indexer and thus indexed.
-    let ndjson_filepath = get_ndjson_filepath("documents_to_ingest.json");
-    let ingest_source = IngestSource::File(PathBuf::from_str(&ndjson_filepath).unwrap());
-    ingest_with_retry(
-        &sandbox.searcher_rest_client,
-        "my-new-multi-node-index",
-        ingest_source,
-        CommitType::Auto,
-    )
-    .await
-    .unwrap();
-    // Wait until split is commited and search.
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    let search_response_one_hit = sandbox
-        .searcher_rest_client
-        .search(
-            "my-new-multi-node-index",
-            SearchRequestQueryString {
-                query: "body:bar".to_string(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(search_response_one_hit.num_hits, 1);
     sandbox.shutdown().await.unwrap();
 }

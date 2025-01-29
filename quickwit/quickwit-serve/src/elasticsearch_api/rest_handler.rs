@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 use std::str::from_utf8;
@@ -24,10 +19,11 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use elasticsearch_dsl::search::{Hit as ElasticHit, SearchResponse as ElasticsearchResponse};
-use elasticsearch_dsl::{HitsMetadata, Source, TotalHits, TotalHitsRelation};
+use elasticsearch_dsl::{HitsMetadata, ShardStatistics, Source, TotalHits, TotalHitsRelation};
 use futures_util::StreamExt;
 use hyper::StatusCode;
 use itertools::Itertools;
+use quickwit_cluster::Cluster;
 use quickwit_common::truncate_str;
 use quickwit_config::{validate_index_id_pattern, NodeConfig};
 use quickwit_index_management::IndexService;
@@ -38,24 +34,26 @@ use quickwit_proto::search::{
     SortDatetimeFormat,
 };
 use quickwit_proto::types::IndexUid;
-use quickwit_proto::ServiceErrorCode;
 use quickwit_query::query_ast::{BoolQuery, QueryAst, UserInputQuery};
 use quickwit_query::BooleanOperand;
 use quickwit_search::{list_all_splits, resolve_index_patterns, SearchError, SearchService};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use warp::reply::with_status;
 use warp::{Filter, Rejection};
 
 use super::filter::{
-    elastic_cat_indices_filter, elastic_cluster_info_filter, elastic_delete_index_filter,
-    elastic_field_capabilities_filter, elastic_index_cat_indices_filter,
-    elastic_index_count_filter, elastic_index_field_capabilities_filter,
-    elastic_index_search_filter, elastic_index_stats_filter, elastic_multi_search_filter,
+    elastic_cat_indices_filter, elastic_cluster_health_filter, elastic_cluster_info_filter,
+    elastic_delete_index_filter, elastic_field_capabilities_filter,
+    elastic_index_cat_indices_filter, elastic_index_count_filter,
+    elastic_index_field_capabilities_filter, elastic_index_search_filter,
+    elastic_index_stats_filter, elastic_multi_search_filter, elastic_resolve_index_filter,
     elastic_scroll_filter, elastic_stats_filter, elasticsearch_filter,
 };
 use super::model::{
     build_list_field_request_for_es_api, convert_to_es_field_capabilities_response,
     CatIndexQueryParams, DeleteQueryParams, ElasticsearchCatIndexResponse, ElasticsearchError,
+    ElasticsearchResolveIndexEntryResponse, ElasticsearchResolveIndexResponse,
     ElasticsearchStatsResponse, FieldCapabilityQueryParams, FieldCapabilityRequestBody,
     FieldCapabilityResponse, MultiSearchHeader, MultiSearchQueryParams, MultiSearchResponse,
     MultiSearchSingleResponse, ScrollQueryParams, SearchBody, SearchQueryParams,
@@ -63,7 +61,8 @@ use super::model::{
 };
 use super::{make_elastic_api_response, TrackTotalHits};
 use crate::format::BodyFormat;
-use crate::rest_api_response::{into_rest_api_response, RestApiError, RestApiResponse};
+use crate::rest::recover_fn;
+use crate::rest_api_response::{RestApiError, RestApiResponse};
 use crate::{with_arg, BuildInfo};
 
 /// Elastic compatible cluster info handler.
@@ -88,22 +87,29 @@ pub fn es_compat_cluster_info_handler(
                 }))
             },
         )
+        .boxed()
 }
 
 /// GET or POST _elastic/_search
 pub fn es_compat_search_handler(
     _search_service: Arc<dyn SearchService>,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
-    elasticsearch_filter().then(|_params: SearchQueryParams| async move {
-        // TODO
-        let api_error = RestApiError {
-            service_code: ServiceErrorCode::NotSupportedYet,
-            message: "_elastic/_search is not supported yet. Please try the index search endpoint \
-                      (_elastic/{index}/search)"
-                .to_string(),
-        };
-        into_rest_api_response::<(), _>(Err(api_error), BodyFormat::default())
-    })
+    elasticsearch_filter()
+        .then(|_params: SearchQueryParams| async move {
+            // TODO
+            let api_error = RestApiError {
+                status_code: StatusCode::NOT_IMPLEMENTED,
+                message: "_elastic/_search is not supported yet. Please try the index search \
+                          endpoint (_elastic/{index}/search)"
+                    .to_string(),
+            };
+            RestApiResponse::new::<(), _>(
+                &Err(api_error),
+                StatusCode::NOT_IMPLEMENTED,
+                BodyFormat::default(),
+            )
+        })
+        .recover(recover_fn)
 }
 
 /// GET or POST _elastic/{index}/_field_caps
@@ -116,6 +122,7 @@ pub fn es_compat_index_field_capabilities_handler(
         .and(with_arg(search_service))
         .then(es_compat_index_field_capabilities)
         .map(|result| make_elastic_api_response(result, BodyFormat::default()))
+        .recover(recover_fn)
 }
 
 /// DELETE _elastic/{index}
@@ -126,46 +133,117 @@ pub fn es_compat_delete_index_handler(
         .and(with_arg(index_service))
         .then(es_compat_delete_index)
         .map(|result| make_elastic_api_response(result, BodyFormat::default()))
+        .boxed()
 }
 
 /// GET _elastic/_stats
 pub fn es_compat_stats_handler(
-    search_service: MetastoreServiceClient,
+    metastore_service: MetastoreServiceClient,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     elastic_stats_filter()
-        .and(with_arg(search_service))
+        .and(with_arg(metastore_service))
         .then(es_compat_stats)
         .map(|result| make_elastic_api_response(result, BodyFormat::default()))
+        .recover(recover_fn)
+        .boxed()
+}
+
+/// Check if the parameter is a known query parameter to reject
+fn is_unsuppported_qp(param: &str) -> bool {
+    ["wait_for_status", "timeout", "level"].contains(&param)
+}
+
+/// GET _elastic/_cluster/health
+pub fn es_compat_cluster_health_handler(
+    cluster: Cluster,
+) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
+    elastic_cluster_health_filter()
+        .and(warp::query::<HashMap<String, String>>())
+        .and(with_arg(cluster))
+        .then(es_compat_cluster_health)
+        .recover(recover_fn)
+}
+
+#[utoipa::path(
+    get,
+    tag = "Node Health",
+    path = "/_elastic/_cluster/health",
+    responses(
+        (status = 200, description = "The cluster is healthy.", body = bool),
+        (status = 503, description = "The cluster is unhealthy.", body = bool),
+    ),
+)]
+/// Get Node Liveliness
+async fn es_compat_cluster_health(
+    query_params: HashMap<String, String>,
+    cluster: Cluster,
+) -> impl warp::Reply {
+    if let Some(invalid_param) = query_params.keys().find(|key| is_unsuppported_qp(key)) {
+        let error_body = warp::reply::json(&json!({
+            "error": "Unsupported parameter.",
+            "param": invalid_param
+        }));
+        return with_status(error_body, StatusCode::BAD_REQUEST);
+    }
+    let is_ready = cluster.is_self_node_ready().await;
+    if is_ready {
+        with_status(
+            warp::reply::json(&json!({"status": "green"})),
+            StatusCode::OK,
+        )
+    } else {
+        with_status(
+            warp::reply::json(&json!({"status": "red"})),
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    }
 }
 
 /// GET _elastic/{index}/_stats
 pub fn es_compat_index_stats_handler(
-    search_service: MetastoreServiceClient,
+    metastore_service: MetastoreServiceClient,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     elastic_index_stats_filter()
-        .and(with_arg(search_service))
+        .and(with_arg(metastore_service))
         .then(es_compat_index_stats)
         .map(|result| make_elastic_api_response(result, BodyFormat::default()))
+        .recover(recover_fn)
+        .boxed()
 }
 
 /// GET _elastic/_cat/indices
 pub fn es_compat_cat_indices_handler(
-    search_service: MetastoreServiceClient,
+    metastore_service: MetastoreServiceClient,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     elastic_cat_indices_filter()
-        .and(with_arg(search_service))
+        .and(with_arg(metastore_service))
         .then(es_compat_cat_indices)
         .map(|result| make_elastic_api_response(result, BodyFormat::default()))
+        .recover(recover_fn)
+        .boxed()
 }
 
 /// GET _elastic/_cat/indices/{index}
 pub fn es_compat_index_cat_indices_handler(
-    search_service: MetastoreServiceClient,
+    metastore_service: MetastoreServiceClient,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     elastic_index_cat_indices_filter()
-        .and(with_arg(search_service))
+        .and(with_arg(metastore_service))
         .then(es_compat_index_cat_indices)
         .map(|result| make_elastic_api_response(result, BodyFormat::default()))
+        .recover(recover_fn)
+        .boxed()
+}
+
+/// GET  _elastic/_resolve/index/{index}
+pub fn es_compat_resolve_index_handler(
+    metastore_service: MetastoreServiceClient,
+) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
+    elastic_resolve_index_filter()
+        .and(with_arg(metastore_service))
+        .then(es_compat_resolve_index)
+        .map(|result| make_elastic_api_response(result, BodyFormat::default()))
+        .boxed()
 }
 
 /// GET or POST _elastic/{index}/_search
@@ -176,6 +254,8 @@ pub fn es_compat_index_search_handler(
         .and(with_arg(search_service))
         .then(es_compat_index_search)
         .map(|result| make_elastic_api_response(result, BodyFormat::default()))
+        .recover(recover_fn)
+        .boxed()
 }
 
 /// GET or POST _elastic/{index}/_count
@@ -186,9 +266,11 @@ pub fn es_compat_index_count_handler(
         .and(with_arg(search_service))
         .then(es_compat_index_count)
         .map(|result| make_elastic_api_response(result, BodyFormat::default()))
+        .recover(recover_fn)
+        .boxed()
 }
 
-/// POST _elastic/_search
+/// POST _elastic/_msearch
 pub fn es_compat_index_multi_search_handler(
     search_service: Arc<dyn SearchService>,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
@@ -200,8 +282,10 @@ pub fn es_compat_index_multi_search_handler(
                 Ok(_) => StatusCode::OK,
                 Err(err) => err.status,
             };
-            RestApiResponse::new(&result, status_code, &BodyFormat::default())
+            RestApiResponse::new(&result, status_code, BodyFormat::default())
         })
+        .recover(recover_fn)
+        .boxed()
 }
 
 /// GET or POST _elastic/_search/scroll
@@ -212,6 +296,8 @@ pub fn es_compat_scroll_handler(
         .and(with_arg(search_service))
         .then(es_scroll)
         .map(|result| make_elastic_api_response(result, BodyFormat::default()))
+        .recover(recover_fn)
+        .boxed()
 }
 
 fn build_request_for_es_api(
@@ -227,6 +313,7 @@ fn build_request_for_es_api(
             user_text: q.to_string(),
             default_fields: None,
             default_operator,
+            lenient: false,
         };
         user_text_query.into()
     } else if let Some(query_dsl) = search_body.query {
@@ -245,6 +332,7 @@ fn build_request_for_es_api(
                     user_text: query.to_string(),
                     default_fields: None,
                     default_operator,
+                    lenient: false,
                 };
                 QueryAst::UserInput(user_text_query)
             })
@@ -255,6 +343,7 @@ fn build_request_for_es_api(
             must_not: Vec::new(),
             should: Vec::new(),
             filter: queries,
+            minimum_should_match: None,
         });
     }
 
@@ -266,7 +355,10 @@ fn build_request_for_es_api(
 
     let max_hits = search_params.size.or(search_body.size).unwrap_or(10);
     let start_offset = search_params.from.or(search_body.from).unwrap_or(0);
-    let count_hits = match search_params.track_total_hits {
+    let count_hits = match search_params
+        .track_total_hits
+        .or(search_body.track_total_hits)
+    {
         None => CountHits::Underestimate,
         Some(TrackTotalHits::Track(false)) => CountHits::Underestimate,
         Some(TrackTotalHits::Count(count)) if count <= max_hits as i64 => CountHits::Underestimate,
@@ -335,6 +427,7 @@ fn partial_hit_from_search_after_param(
         return Err(ElasticsearchError::new(
             StatusCode::BAD_REQUEST,
             "sort and search_after are of different length".to_string(),
+            None,
         ));
     }
     let mut parsed_search_after = PartialHit::default();
@@ -348,6 +441,7 @@ fn partial_hit_from_search_after_param(
                             "invalid search_after doc id, must be of form \
                              `{split_id}:{segment_id: u32}:{doc_id: u32}`"
                                 .to_string(),
+                            None,
                         )
                     })?;
                 parsed_search_after.split_id = address.split;
@@ -358,6 +452,7 @@ fn partial_hit_from_search_after_param(
                 return Err(ElasticsearchError::new(
                     StatusCode::BAD_REQUEST,
                     "search_after doc id must be of string type".to_string(),
+                    None,
                 ));
             }
         } else {
@@ -365,6 +460,7 @@ fn partial_hit_from_search_after_param(
                 ElasticsearchError::new(
                     StatusCode::BAD_REQUEST,
                     "invalid search_after field value, expect bool, number or string".to_string(),
+                    None,
                 )
             })?;
             // TODO make cleaner once we support Vec
@@ -405,9 +501,16 @@ async fn es_compat_index_search(
     search_body: SearchBody,
     search_service: Arc<dyn SearchService>,
 ) -> Result<ElasticsearchResponse, ElasticsearchError> {
+    if search_params.scroll.is_some() && !search_params.allow_partial_search_results() {
+        return Err(ElasticsearchError::from(SearchError::InvalidArgument(
+            "Quickwit only supports scroll API with allow_partial_search_results set to true"
+                .to_string(),
+        )));
+    }
     let _source_excludes = search_params._source_excludes.clone();
     let _source_includes = search_params._source_includes.clone();
     let start_instant = Instant::now();
+    let allow_partial_search_results = search_params.allow_partial_search_results();
     let (search_request, append_shard_doc) =
         build_request_for_es_api(index_id_patterns, search_params, search_body)?;
     let search_response: SearchResponse = search_service.root_search(search_request).await?;
@@ -417,7 +520,8 @@ async fn es_compat_index_search(
         append_shard_doc,
         _source_excludes,
         _source_includes,
-    );
+        allow_partial_search_results,
+    )?;
     search_response_rest.took = elapsed.as_millis() as u32;
     Ok(search_response_rest)
 }
@@ -521,14 +625,33 @@ async fn es_compat_index_cat_indices(
         })
         .map(|cat_index| cat_index.serialize_filtered(&query_params.h))
         .collect::<Result<Vec<serde_json::Value>, serde_json::Error>>()
-        .map_err(|serde_errror| {
+        .map_err(|serde_error| {
             ElasticsearchError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to serialize cat indices response: {}", serde_errror),
+                format!("Failed to serialize cat indices response: {}", serde_error),
+                None,
             )
         })?;
 
     Ok(search_response_rest)
+}
+
+async fn es_compat_resolve_index(
+    index_id_patterns: Vec<String>,
+    mut metastore: MetastoreServiceClient,
+) -> Result<ElasticsearchResolveIndexResponse, ElasticsearchError> {
+    let indexes_metadata = resolve_index_patterns(&index_id_patterns, &mut metastore).await?;
+    let mut indices: Vec<ElasticsearchResolveIndexEntryResponse> = indexes_metadata
+        .into_iter()
+        .map(|metadata| metadata.into())
+        .collect();
+
+    indices.sort_by(|left, right| left.name.cmp(&right.name));
+
+    Ok(ElasticsearchResolveIndexResponse {
+        indices,
+        ..Default::default()
+    })
 }
 
 async fn es_compat_index_field_capabilities(
@@ -722,24 +845,42 @@ async fn es_compat_index_multi_search(
                     ))
                 })
             })?;
-        let search_query_params = SearchQueryParams::from(request_header);
+        let mut search_query_params = SearchQueryParams::from(request_header);
+        if let Some(_source_excludes) = &multi_search_params._source_excludes {
+            search_query_params._source_excludes = Some(_source_excludes.to_vec());
+        }
+        if let Some(_source_includes) = &multi_search_params._source_includes {
+            search_query_params._source_includes = Some(_source_includes.to_vec());
+        }
+        if let Some(extra_filters) = &multi_search_params.extra_filters {
+            search_query_params.extra_filters = Some(extra_filters.to_vec());
+        }
         let es_request =
             build_request_for_es_api(index_ids_patterns, search_query_params, search_body)?;
         search_requests.push(es_request);
     }
+
     // TODO: forced to do weird referencing to work around https://github.com/rust-lang/rust/issues/100905
     // otherwise append_shard_doc is captured by ref, and we get lifetime issues
     let futures = search_requests
         .into_iter()
         .map(|(search_request, append_shard_doc)| {
             let search_service = &search_service;
+            let _source_excludes = multi_search_params._source_excludes.clone();
+            let _source_includes = multi_search_params._source_includes.clone();
             async move {
                 let start_instant = Instant::now();
                 let search_response: SearchResponse =
                     search_service.clone().root_search(search_request).await?;
                 let elapsed = start_instant.elapsed();
                 let mut search_response_rest: ElasticsearchResponse =
-                    convert_to_es_search_response(search_response, append_shard_doc, None, None);
+                    convert_to_es_search_response(
+                        search_response,
+                        append_shard_doc,
+                        _source_excludes,
+                        _source_includes,
+                        true, //< allow_partial_results. Set to to true to match ES's behavior.
+                    )?;
                 search_response_rest.took = elapsed.as_millis() as u32;
                 Ok::<_, ElasticsearchError>(search_response_rest)
             }
@@ -782,8 +923,13 @@ async fn es_scroll(
     };
     let search_response: SearchResponse = search_service.scroll(scroll_request).await?;
     // TODO append_shard_doc depends on the initial request, but we don't have access to it
+
+    // Ideally, we would have wanted to reuse the setting from the initial search request.
+    // However, passing that parameter is cumbersome, so we cut some corner and forbid the
+    // use of scroll requests in combination with allow_partial_results set to false.
+    let allow_failed_splits = true;
     let mut search_response_rest: ElasticsearchResponse =
-        convert_to_es_search_response(search_response, false, None, None);
+        convert_to_es_search_response(search_response, false, None, None, allow_failed_splits)?;
     search_response_rest.took = start_instant.elapsed().as_millis() as u32;
     Ok(search_response_rest)
 }
@@ -848,7 +994,13 @@ fn convert_to_es_search_response(
     append_shard_doc: bool,
     _source_excludes: Option<Vec<String>>,
     _source_includes: Option<Vec<String>>,
-) -> ElasticsearchResponse {
+    allow_partial_results: bool,
+) -> Result<ElasticsearchResponse, ElasticsearchError> {
+    if !allow_partial_results || resp.num_successful_splits == 0 {
+        if let Some(search_error) = SearchError::from_split_errors(&resp.failed_splits) {
+            return Err(ElasticsearchError::from(search_error));
+        }
+    }
     let hits: Vec<ElasticHit> = resp
         .hits
         .into_iter()
@@ -859,7 +1011,10 @@ fn convert_to_es_search_response(
     } else {
         None
     };
-    ElasticsearchResponse {
+    let num_failed_splits = resp.failed_splits.len() as u32;
+    let num_successful_splits = resp.num_successful_splits as u32;
+    let num_total_splits = num_successful_splits + num_failed_splits;
+    Ok(ElasticsearchResponse {
         timed_out: false,
         hits: HitsMetadata {
             total: Some(TotalHits {
@@ -871,8 +1026,16 @@ fn convert_to_es_search_response(
         },
         aggregations,
         scroll_id: resp.scroll_id,
+        // There is not concept of shards here, but use this to convey split search failures.
+        shards: ShardStatistics {
+            total: num_total_splits,
+            successful: num_successful_splits,
+            skipped: 0u32,
+            failed: num_failed_splits,
+            failures: Vec::new(),
+        },
         ..Default::default()
-    }
+    })
 }
 
 pub(crate) fn str_lines(body: &str) -> impl Iterator<Item = &str> {
@@ -884,6 +1047,7 @@ pub(crate) fn str_lines(body: &str) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 mod tests {
     use hyper::StatusCode;
+    use quickwit_proto::search::SplitSearchError;
 
     use super::{partial_hit_from_search_after_param, *};
 
@@ -1062,5 +1226,59 @@ mod tests {
         });
 
         assert_eq!(fields, expected);
+    }
+
+    // We test that the behavior of allow partial search results.
+    #[test]
+    fn test_convert_to_es_search_response_allow_partial() {
+        let split_error = SplitSearchError {
+            error: "some-error".to_string(),
+            split_id: "some-split-id".to_string(),
+            retryable_error: true,
+        };
+        {
+            let search_response = SearchResponse {
+                num_successful_splits: 1,
+                failed_splits: vec![split_error.clone()],
+                ..Default::default()
+            };
+            convert_to_es_search_response(search_response, false, None, None, false).unwrap_err();
+        }
+        {
+            let search_response = SearchResponse {
+                num_successful_splits: 1,
+                failed_splits: vec![split_error.clone()],
+                ..Default::default()
+            };
+            // if we allow partial search results, this should not fail, but we report the presence
+            // of failed splits in the fail shard response.
+            let es_search_resp =
+                convert_to_es_search_response(search_response, false, None, None, true).unwrap();
+            assert_eq!(es_search_resp.shards.failed, 1);
+        }
+        {
+            let search_response = SearchResponse {
+                failed_splits: vec![split_error.clone()],
+                ..Default::default()
+            };
+            // Event if we allow partial search results, with a fail and no success, we have a
+            // failure.
+            convert_to_es_search_response(search_response, false, None, None, true).unwrap_err();
+        }
+        {
+            // Not having any splits (no failure + no success) is not considered a failure.
+            for allow_partial in [true, false] {
+                let search_response = SearchResponse::default();
+                let es_search_resp = convert_to_es_search_response(
+                    search_response,
+                    false,
+                    None,
+                    None,
+                    allow_partial,
+                )
+                .unwrap();
+                assert_eq!(es_search_resp.shards.failed, 0);
+            }
+        }
     }
 }

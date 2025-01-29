@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 
@@ -30,17 +25,16 @@ use crate::IndexMetadata;
 #[derive(Clone, Debug, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "version")]
 pub(crate) enum VersionedIndexMetadata {
-    #[serde(rename = "0.7")]
+    #[serde(rename = "0.9")]
     // Retro compatibility.
-    #[serde(alias = "0.6")]
-    #[serde(alias = "0.5")]
-    #[serde(alias = "0.4")]
-    V0_7(IndexMetadataV0_7),
+    #[serde(alias = "0.8")]
+    #[serde(alias = "0.7")]
+    V0_8(IndexMetadataV0_8),
 }
 
 impl From<IndexMetadata> for VersionedIndexMetadata {
     fn from(index_metadata: IndexMetadata) -> Self {
-        VersionedIndexMetadata::V0_7(index_metadata.into())
+        VersionedIndexMetadata::V0_8(index_metadata.into())
     }
 }
 
@@ -51,12 +45,12 @@ impl TryFrom<VersionedIndexMetadata> for IndexMetadata {
         match index_metadata {
             // When we have more than one version, you should chain version conversion.
             // ie. Implement conversion from V_k -> V_{k+1}
-            VersionedIndexMetadata::V0_7(v6) => v6.try_into(),
+            VersionedIndexMetadata::V0_8(v8) => v8.try_into(),
         }
     }
 }
 
-impl From<IndexMetadata> for IndexMetadataV0_7 {
+impl From<IndexMetadata> for IndexMetadataV0_8 {
     fn from(index_metadata: IndexMetadata) -> Self {
         let sources: Vec<SourceConfig> = index_metadata.sources.values().cloned().collect();
         Self {
@@ -70,10 +64,8 @@ impl From<IndexMetadata> for IndexMetadataV0_7 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, utoipa::ToSchema)]
-pub(crate) struct IndexMetadataV0_7 {
+pub(crate) struct IndexMetadataV0_8 {
     #[schema(value_type = String)]
-    // Defaults to nil for backward compatibility.
-    #[serde(default, alias = "index_id")]
     pub index_uid: IndexUid,
     #[schema(value_type = VersionedIndexConfig)]
     pub index_config: IndexConfig,
@@ -85,26 +77,22 @@ pub(crate) struct IndexMetadataV0_7 {
     pub sources: Vec<SourceConfig>,
 }
 
-impl TryFrom<IndexMetadataV0_7> for IndexMetadata {
+impl TryFrom<IndexMetadataV0_8> for IndexMetadata {
     type Error = anyhow::Error;
 
-    fn try_from(v0_6: IndexMetadataV0_7) -> anyhow::Result<Self> {
+    fn try_from(v0_8: IndexMetadataV0_8) -> anyhow::Result<Self> {
         let mut sources: HashMap<String, SourceConfig> = Default::default();
-        for source in v0_6.sources {
+        for source in v0_8.sources {
             if sources.contains_key(&source.source_id) {
                 anyhow::bail!("source `{}` is defined more than once", source.source_id);
             }
             sources.insert(source.source_id.clone(), source);
         }
         Ok(Self {
-            index_uid: if v0_6.index_uid.is_empty() {
-                IndexUid::from_parts(&v0_6.index_config.index_id, 0)
-            } else {
-                v0_6.index_uid
-            },
-            index_config: v0_6.index_config,
-            checkpoint: v0_6.checkpoint,
-            create_timestamp: v0_6.create_timestamp,
+            index_uid: v0_8.index_uid,
+            index_config: v0_8.index_config,
+            checkpoint: v0_8.checkpoint,
+            create_timestamp: v0_8.create_timestamp,
             sources,
         })
     }

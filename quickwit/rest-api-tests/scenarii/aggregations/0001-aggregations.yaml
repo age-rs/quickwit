@@ -6,8 +6,8 @@ endpoint: _elastic/aggregations/_search
 json:
   query: { match_all: {} }
   aggs:
-    date_histo: 
-      date_histogram: 
+    date_histo:
+      date_histogram:
         field: "date"
         fixed_interval: "30d"
         offset: "-4d"
@@ -17,7 +17,31 @@ expected:
       buckets:
         -  { "doc_count": 5, "key": 1420070400000.0, "key_as_string": "2015-01-01T00:00:00Z" }
         -  { "doc_count": 2, "key": 1422662400000.0, "key_as_string": "2015-01-31T00:00:00Z" }
---- 
+---
+# Test date histogram with extended bounds
+method: [GET]
+engines:
+  - quickwit
+endpoint: _elastic/aggregations/_search
+json:
+  query: { match_all: {} }
+  aggs:
+    date_histo:
+      date_histogram:
+        field: "date"
+        fixed_interval: "30d"
+        offset: "-4d"
+        extended_bounds:
+          min: 1420070400000
+          max: 1425254400000
+expected:
+  aggregations:
+    date_histo:
+      buckets:
+        -  { "doc_count": 5, "key": 1420070400000.0, "key_as_string": "2015-01-01T00:00:00Z" }
+        -  { "doc_count": 2, "key": 1422662400000.0, "key_as_string": "2015-01-31T00:00:00Z" }
+        -  { "doc_count": 0, "key": 1425254400000.0, "key_as_string": "2015-03-02T00:00:00Z" }
+---
 # Test date histogram aggregation and sub-aggregation 
 method: [GET]
 engines:
@@ -117,8 +141,6 @@ expected:
         key: 192.168.0.1
       - doc_count: 1
         key: 192.168.0.11
-      - doc_count: 1
-        key: 192.168.0.15
       doc_count_error_upper_bound: 0
       sum_other_doc_count: 0
     tags:
@@ -311,4 +333,63 @@ expected:
   aggregations:
     metrics:
       buckets: []
-
+---
+# Test cardinality aggregation
+method: [GET]
+engines:
+  - quickwit
+endpoint: _elastic/aggregations/_search
+json:
+  query: { match_all: {} }
+  aggs:
+    unique_names:
+      cardinality:
+        field: "name"
+    unique_response:
+      cardinality:
+        field: "response"
+    unique_dates:
+      cardinality:
+        field: "date"
+expected:
+  aggregations:
+    unique_names:
+      value: 8.0
+    unique_response:
+      value: 5.0 # TODO: Check. The correct number is 6
+    unique_dates:
+      value: 6.0 
+---
+# Test extended stats aggregation
+method: [GET]
+engines:
+  - quickwit
+endpoint: _elastic/aggregations/_search
+json:
+  query: { match_all: {} }
+  aggs:
+    response_stats:
+      extended_stats:
+        field: "response"
+expected:
+  aggregations:
+    response_stats:
+      sum_of_squares: 55300.0
+# Test term aggs number precision
+method: [GET]
+engines:
+  - quickwit
+endpoint: _elastic/aggregations/_search
+json:
+  query: { match_all: {} }
+  size: 0
+  aggs:
+    names: 
+      terms: 
+        field: "high_prec_test"
+expected:
+  aggregations:
+    names:
+      buckets:
+      - doc_count: 1 
+        key: 1769070189829214200

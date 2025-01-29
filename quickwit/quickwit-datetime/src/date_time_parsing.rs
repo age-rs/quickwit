@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::time::Duration;
 
@@ -36,22 +31,24 @@ pub fn parse_date_time_str(
     date_time_str: &str,
     date_time_formats: &[DateTimeInputFormat],
 ) -> Result<TantivyDateTime, String> {
+    let trimmed_date_time_str = date_time_str.trim_ascii();
+
     for date_time_format in date_time_formats {
         let date_time_opt = match date_time_format {
-            DateTimeInputFormat::Iso8601 => parse_iso8601(date_time_str)
+            DateTimeInputFormat::Iso8601 => parse_iso8601(trimmed_date_time_str)
                 .map(TantivyDateTime::from_utc)
                 .ok(),
-            DateTimeInputFormat::Rfc2822 => parse_rfc2822(date_time_str)
+            DateTimeInputFormat::Rfc2822 => parse_rfc2822(trimmed_date_time_str)
                 .map(TantivyDateTime::from_utc)
                 .ok(),
-            DateTimeInputFormat::Rfc3339 => parse_rfc3339(date_time_str)
+            DateTimeInputFormat::Rfc3339 => parse_rfc3339(trimmed_date_time_str)
                 .map(TantivyDateTime::from_utc)
                 .ok(),
             DateTimeInputFormat::Strptime(parser) => parser
-                .parse_date_time(date_time_str)
+                .parse_date_time(trimmed_date_time_str)
                 .map(TantivyDateTime::from_utc)
                 .ok(),
-            DateTimeInputFormat::Timestamp => parse_timestamp_str(date_time_str),
+            DateTimeInputFormat::Timestamp => parse_timestamp_str(trimmed_date_time_str),
         };
         if let Some(date_time) = date_time_opt {
             return Ok(date_time);
@@ -80,7 +77,7 @@ pub fn parse_timestamp_float(
         ));
     }
     let duration_since_epoch = Duration::try_from_secs_f64(timestamp)
-        .map_err(|error| format!("Failed to parse datetime `{timestamp}`: {error}"))?;
+        .map_err(|error| format!("failed to parse datetime `{timestamp}`: {error}"))?;
     let timestamp_nanos = duration_since_epoch.as_nanos() as i64;
     Ok(TantivyDateTime::from_timestamp_nanos(timestamp_nanos))
 }
@@ -179,11 +176,11 @@ pub fn parse_timestamp(timestamp: i64) -> Result<TantivyDateTime, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use time::macros::datetime;
+    use time::Month;
 
     use super::*;
+    use crate::date_time_format::infer_year;
     use crate::StrptimeParser;
 
     #[test]
@@ -208,13 +205,13 @@ mod tests {
     fn test_parse_strptime() {
         let test_data = vec![
             (
-                "%Y-%m-%d %H:%M:%S",
+                " %Y-%m-%d %H:%M:%S ",
                 "2012-05-21 12:09:14",
                 datetime!(2012-05-21 12:09:14 UTC),
             ),
             (
                 "%Y-%m-%d %H:%M:%S %z",
-                "2012-05-21 12:09:14 +0000",
+                " 2012-05-21 12:09:14 +0000 ",
                 datetime!(2012-05-21 12:09:14 UTC),
             ),
             (
@@ -247,30 +244,41 @@ mod tests {
                 "2024-01-31 18:40:19.950188123",
                 datetime!(2024-01-31 18:40:19.950188123 UTC),
             ),
+            ("%b %d %H:%M:%S", "Mar  6 17:40:02", {
+                let dt = datetime!(1900-03-06 17:40:02 UTC);
+                let now = OffsetDateTime::now_utc();
+                let year = infer_year(Some(Month::March), now.month(), now.year());
+                dt.replace_year(year).unwrap()
+            }),
+            (
+                "%Y-%m-%dT%H:%M:%S.%f%z",
+                "2024-03-21T03:45:02.561820768-0400",
+                datetime!(2024-03-21 03:45:02.561820768 -04:00),
+            ),
         ];
         for (fmt, date_time_str, expected) in test_data {
-            let parser = StrptimeParser::from_str(fmt).unwrap();
-            let result = parser.parse_date_time(date_time_str);
+            let parser = DateTimeInputFormat::Strptime(StrptimeParser::from_strptime(fmt).unwrap());
+            let result = parse_date_time_str(date_time_str, &[parser]);
             if let Err(error) = &result {
                 panic!(
                     "failed to parse `{date_time_str}` using the following strptime format \
                      `{fmt}`: {error}"
                 )
             }
-            assert_eq!(result.unwrap(), expected);
+            assert_eq!(result.unwrap(), TantivyDateTime::from_utc(expected));
         }
     }
 
     #[test]
     fn test_parse_date_without_time() {
-        let strptime_parser = StrptimeParser::from_str("%Y-%m-%d").unwrap();
+        let strptime_parser = StrptimeParser::from_strptime("%Y-%m-%d").unwrap();
         let date = strptime_parser.parse_date_time("2012-05-21").unwrap();
         assert_eq!(date, datetime!(2012-05-21 00:00:00 UTC));
     }
 
     #[test]
     fn test_parse_date_am_pm_hour_not_zeroed() {
-        let strptime_parser = StrptimeParser::from_str("%Y-%m-%d %I:%M:%S %p").unwrap();
+        let strptime_parser = StrptimeParser::from_strptime("%Y-%m-%d %I:%M:%S %p").unwrap();
         let date = strptime_parser
             .parse_date_time("2012-05-21 10:05:12 pm")
             .unwrap();
@@ -280,14 +288,14 @@ mod tests {
     #[test]
     fn test_parse_date_time_str() {
         for date_time_str in [
-            "20120521T120914Z",
-            "Mon, 21 May 2012 12:09:14 GMT",
-            "2012-05-21T12:09:14-00:00",
+            "20120521T120914Z ",
+            " Mon, 21 May 2012 12:09:14 GMT",
+            " 2012-05-21T12:09:14-00:00 ",
             "2012-05-21 12:09:14",
-            "2012/05/21 12:09:14",
+            " 2012/05/21 12:09:14",
             "2012/05/21 12:09:14 +00:00",
-            "1337602154",
-            "1337602154.0",
+            "1337602154 ",
+            " 1337602154.0 ",
         ] {
             let date_time = parse_date_time_str(
                 date_time_str,
@@ -296,13 +304,13 @@ mod tests {
                     DateTimeInputFormat::Rfc2822,
                     DateTimeInputFormat::Rfc3339,
                     DateTimeInputFormat::Strptime(
-                        StrptimeParser::from_str("%Y-%m-%d %H:%M:%S").unwrap(),
+                        StrptimeParser::from_strptime("%Y-%m-%d %H:%M:%S").unwrap(),
                     ),
                     DateTimeInputFormat::Strptime(
-                        StrptimeParser::from_str("%Y/%m/%d %H:%M:%S").unwrap(),
+                        StrptimeParser::from_strptime("%Y/%m/%d %H:%M:%S").unwrap(),
                     ),
                     DateTimeInputFormat::Strptime(
-                        StrptimeParser::from_str("%Y/%m/%d %H:%M:%S %z").unwrap(),
+                        StrptimeParser::from_strptime("%Y/%m/%d %H:%M:%S %z").unwrap(),
                     ),
                     DateTimeInputFormat::Timestamp,
                 ],
@@ -439,7 +447,7 @@ mod tests {
                     DateTimeInputFormat::Iso8601,
                     DateTimeInputFormat::Rfc3339,
                     DateTimeInputFormat::Strptime(
-                        StrptimeParser::from_str("%Y-%m-%d %H:%M:%S.%f").unwrap(),
+                        StrptimeParser::from_strptime("%Y-%m-%d %H:%M:%S.%f").unwrap(),
                     ),
                 ],
             )

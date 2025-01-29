@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -154,7 +149,7 @@ async fn compute_cluster_change_events_on_added(
             warn!(
                 node_id=%new_chitchat_id.node_id,
                 generation_id=%new_chitchat_id.generation_id,
-                "node `{}` has rejoined the cluster with a lower generation ID and will be ignored",
+                "ignoring node `{}` rejoining the cluster with a lower generation ID",
                 new_chitchat_id.node_id
             );
             return events;
@@ -201,6 +196,16 @@ async fn compute_cluster_change_events_on_updated(
     previous_nodes: &mut BTreeMap<NodeId, ClusterNode>,
 ) -> Option<ClusterChange> {
     let previous_node = previous_nodes.get(&updated_chitchat_id.node_id)?.clone();
+
+    if previous_node.chitchat_id().generation_id > updated_chitchat_id.generation_id {
+        warn!(
+            node_id=%updated_chitchat_id.node_id,
+            generation_id=%updated_chitchat_id.generation_id,
+            "ignoring node `{}` update with a lower generation ID",
+            updated_chitchat_id.node_id
+        );
+        return None;
+    }
     let previous_channel = previous_node.channel();
     let is_self_node = self_chitchat_id == updated_chitchat_id;
     let updated_node = try_new_node_with_channel(
@@ -337,7 +342,7 @@ pub mod for_test {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashSet;
     use std::net::SocketAddr;
 
@@ -362,9 +367,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 enabled_services: QuickwitService::supported_services(),
-                grpc_advertise_addr: "127.0.0.1:7281"
-                    .parse()
-                    .expect("`127.0.0.1:7281` should be a valid socket address"),
+                grpc_advertise_addr: "127.0.0.1:7281".parse().unwrap(),
                 readiness: false,
                 key_values: Vec::new(),
             }
@@ -719,6 +722,50 @@ mod tests {
             assert_eq!(
                 previous_nodes.get(&updated_chitchat_id.node_id).unwrap(),
                 &node
+            );
+        }
+        {
+            // Ignore node update with a lower generation ID.
+            let port = 1235;
+            let grpc_advertise_addr: SocketAddr = ([127, 0, 0, 1], port + 1).into();
+            let updated_chitchat_id = ChitchatId::for_local_test(port);
+            let updated_node_id: NodeId = updated_chitchat_id.node_id.clone().into();
+            let mut previous_chitchat_id = updated_chitchat_id.clone();
+            previous_chitchat_id.generation_id += 1;
+            let previous_node_state = NodeStateBuilder::default()
+                .with_grpc_advertise_addr(grpc_advertise_addr)
+                .with_readiness(true)
+                .build();
+            let previous_channel = Channel::from_static("http://127.0.0.1:12345/").connect_lazy();
+            let is_self_node = true;
+            let previous_node = ClusterNode::try_new(
+                previous_chitchat_id.clone(),
+                &previous_node_state,
+                previous_channel,
+                is_self_node,
+            )
+            .unwrap();
+            let mut previous_nodes =
+                BTreeMap::from_iter([(updated_node_id, previous_node.clone())]);
+
+            let updated_node_state = NodeStateBuilder::default()
+                .with_grpc_advertise_addr(grpc_advertise_addr)
+                .with_readiness(false)
+                .with_key_value("my-key", "my-value")
+                .build();
+            let event_opt = compute_cluster_change_events_on_updated(
+                &cluster_id,
+                &self_chitchat_id,
+                &updated_chitchat_id,
+                &updated_node_state,
+                &mut previous_nodes,
+            )
+            .await;
+            assert!(event_opt.is_none());
+
+            assert_eq!(
+                previous_nodes.get(&updated_chitchat_id.node_id).unwrap(),
+                &previous_node
             );
         }
     }

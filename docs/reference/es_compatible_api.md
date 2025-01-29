@@ -21,7 +21,7 @@ POST api/v1/_elastic/_bulk
 POST api/v1/_elastic/<index>/_bulk
 ```
 
-The _bulk ingestion API makes it possible to index a batch of documents, possibly targetting several indices in the same request.
+The _bulk ingestion API makes it possible to index a batch of documents, possibly targeting several indices in the same request.
 
 #### Request Body example
 
@@ -135,6 +135,7 @@ If a parameter appears both as a query string parameter and in the JSON payload,
 | `size`             | `Integer`     | Number of hits to return.                                                        | 10            |
 | `sort`             | `String`      | Describes how documents should be ranked. See [Sort order](#sort-order)          | (Optional)    |
 | `scroll`           | `Duration`    | Creates a scroll context for "time to live". See [Scroll](#_scroll--scroll-api). | (Optional)    |
+| `allow_partial_search_results` | `Boolean` | Returns a partial response if some (but not all) of the split searches were unsuccessful. | `true` |
 
 #### Supported Request Body parameters
 
@@ -228,7 +229,7 @@ You can pass the `sort` value of the last hit in a subsequent request where othe
 ```json
 {
   // keep all fields from the original request
-  "seach_after": [
+  "search_after": [
     1701962929199
   ]
 }
@@ -256,7 +257,7 @@ POST api/v1/_elastic/_msearch
 Runs several search requests at once.
 
 The payload is expected to alternate:
-- a `header` json object, containing the targetted index id.
+- a `header` json object, containing the targeted index id.
 - a `search request body` as defined in the [`_search` endpoint section].
 
 
@@ -278,11 +279,86 @@ First, the client needs to call the `search api` with a `scroll` query parameter
 
 Each subsequent call to the `_search/scroll` endpoint will return a new `scroll_id` pointing to the next page.
 
-:::caution
 
-The scroll API should not be used to fetch above the 10,000th result.
+### `_cat` &nbsp; Cat API
 
-:::
+```
+GET api/v1/_elastic/_cat/indices/<index>
+```
+```
+GET api/v1/_elastic/_cat/indices
+```
+
+#### Supported Query string parameters
+
+| Variable | Type       | Description                                                                                            | Default value |
+|----------|------------|--------------------------------------------------------------------------------------------------------|---------------|
+| `format` | `String`   | Format for response. Only JSON supported for now.                                                      |               |
+| `h`      | `String[]` | Comma-separated list of column names to display.                                                       | (Optional)    |
+| `health` | `String`   | Filter for health: `green`, `yellow`, or `red`.                                                        | (Optional)    |
+| `bytes`  | `String`   | Unit used to display byte values. Unsupported for now.                                                 | (Optional)    |
+| `s`      | `String`   | Comma-separated list of column names or column aliases used to sort the response. Unsupported for now. | (Optional)    |
+| `v`      | `Boolean`  | If true, the response includes column headings. Unsupported for now.                                   | (Optional)    |
+
+Use the [cat indices API](https://www.elastic.co/guide/en/elasticsearch/reference/current/cat-indices.html) to get the following information for each index in a cluster:
+* Shard count
+* Document count
+* Deleted document count
+* Primary store size
+* Total store size
+
+#### Response
+
+The response is a JSON object, and the content type is `application/json; charset=UTF-8.`
+
+| Field            | Description                                      |   Type   |
+|------------------|--------------------------------------------------|:--------:|
+| `uuid`           | Index uuid                                       | `String` |
+| `index`          | Index name                                       | `String` |
+| `health`         | Health of the index `green`, `yellow`, or `red`. | `String` |
+| `status`         | Status of the index `open`.                      | `String` |
+| `rep`            | Replication factor.                              | `Number` |
+| `pri`            | Number of primary shards                         | `Number` |
+| `pri.store.size` | Stored size of primary shard.                    | `String` |
+| `store.size`     | Stored size of index.                            | `String` |
+| `dataset.size`   | Indexed data size.                               | `String` |
+| `docs.count`     | Number of records in index.                      | `Number` |
+| `docs.deleted`   | Number of deleted records in index.              | `Number` |
+
+Example response:
+
+```json
+[
+  {
+    "dataset.size": "0b",
+    "docs.count": "0",
+    "docs.deleted": "0",
+    "health": "green",
+    "index": "otel-traces-v0_7",
+    "pri": "1",
+    "pri.store.size": "0b",
+    "rep": "1",
+    "status": "open",
+    "store.size": "0b",
+    "uuid": "otel-traces-v0_7:01HTJC6TQDGM07KBDQZ2KDHW53"
+  },
+  {
+    "dataset.size": "387.5gb",
+    "docs.count": "224453081",
+    "docs.deleted": "0",
+    "health": "green",
+    "index": "otel-logs-v0_7",
+    "pri": "1",
+    "pri.store.size": "37.5gb",
+    "rep": "1",
+    "status": "open",
+    "store.size": "37.5gb",
+    "uuid": "otel-logs-v0_7:01HTJC6TME1JGXBFERHZ0FJ860"
+  }
+]
+```
+
+[HTTP accept header]: https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html
 
 ## Query DSL
 
@@ -318,6 +394,7 @@ The following query types are supported.
 | `fields`           | `String[]` (Optional) | Default search target fields.                                                                                               | -             |
 | `default_operator` | `"AND"` or `"OR"`     | In the absence of boolean operator defines whether terms should be combined as a conjunction (`AND`) or disjunction (`OR`). | `OR`          |
 | `boost`            | `Number`              | Multiplier boost for score computation.                                                                                     | 1.0           |
+| `lenient`          | `Boolean`             | [See note](#about-the-lenient-argument).                                                                                    | false         |
 
 
 ### `bool`
@@ -358,6 +435,7 @@ The following query types are supported.
 | `should`   | `JsonObject[]` (Optional) | Sub-queries that should match the documents.                      | []            |
 | `filter`   | `JsonObject[]`            | Like must queries, but the match does not influence the `_score`. | []            |
 | `boost`    | `Number`                  | Multiplier boost for score computation.                           | 1.0           |
+| `minimum_should_match`    | `Number` or `Str` | If present, quickwit will only match documents for which at least `minimum_should_match` should clauses are matching. `2`, `-1`, `"10%"` and `"-10%"` are supported. |  |
 
 ### `range`
 
@@ -417,7 +495,7 @@ The following query types are supported.
 | `operator`         | `"AND"` or `"OR"` | Defines whether all terms should be present (`AND`) or if at least one term is sufficient to match (`OR`).                     | OR      |
 | `zero_terms_query` | `all` or `none`   | Defines if all (`all`) or no documents (`none`) should be returned if the query does not contain any terms after tokenization. | `none`  |
 | `boost`            | `Number`          | Multiplier boost for score computation                                                                                         | 1.0     |
-
+| `lenient`          | `Boolean`         | [See note](#about-the-lenient-argument).                                                                                       | false   |
 
 
 
@@ -467,8 +545,6 @@ The following query types are supported.
 | `max_expansions`   | `Integer`       | Number of terms to be match by the prefix matching.                                                                            | 50                          |
 | `slop`             | `Integer`       | Allows extra tokens between the query tokens.                                                                                  | 0                           |
 | `analyzer`         | String          | Analyzer meant to cut the query into terms. It is recommended to NOT use this parameter.                                       | The actual field tokenizer. |
-
-
 
 
 ### `match_bool_prefix`
@@ -562,15 +638,30 @@ Contrary to ES/Opensearch, in Quickwit, at most 50 terms will be considered when
 }
 ```
 
-#### Supported Multi-match Queries
-| Type            | Description                                                                                 |
+#### Supported parameters
+
+| Variable           | Type                  | Description                                  | Default value |
+| ------------------ | --------------------- | ---------------------------------------------| ------------- |
+| `type`             | `String`              | See supported types below                    | `most_fields` |
+| `fields`           | `String[]` (Optional) | Default search target fields.                | -             |
+| `lenient`          | `Boolean`             | [See note](#about-the-lenient-argument).     | false         |
+
+Supported types:
+
+| `type` value    | Description                                                                                 |
 | --------------- | ------------------------------------------------------------------------------------------- |
-| `most_fields`   | (default) Finds documents which match any field and combines the `_score` from each field.  |
-| `phrase`        | Runs a `match_phrase` query on each field and uses the `_score` from the best field .       |
-| `phrase_prefix` | Runs a `match_phrase_prefix` query on each field and uses the `_score` from the best field. |
+| `most_fields`   | Finds documents matching any field and combines the `_score` from each field (default).  |
+| `phrase`        | Runs a `match_phrase` query on each field.       |
+| `phrase_prefix` | Runs a `match_phrase_prefix` query on each field. |
+| `bool_prefix`   | Runs a `match_bool_prefix` query on each field. |
 
+:::warning
 
+In `phrase`, `phrase_prefix` and `bool_prefix` modes, Quickwit sums the score of the different fields instead of returning their max.
 
+Moreover, while Quickwit does not support `best_fields` or `cross_fields`, it will not return an error when presented a `best_fields` or `cross_fields` type. For compatibilility reasons, Quickwit silently accepts these parameters and interprets them as a `most_fields` type.
+
+:::
 
 ### `term`
 
@@ -640,13 +731,19 @@ Query matching only documents containing a non-null value for a given field.
 | `field`  | String | Only documents with a value for field will be returned. | -       |
 
 
+### About the `lenient` argument
+
+Quickwit and Elasticsearch have different interpretations of the `lenient` setting:
+- In Quickwit, lenient mode allows ignoring parts of the query that reference non-existing columns. This is a behavior that Elasticsearch supports by default.
+- In Elasticsearch, lenient mode primarily addresses type errors (such as searching for text in an integer field). Quickwit always supports this behavior, regardless of the `lenient` setting.
+
 ## Search multiple indices
 
 Search APIs that accept <index_id> requests path parameter also support multi-target syntax.
 
 ### Multi-target syntax
 
-In multi-target syntax, you can use a comma or its URL encoded version '%2C' seperated list to run a request on multiple indices: test1,test2,test3. You can also sue [glob-like](https://en.wikipedia.org/wiki/Glob_(programming)) wildcard ( \* ) expressions to target indices that match a pattern: test\* or \*test or te\*t or \*test\*.
+In multi-target syntax, you can use a comma or its URL encoded version '%2C' separated list to run a request on multiple indices: test1,test2,test3. You can also sue [glob-like](https://en.wikipedia.org/wiki/Glob_(programming)) wildcard ( \* ) expressions to target indices that match a pattern: test\* or \*test or te\*t or \*test\*.
 
 The multi-target expression has the following constraints:
 

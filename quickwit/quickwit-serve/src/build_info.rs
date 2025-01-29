@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use once_cell::sync::OnceCell;
 use quickwit_common::runtimes::RuntimesConfig;
@@ -96,8 +91,9 @@ impl BuildInfo {
 
 #[derive(Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 pub struct RuntimeInfo {
-    pub num_cpus_logical: usize,
-    pub num_cpus_physical: usize,
+    // This is a number of logical cpus: vCPU or hyperthread depending on where you are running.
+    // This is usually NOT necessarily the number of cores.
+    pub num_cpus: usize,
     pub num_threads_blocking: usize,
     pub num_threads_non_blocking: usize,
 }
@@ -108,12 +104,10 @@ impl RuntimeInfo {
         static INSTANCE: OnceCell<RuntimeInfo> = OnceCell::new();
 
         INSTANCE.get_or_init(|| {
-            let num_cpus_logical = num_cpus::get();
-            let runtimes_config = RuntimesConfig::with_num_cpus(num_cpus_logical);
-
+            let num_cpus = quickwit_common::num_cpus();
+            let runtimes_config = RuntimesConfig::with_num_cpus(num_cpus);
             Self {
-                num_cpus_logical,
-                num_cpus_physical: num_cpus::get_physical(),
+                num_cpus,
                 num_threads_blocking: runtimes_config.num_threads_blocking,
                 num_threads_non_blocking: runtimes_config.num_threads_non_blocking,
             }

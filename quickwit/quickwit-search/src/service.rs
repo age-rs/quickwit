@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::pin::Pin;
 use std::str::FromStr;
@@ -33,23 +28,27 @@ use quickwit_proto::search::{
     LeafListTermsRequest, LeafListTermsResponse, LeafSearchRequest, LeafSearchResponse,
     LeafSearchStreamRequest, LeafSearchStreamResponse, ListFieldsRequest, ListFieldsResponse,
     ListTermsRequest, ListTermsResponse, PutKvRequest, ReportSplitsRequest, ReportSplitsResponse,
-    ScrollRequest, SearchRequest, SearchResponse, SearchStreamRequest, SnippetRequest,
+    ScrollRequest, SearchPlanResponse, SearchRequest, SearchResponse, SearchStreamRequest,
+    SnippetRequest,
 };
 use quickwit_storage::{
     MemorySizedCache, QuickwitCache, SplitCache, StorageCache, StorageResolver,
 };
-use tantivy::aggregation::AggregationLimits;
+use tantivy::aggregation::AggregationLimitsGuard;
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use crate::leaf::multi_leaf_search;
 use crate::leaf_cache::LeafSearchCache;
 use crate::list_fields::{leaf_list_fields, root_list_fields};
 use crate::list_fields_cache::ListFieldsCache;
 use crate::list_terms::{leaf_list_terms, root_list_terms};
+use crate::metrics::SEARCH_METRICS;
 use crate::root::fetch_docs_phase;
 use crate::scroll_context::{MiniKV, ScrollContext, ScrollKeyAndStartOffset};
+use crate::search_permit_provider::SearchPermitProvider;
 use crate::search_stream::{leaf_search_stream, root_search_stream};
-use crate::{fetch_docs, leaf_search, root_search, ClusterClient, SearchError};
+use crate::{fetch_docs, root_search, search_plan, ClusterClient, SearchError};
 
 #[derive(Clone)]
 /// The search service implementation.
@@ -148,6 +147,9 @@ pub trait SearchService: 'static + Send + Sync {
         &self,
         list_fields: LeafListFieldsRequest,
     ) -> crate::Result<ListFieldsResponse>;
+
+    /// Describe how a search would be processed.
+    async fn search_plan(&self, request: SearchRequest) -> crate::Result<SearchPlanResponse>;
 }
 
 impl SearchServiceImpl {
@@ -168,8 +170,8 @@ impl SearchServiceImpl {
     }
 }
 
-fn deserialize_doc_mapper(doc_mapper_str: &str) -> crate::Result<Arc<dyn DocMapper>> {
-    let doc_mapper = serde_json::from_str::<Arc<dyn DocMapper>>(doc_mapper_str).map_err(|err| {
+pub fn deserialize_doc_mapper(doc_mapper_str: &str) -> crate::Result<Arc<DocMapper>> {
+    let doc_mapper = serde_json::from_str::<Arc<DocMapper>>(doc_mapper_str).map_err(|err| {
         SearchError::Internal(format!("failed to deserialize doc mapper: `{err}`"))
     })?;
     Ok(doc_mapper)
@@ -192,24 +194,34 @@ impl SearchService for SearchServiceImpl {
         &self,
         leaf_search_request: LeafSearchRequest,
     ) -> crate::Result<LeafSearchResponse> {
-        let search_request: Arc<SearchRequest> = leaf_search_request
-            .search_request
-            .ok_or_else(|| SearchError::Internal("no search request".to_string()))?
-            .into();
-        let index_uri = Uri::from_str(&leaf_search_request.index_uri)?;
-        let storage = self.storage_resolver.resolve(&index_uri).await?;
-        let doc_mapper = deserialize_doc_mapper(&leaf_search_request.doc_mapper)?;
-
-        let leaf_search_response = leaf_search(
+        // Check leaf_search_request existence before tracing with `instrument` call.
+        if leaf_search_request.search_request.is_none() {
+            return Err(SearchError::Internal("no search request".to_string()));
+        }
+        let start = Instant::now();
+        let leaf_search_response_result = multi_leaf_search(
             self.searcher_context.clone(),
-            search_request,
-            storage.clone(),
-            leaf_search_request.split_offsets,
-            doc_mapper,
+            leaf_search_request,
+            &self.storage_resolver,
         )
-        .await?;
+        .await;
 
-        Ok(leaf_search_response)
+        let elapsed = start.elapsed().as_secs_f64();
+        let label_values = if leaf_search_response_result.is_ok() {
+            ["success"]
+        } else {
+            ["error"]
+        };
+        SEARCH_METRICS
+            .leaf_search_requests_total
+            .with_label_values(label_values)
+            .inc();
+        SEARCH_METRICS
+            .leaf_search_request_duration_seconds
+            .with_label_values(label_values)
+            .observe(elapsed);
+
+        leaf_search_response_result
     }
 
     async fn fetch_docs(
@@ -356,6 +368,14 @@ impl SearchService for SearchServiceImpl {
         )
         .await
     }
+
+    async fn search_plan(
+        &self,
+        search_request: SearchRequest,
+    ) -> crate::Result<SearchPlanResponse> {
+        let search_plan = search_plan(search_request, self.metastore.clone()).await?;
+        Ok(search_plan)
+    }
 }
 
 pub(crate) async fn scroll(
@@ -428,6 +448,8 @@ pub(crate) async fn scroll(
         scroll_id: Some(next_scroll_id.to_string()),
         errors: Vec::new(),
         aggregation: None,
+        failed_splits: scroll_context.failed_splits,
+        num_successful_splits: scroll_context.num_successful_splits,
     })
 }
 /// [`SearcherContext`] provides a common set of variables
@@ -439,7 +461,7 @@ pub struct SearcherContext {
     /// Fast fields cache.
     pub fast_fields_cache: Arc<dyn StorageCache>,
     /// Counting semaphore to limit concurrent leaf search split requests.
-    pub leaf_search_split_semaphore: Arc<Semaphore>,
+    pub search_permit_provider: SearchPermitProvider,
     /// Split footer cache.
     pub split_footer_cache: MemorySizedCache<String>,
     /// Counting semaphore to limit concurrent split stream requests.
@@ -450,16 +472,14 @@ pub struct SearcherContext {
     pub split_cache_opt: Option<Arc<SplitCache>>,
     /// List fields cache. Caches the list fields response for a given split.
     pub list_fields_cache: ListFieldsCache,
+    /// The aggregation limits are passed to limit the memory usage.
+    pub aggregation_limit: AggregationLimitsGuard,
 }
 
 impl std::fmt::Debug for SearcherContext {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("SearcherContext")
             .field("searcher_config", &self.searcher_config)
-            .field(
-                "leaf_search_split_semaphore",
-                &self.leaf_search_split_semaphore,
-            )
             .field("split_stream_semaphore", &self.split_stream_semaphore)
             .finish()
     }
@@ -479,9 +499,10 @@ impl SearcherContext {
             capacity_in_bytes,
             &quickwit_storage::STORAGE_METRICS.split_footer_cache,
         );
-        let leaf_search_split_semaphore = Arc::new(Semaphore::new(
+        let leaf_search_split_semaphore = SearchPermitProvider::new(
             searcher_config.max_num_concurrent_split_searches,
-        ));
+            searcher_config.warmup_memory_budget,
+        );
         let split_stream_semaphore =
             Semaphore::new(searcher_config.max_num_concurrent_split_streams);
         let fast_field_cache_capacity = searcher_config.fast_field_cache_capacity.as_u64() as usize;
@@ -490,24 +511,26 @@ impl SearcherContext {
             LeafSearchCache::new(searcher_config.partial_request_cache_capacity.as_u64() as usize);
         let list_fields_cache =
             ListFieldsCache::new(searcher_config.partial_request_cache_capacity.as_u64() as usize);
+        let aggregation_limit = AggregationLimitsGuard::new(
+            Some(searcher_config.aggregation_memory_limit.as_u64()),
+            Some(searcher_config.aggregation_bucket_limit),
+        );
 
         Self {
             searcher_config,
             fast_fields_cache: storage_long_term_cache,
-            leaf_search_split_semaphore,
+            search_permit_provider: leaf_search_split_semaphore,
             split_footer_cache: global_split_footer_cache,
             split_stream_semaphore,
             leaf_search_cache,
             list_fields_cache,
             split_cache_opt,
+            aggregation_limit,
         }
     }
 
-    /// Returns a new instance to track the aggregation memory usage.
-    pub fn get_aggregation_limits(&self) -> AggregationLimits {
-        AggregationLimits::new(
-            Some(self.searcher_config.aggregation_memory_limit.as_u64()),
-            Some(self.searcher_config.aggregation_bucket_limit),
-        )
+    /// Returns the shared instance to track the aggregation memory usage.
+    pub fn get_aggregation_limits(&self) -> AggregationLimitsGuard {
+        self.aggregation_limit.clone()
     }
 }

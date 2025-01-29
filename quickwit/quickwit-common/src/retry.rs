@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt::Debug;
 use std::time::Duration;
@@ -24,10 +19,6 @@ use async_trait::async_trait;
 use futures::Future;
 use rand::Rng;
 use tracing::{debug, warn};
-
-const DEFAULT_MAX_ATTEMPTS: usize = 30;
-const DEFAULT_BASE_DELAY: Duration = Duration::from_millis(250);
-const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(20);
 
 pub trait Retryable {
     fn is_retryable(&self) -> bool {
@@ -66,17 +57,37 @@ pub struct RetryParams {
     pub max_attempts: usize,
 }
 
-impl Default for RetryParams {
-    fn default() -> Self {
+impl RetryParams {
+    /// Creates a new [`RetryParams`] instance using the same settings as the standard retry policy
+    /// defined in the AWS SDK for Rust.
+    pub fn standard() -> Self {
         Self {
-            base_delay: DEFAULT_BASE_DELAY,
-            max_delay: DEFAULT_MAX_DELAY,
-            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(20),
+            max_attempts: 3,
         }
     }
-}
 
-impl RetryParams {
+    /// Creates a new [`RetryParams`] instance using settings that are more aggressive than those of
+    /// the standard policy for services that are more resilient to retries, usually managed
+    /// cloud services.
+    pub fn aggressive() -> Self {
+        Self {
+            base_delay: Duration::from_millis(250),
+            max_delay: Duration::from_secs(20),
+            max_attempts: 5,
+        }
+    }
+
+    /// Creates a new [`RetryParams`] instance that does not perform any retries.
+    pub fn no_retries() -> Self {
+        Self {
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            max_attempts: 1,
+        }
+    }
+
     /// Computes the delay after which a new attempt should be performed. The randomized delay
     /// increases after each attempt (exponential backoff and full jitter). Implementation and
     /// default values originate from the Java SDK. See also: <https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/>.
@@ -104,7 +115,7 @@ impl RetryParams {
         Self {
             base_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(2),
-            ..Default::default()
+            max_attempts: 3,
         }
     }
 }
@@ -211,7 +222,11 @@ mod tests {
         let noop_mock = NoopSleep;
         let values_it = RwLock::new(values.into_iter());
         retry_with_mockable_sleep(
-            &RetryParams::default(),
+            &RetryParams {
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+                max_attempts: 30,
+            },
             || ready(values_it.write().unwrap().next().unwrap()),
             noop_mock,
         )

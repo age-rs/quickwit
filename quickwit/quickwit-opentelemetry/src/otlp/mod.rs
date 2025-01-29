@@ -1,25 +1,26 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 
-use quickwit_config::{validate_identifier, validate_index_id_pattern};
+use quickwit_common::rate_limited_warn;
+use quickwit_config::{validate_identifier, validate_index_id_pattern, INGEST_V2_SOURCE_ID};
+use quickwit_ingest::{CommitType, IngestServiceError};
+use quickwit_proto::ingest::router::{
+    IngestRequestV2, IngestRouterService, IngestRouterServiceClient, IngestSubrequest,
+};
+use quickwit_proto::ingest::DocBatchV2;
 use quickwit_proto::opentelemetry::proto::common::v1::any_value::Value as OtlpValue;
 use quickwit_proto::opentelemetry::proto::common::v1::{
     AnyValue as OtlpAnyValue, ArrayValue as OtlpArrayValue, KeyValue as OtlpKeyValue,
@@ -34,7 +35,10 @@ mod test_utils;
 mod trace_id;
 mod traces;
 
-pub use logs::{OtlpGrpcLogsService, OTEL_LOGS_INDEX_ID};
+pub use logs::{
+    parse_otlp_logs_json, parse_otlp_logs_protobuf, JsonLogIterator, OtlpGrpcLogsService,
+    OtlpLogsError, OTEL_LOGS_INDEX_ID,
+};
 pub use span_id::{SpanId, TryFromSpanIdError};
 #[cfg(any(test, feature = "testsuite"))]
 pub use test_utils::make_resource_spans_for_test;
@@ -42,7 +46,7 @@ use tonic::Status;
 pub use trace_id::{TraceId, TryFromTraceIdError};
 pub use traces::{
     parse_otlp_spans_json, parse_otlp_spans_protobuf, Event, JsonSpanIterator, Link,
-    OtlpGrpcTracesService, OtlpTraceError, Span, SpanFingerprint, SpanKind, SpanStatus,
+    OtlpGrpcTracesService, OtlpTracesError, Span, SpanFingerprint, SpanKind, SpanStatus,
     OTEL_TRACES_INDEX_ID, OTEL_TRACES_INDEX_ID_PATTERN,
 };
 
@@ -68,8 +72,14 @@ impl OtelSignal {
     }
 }
 
-impl From<OtlpTraceError> for tonic::Status {
-    fn from(error: OtlpTraceError) -> Self {
+impl From<OtlpLogsError> for tonic::Status {
+    fn from(error: OtlpLogsError) -> Self {
+        tonic::Status::invalid_argument(error.to_string())
+    }
+}
+
+impl From<OtlpTracesError> for tonic::Status {
+    fn from(error: OtlpTracesError) -> Self {
         tonic::Status::invalid_argument(error.to_string())
     }
 }
@@ -105,7 +115,7 @@ pub(crate) fn extract_attributes(attributes: Vec<OtlpKeyValue>) -> HashMap<Strin
         if let Some(value) = attribute
             .value
             .and_then(|any_value| any_value.value)
-            .and_then(to_json_value)
+            .and_then(oltp_value_to_json_value)
         {
             attrs.insert(attribute.key, value);
         }
@@ -113,38 +123,46 @@ pub(crate) fn extract_attributes(attributes: Vec<OtlpKeyValue>) -> HashMap<Strin
     attrs
 }
 
-fn to_json_value(value: OtlpValue) -> Option<JsonValue> {
+fn oltp_value_to_json_value(value: OtlpValue) -> Option<JsonValue> {
     match value {
         OtlpValue::ArrayValue(OtlpArrayValue { values }) => Some(
             values
                 .into_iter()
-                .flat_map(to_json_value_from_primitive_any_value)
+                .filter_map(|value| match value.value {
+                    Some(value) => oltp_value_to_json_value(value),
+                    None => None,
+                })
                 .collect(),
         ),
-        OtlpValue::BoolValue(value) => Some(JsonValue::Bool(value)),
-        OtlpValue::DoubleValue(value) => JsonNumber::from_f64(value).map(JsonValue::Number),
-        OtlpValue::IntValue(value) => Some(JsonValue::Number(JsonNumber::from(value))),
-        OtlpValue::StringValue(value) => Some(JsonValue::String(value)),
-        OtlpValue::BytesValue(_) | OtlpValue::KvlistValue(_) => {
-            // These attribute types are not supported for attributes according to the OpenTelemetry
-            // specification.
+        OtlpValue::BoolValue(bool_value) => Some(JsonValue::Bool(bool_value)),
+        OtlpValue::DoubleValue(double_value) => {
+            JsonNumber::from_f64(double_value).map(JsonValue::Number)
+        }
+        OtlpValue::IntValue(int_value) => Some(JsonValue::Number(JsonNumber::from(int_value))),
+        OtlpValue::KvlistValue(key_values) => {
+            let mut map = serde_json::Map::with_capacity(key_values.values.len());
+
+            for key_value in key_values.values {
+                if let Some(value) = key_value
+                    .value
+                    .and_then(|any_value| any_value.value)
+                    .and_then(oltp_value_to_json_value)
+                {
+                    map.insert(key_value.key, value);
+                }
+            }
+            Some(JsonValue::Object(map))
+        }
+        OtlpValue::StringValue(string_value) => Some(JsonValue::String(string_value)),
+        OtlpValue::BytesValue(_) => {
+            rate_limited_warn!(limit_per_min = 10, "ignoring unsupported OTLP bytes value");
             None
         }
     }
 }
 
-fn to_json_value_from_primitive_any_value(any_value: OtlpAnyValue) -> Option<JsonValue> {
-    match any_value.value {
-        Some(OtlpValue::BoolValue(value)) => Some(JsonValue::Bool(value)),
-        Some(OtlpValue::DoubleValue(value)) => JsonNumber::from_f64(value).map(JsonValue::Number),
-        Some(OtlpValue::IntValue(value)) => Some(JsonValue::Number(JsonNumber::from(value))),
-        Some(OtlpValue::StringValue(value)) => Some(JsonValue::String(value)),
-        _ => None,
-    }
-}
-
 pub(crate) fn parse_log_record_body(body: OtlpAnyValue) -> Option<JsonValue> {
-    body.value.and_then(to_json_value).map(|value| {
+    body.value.and_then(oltp_value_to_json_value).map(|value| {
         if value.is_string() {
             let mut map = serde_json::Map::with_capacity(1);
             map.insert("message".to_string(), value);
@@ -197,18 +215,47 @@ pub(crate) fn extract_otel_index_id_from_metadata(
         .transpose()
         .map_err(|error| {
             Status::internal(format!(
-                "Failed to extract index ID from request metadata: {}",
-                error
+                "failed to extract index ID from request metadata: {error}",
             ))
         })?
         .unwrap_or_else(|| otel_signal.default_index_id());
     validate_identifier("index_id", index_id).map_err(|error| {
         Status::internal(format!(
-            "Invalid index ID pattern in request metadata: {}",
-            error
+            "invalid index ID pattern in request metadata: {error}",
         ))
     })?;
     Ok(index_id.to_string())
+}
+
+async fn ingest_doc_batch_v2(
+    ingest_router: IngestRouterServiceClient,
+    index_id: String,
+    doc_batch: DocBatchV2,
+    commit_type: CommitType,
+) -> Result<(), IngestServiceError> {
+    let subrequest = IngestSubrequest {
+        subrequest_id: 0,
+        index_id,
+        source_id: INGEST_V2_SOURCE_ID.to_string(),
+        doc_batch: Some(doc_batch),
+    };
+    let request = IngestRequestV2 {
+        commit_type: commit_type.into(),
+        subrequests: vec![subrequest],
+    };
+    let mut response = ingest_router.ingest(request).await?;
+    let num_responses = response.successes.len() + response.failures.len();
+    if num_responses != 1 {
+        return Err(IngestServiceError::Internal(format!(
+            "expected a single failure or success, got {}",
+            num_responses
+        )));
+    }
+    if response.successes.pop().is_some() {
+        return Ok(());
+    }
+    let ingest_failure = response.failures.pop().unwrap();
+    Err(ingest_failure.into())
 }
 
 #[cfg(test)]
@@ -216,34 +263,75 @@ mod tests {
     use quickwit_proto::opentelemetry::proto::common::v1::any_value::{
         Value as OtlpValue, Value as OtlpAnyValueValue,
     };
-    use quickwit_proto::opentelemetry::proto::common::v1::ArrayValue as OtlpArrayValue;
+    use quickwit_proto::opentelemetry::proto::common::v1::{
+        ArrayValue as OtlpArrayValue, KeyValueList as OtlpKeyValueList,
+    };
     use serde_json::{json, Value as JsonValue};
 
     use super::*;
-    use crate::otlp::{extract_attributes, parse_log_record_body, to_json_value};
+    use crate::otlp::{extract_attributes, oltp_value_to_json_value, parse_log_record_body};
 
     #[test]
-    fn test_to_json_value() {
+    fn test_oltp_value_to_json_value() {
         assert_eq!(
-            to_json_value(OtlpValue::ArrayValue(OtlpArrayValue { values: Vec::new() })),
+            oltp_value_to_json_value(OtlpValue::ArrayValue(OtlpArrayValue { values: Vec::new() })),
             Some(json!([]))
         );
         assert_eq!(
-            to_json_value(OtlpValue::ArrayValue(OtlpArrayValue {
-                values: vec![OtlpAnyValue {
-                    value: Some(OtlpAnyValueValue::IntValue(1337))
-                }]
+            oltp_value_to_json_value(OtlpValue::ArrayValue(OtlpArrayValue {
+                values: vec![
+                    OtlpAnyValue {
+                        value: Some(OtlpAnyValueValue::IntValue(1337))
+                    },
+                    OtlpAnyValue {
+                        value: Some(OtlpAnyValueValue::StringValue("1337".to_string()))
+                    }
+                ]
             })),
-            Some(json!([1337]))
+            Some(json!([1337, "1337"]))
         );
-        assert_eq!(to_json_value(OtlpValue::BoolValue(true)), Some(json!(true)));
         assert_eq!(
-            to_json_value(OtlpValue::DoubleValue(12.0)),
+            oltp_value_to_json_value(OtlpValue::BoolValue(true)),
+            Some(json!(true))
+        );
+        assert_eq!(
+            oltp_value_to_json_value(OtlpValue::DoubleValue(12.0)),
             Some(json!(12.0))
         );
-        assert_eq!(to_json_value(OtlpValue::IntValue(42)), Some(json!(42)));
         assert_eq!(
-            to_json_value(OtlpValue::StringValue("foo".to_string())),
+            oltp_value_to_json_value(OtlpValue::IntValue(42)),
+            Some(json!(42))
+        );
+        assert_eq!(
+            oltp_value_to_json_value(OtlpValue::KvlistValue(OtlpKeyValueList {
+                values: Vec::new()
+            })),
+            Some(json!({}))
+        );
+        assert_eq!(
+            oltp_value_to_json_value(OtlpValue::KvlistValue(OtlpKeyValueList {
+                values: vec![
+                    OtlpKeyValue {
+                        key: "foo".to_string(),
+                        value: Some(OtlpAnyValue {
+                            value: Some(OtlpAnyValueValue::IntValue(1337))
+                        })
+                    },
+                    OtlpKeyValue {
+                        key: "bar".to_string(),
+                        value: Some(OtlpAnyValue {
+                            value: Some(OtlpAnyValueValue::StringValue("1337".to_string()))
+                        })
+                    }
+                ]
+            })),
+            Some(json!({
+                "foo": 1337,
+                "bar": "1337"
+            }))
+        );
+        assert_eq!(
+            oltp_value_to_json_value(OtlpValue::StringValue("foo".to_string())),
             Some(json!("foo"))
         );
     }
@@ -310,7 +398,7 @@ mod tests {
                 }),
             },
         ];
-        let expected_attributes = std::collections::HashMap::from_iter([
+        let expected_attributes = HashMap::from_iter([
             ("array_key".to_string(), json!([1337])),
             ("bool_key".to_string(), json!(true)),
             ("double_key".to_string(), json!(12.0)),

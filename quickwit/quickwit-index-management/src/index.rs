@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -25,18 +20,19 @@ use futures_util::StreamExt;
 use itertools::Itertools;
 use quickwit_common::fs::{empty_dir, get_cache_directory_path};
 use quickwit_common::pretty::PrettySample;
+use quickwit_common::rate_limited_error;
 use quickwit_config::{validate_identifier, IndexConfig, SourceConfig};
 use quickwit_indexing::check_source_connectivity;
 use quickwit_metastore::{
     AddSourceRequestExt, CreateIndexResponseExt, IndexMetadata, IndexMetadataResponseExt,
     ListIndexesMetadataResponseExt, ListSplitsQuery, ListSplitsRequestExt,
-    MetastoreServiceStreamSplitsExt, SplitInfo, SplitMetadata, SplitState,
+    MetastoreServiceStreamSplitsExt, SplitInfo, SplitMetadata, SplitState, UpdateSourceRequestExt,
 };
 use quickwit_proto::metastore::{
     serde_utils, AddSourceRequest, CreateIndexRequest, DeleteIndexRequest, EntityKind,
     IndexMetadataRequest, ListIndexesMetadataRequest, ListSplitsRequest,
     MarkSplitsForDeletionRequest, MetastoreError, MetastoreService, MetastoreServiceClient,
-    ResetSourceCheckpointRequest,
+    ResetSourceCheckpointRequest, UpdateSourceRequest,
 };
 use quickwit_proto::types::{IndexUid, SplitId};
 use quickwit_proto::{ServiceError, ServiceErrorCode};
@@ -70,13 +66,28 @@ pub enum IndexServiceError {
 impl ServiceError for IndexServiceError {
     fn error_code(&self) -> ServiceErrorCode {
         match self {
-            Self::Internal(_) => ServiceErrorCode::Internal,
+            Self::Internal(err_msg) => {
+                rate_limited_error!(limit_per_min = 6, err_msg);
+                ServiceErrorCode::Internal
+            }
             Self::InvalidConfig(_) => ServiceErrorCode::BadRequest,
             Self::InvalidIdentifier(_) => ServiceErrorCode::BadRequest,
             Self::Metastore(error) => error.error_code(),
-            Self::OperationNotAllowed(_) => ServiceErrorCode::MethodNotAllowed,
-            Self::SplitDeletion(_) => ServiceErrorCode::Internal,
-            Self::Storage(_) => ServiceErrorCode::Internal,
+            Self::OperationNotAllowed(_) => ServiceErrorCode::Forbidden,
+            Self::SplitDeletion(delete_splits_error) => {
+                rate_limited_error!(
+                    limit_per_min = 6,
+                    "index service internal error/split deletion: {delete_splits_error:?}"
+                );
+                ServiceErrorCode::Internal
+            }
+            Self::Storage(storage_error) => {
+                rate_limited_error!(
+                    limit_per_min = 6,
+                    "index service internal error/storage {storage_error:?}"
+                );
+                ServiceErrorCode::Internal
+            }
         }
     }
 }
@@ -125,7 +136,7 @@ impl IndexService {
                 }
             }
         }
-        let mut metastore = self.metastore.clone();
+        let metastore = self.metastore.clone();
 
         let index_config_json = serde_utils::to_json_str(&index_config)?;
 
@@ -253,11 +264,12 @@ impl IndexService {
             }
         }
 
-        let mut metastore = self.metastore.clone();
+        let metastore = self.metastore.clone();
         let indexes_metadata = metastore
             .list_indexes_metadata(list_indexes_metadatas_request)
             .await?
-            .deserialize_indexes_metadata()?;
+            .deserialize_indexes_metadata()
+            .await?;
 
         if !ignore_missing && indexes_metadata.len() != index_id_patterns.len() {
             let found_index_ids: HashSet<&str> = indexes_metadata
@@ -292,7 +304,7 @@ impl IndexService {
         }
         let mut delete_responses: HashMap<String, Vec<SplitInfo>> = HashMap::new();
         let mut delete_errors: HashMap<String, IndexServiceError> = HashMap::new();
-        let mut stream = futures::stream::iter(delete_index_tasks).buffer_unordered(100);
+        let mut stream = futures::stream::iter(delete_index_tasks).buffer_unordered(5);
         while let Some((index_id, delete_response)) = stream.next().await {
             match delete_response {
                 Ok(split_infos) => {
@@ -348,14 +360,14 @@ impl IndexService {
             .await?;
 
         let deleted_entries = run_garbage_collect(
-            index_uid,
-            storage,
+            [(index_uid, storage)].into_iter().collect(),
             self.metastore.clone(),
             grace_period,
             // deletion_grace_period of zero, so that a cli call directly deletes splits after
             // marking to be deleted.
             Duration::ZERO,
             dry_run,
+            None,
             None,
         )
         .await?;
@@ -464,6 +476,40 @@ impl IndexService {
         Ok(source)
     }
 
+    /// Updates a source from an index identified by its UID.
+    pub async fn update_source(
+        &mut self,
+        index_uid: IndexUid,
+        source_config: SourceConfig,
+    ) -> Result<SourceConfig, IndexServiceError> {
+        let source_id = source_config.source_id.clone();
+        check_source_connectivity(&self.storage_resolver, &source_config)
+            .await
+            .map_err(IndexServiceError::InvalidConfig)?;
+        let update_source_request =
+            UpdateSourceRequest::try_from_source_config(index_uid.clone(), &source_config)?;
+        self.metastore.update_source(update_source_request).await?;
+        info!(
+            "source `{source_id}` successfully updated for index `{}`",
+            index_uid.index_id
+        );
+        let index_metadata_request = IndexMetadataRequest::for_index_id(index_uid.index_id);
+        let source = self
+            .metastore
+            .index_metadata(index_metadata_request)
+            .await?
+            .deserialize_index_metadata()?
+            .sources
+            .get(&source_id)
+            .ok_or_else(|| {
+                IndexServiceError::Internal(
+                    "created source is not in index metadata, this should never happen".to_string(),
+                )
+            })?
+            .clone();
+        Ok(source)
+    }
+
     pub async fn get_source(
         &mut self,
         index_id: &str,
@@ -524,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_index() {
-        let mut metastore = metastore_for_test();
+        let metastore = metastore_for_test();
         let storage_resolver = StorageResolver::for_test();
         let mut index_service = IndexService::new(metastore.clone(), storage_resolver);
         let index_id = "test-index";

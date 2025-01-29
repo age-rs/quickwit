@@ -1,37 +1,71 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use std::env::var;
-
-use once_cell::sync::Lazy;
-
-pub(crate) const CONFIGURATION_TEMPLATE: &str = "version: 0.6
+pub(crate) const CONFIGURATION_TEMPLATE: &str = r#"
+version: 0.8
 node_id: lambda-searcher
-metastore_uri: s3://${QW_LAMBDA_METASTORE_BUCKET}/index
-default_index_root_uri: s3://${QW_LAMBDA_INDEX_BUCKET}/index
+metastore_uri: s3://${QW_LAMBDA_METASTORE_BUCKET}/${QW_LAMBDA_METASTORE_PREFIX:-index}#polling_interval=${QW_LAMBDA_SEARCHER_METASTORE_POLLING_INTERVAL_SECONDS:-60}s
+default_index_root_uri: s3://${QW_LAMBDA_INDEX_BUCKET}/${QW_LAMBDA_INDEX_PREFIX:-index}
 data_dir: /tmp
 searcher:
   partial_request_cache_capacity: ${QW_LAMBDA_PARTIAL_REQUEST_CACHE_CAPACITY:-64M}
-";
+"#;
 
-pub(crate) static INDEX_ID: Lazy<String> =
-    Lazy::new(|| var("QW_LAMBDA_INDEX_ID").expect("QW_LAMBDA_INDEX_ID must be set"));
+#[cfg(test)]
+mod tests {
 
-pub(crate) static DISABLE_SEARCH_CACHE: Lazy<bool> =
-    Lazy::new(|| var("QW_LAMBDA_DISABLE_SEARCH_CACHE").is_ok_and(|v| v.as_str() == "true"));
+    use bytesize::ByteSize;
+    use quickwit_config::{ConfigFormat, NodeConfig};
+
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::file_serial(with_env)]
+    async fn test_load_config() {
+        let bucket = "mock-test-bucket";
+        std::env::set_var("QW_LAMBDA_METASTORE_BUCKET", bucket);
+        std::env::set_var("QW_LAMBDA_INDEX_BUCKET", bucket);
+        std::env::set_var(
+            "QW_LAMBDA_INDEX_CONFIG_URI",
+            "s3://mock-index-config-bucket",
+        );
+        std::env::set_var("QW_LAMBDA_INDEX_ID", "lambda-test");
+
+        let node_config = NodeConfig::load(ConfigFormat::Yaml, CONFIGURATION_TEMPLATE.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            node_config.data_dir_path.to_string_lossy(),
+            "/tmp",
+            "only `/tmp` is writeable in AWS Lambda"
+        );
+        assert_eq!(
+            node_config.default_index_root_uri,
+            "s3://mock-test-bucket/index"
+        );
+        assert_eq!(
+            node_config.metastore_uri.to_string(),
+            "s3://mock-test-bucket/index#polling_interval=60s"
+        );
+        assert_eq!(
+            node_config.searcher_config.partial_request_cache_capacity,
+            ByteSize::mb(64)
+        );
+
+        std::env::remove_var("QW_LAMBDA_METASTORE_BUCKET");
+        std::env::remove_var("QW_LAMBDA_INDEX_BUCKET");
+        std::env::remove_var("QW_LAMBDA_INDEX_CONFIG_URI");
+        std::env::remove_var("QW_LAMBDA_INDEX_ID");
+    }
+}

@@ -1,34 +1,29 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 mod serialize;
 
 use anyhow::ensure;
 use quickwit_common::uri::Uri;
-use quickwit_proto::types::IndexId;
+use quickwit_proto::types::{DocMappingUid, IndexId};
 use serde::{Deserialize, Serialize};
-pub use serialize::{IndexTemplateV0_7, VersionedIndexTemplate};
+pub use serialize::{IndexTemplateV0_8, VersionedIndexTemplate};
 
 use crate::index_config::validate_index_config;
 use crate::{
     validate_identifier, validate_index_id_pattern, DocMapping, IndexConfig, IndexingSettings,
-    RetentionPolicy, SearchSettings, TestableForRegression,
+    RetentionPolicy, SearchSettings,
 };
 
 pub type IndexTemplateId = String;
@@ -68,10 +63,14 @@ impl IndexTemplate {
             .unwrap_or(default_index_root_uri)
             .join(&index_id)?;
 
+        // Ensure that the doc mapping UID is truly unique per index.
+        let mut doc_mapping = self.doc_mapping.clone();
+        doc_mapping.doc_mapping_uid = DocMappingUid::random();
+
         let index_config = IndexConfig {
             index_id,
             index_uri,
-            doc_mapping: self.doc_mapping.clone(),
+            doc_mapping,
             indexing_settings: self.indexing_settings.clone(),
             search_settings: self.search_settings.clone(),
             retention_policy_opt: self.retention_policy_opt.clone(),
@@ -135,7 +134,8 @@ impl IndexTemplate {
     }
 }
 
-impl TestableForRegression for IndexTemplate {
+#[cfg(any(test, feature = "testsuite"))]
+impl crate::TestableForRegression for IndexTemplate {
     fn sample_for_regression() -> Self {
         let template_id = "test-template".to_string();
         let index_id_patterns = vec![
@@ -144,6 +144,7 @@ impl TestableForRegression for IndexTemplate {
         ];
 
         let doc_mapping_json = r#"{
+            "doc_mapping_uid": "00000000000000000000000001",
             "field_mappings": [
                 {
                     "name": "ts",
@@ -187,7 +188,7 @@ mod tests {
     #[test]
     fn test_index_template_serde() {
         let index_template_yaml = r#"
-            version: 0.7
+            version: 0.8
 
             template_id: test-template
             index_id_patterns:
@@ -233,33 +234,37 @@ mod tests {
         });
         let default_index_root_uri = Uri::for_test("s3://test-bucket/indexes");
 
-        let index_config = index_template
-            .apply_template("test-index".to_string(), &default_index_root_uri)
+        let index_config_foo = index_template
+            .apply_template("test-index-foo".to_string(), &default_index_root_uri)
             .unwrap();
 
-        assert_eq!(index_config.index_id, "test-index");
-        assert_eq!(index_config.index_uri, "ram:///indexes/test-index");
+        assert_eq!(index_config_foo.index_id, "test-index-foo");
+        assert_eq!(index_config_foo.index_uri, "ram:///indexes/test-index-foo");
 
-        assert_eq!(index_config.doc_mapping.timestamp_field.unwrap(), "ts");
-        assert_eq!(index_config.indexing_settings.commit_timeout_secs, 42);
+        assert_eq!(index_config_foo.doc_mapping.timestamp_field.unwrap(), "ts");
+        assert_eq!(index_config_foo.indexing_settings.commit_timeout_secs, 42);
         assert_eq!(
-            index_config.search_settings.default_search_fields,
+            index_config_foo.search_settings.default_search_fields,
             ["message"]
         );
-        let retention_policy = index_config.retention_policy_opt.unwrap();
+        let retention_policy = index_config_foo.retention_policy_opt.unwrap();
         assert_eq!(retention_policy.retention_period, "42 days");
         assert_eq!(retention_policy.evaluation_schedule, "hourly");
 
         index_template.index_root_uri = None;
 
-        let index_config = index_template
-            .apply_template("test-index".to_string(), &default_index_root_uri)
+        let index_config_bar = index_template
+            .apply_template("test-index-bar".to_string(), &default_index_root_uri)
             .unwrap();
 
-        assert_eq!(index_config.index_id, "test-index");
+        assert_eq!(index_config_bar.index_id, "test-index-bar");
         assert_eq!(
-            index_config.index_uri,
-            "s3://test-bucket/indexes/test-index"
+            index_config_bar.index_uri,
+            "s3://test-bucket/indexes/test-index-bar"
+        );
+        assert_ne!(
+            index_config_foo.doc_mapping.doc_mapping_uid,
+            index_config_bar.doc_mapping.doc_mapping_uid
         );
     }
 

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![warn(missing_docs)]
 #![allow(clippy::bool_assert_comparison)]
@@ -26,7 +21,7 @@
 //! metastore:
 //! - file-backed metastore
 //! - PostgreSQL metastore
-//! etc.
+//! - etc.
 
 #[allow(missing_docs)]
 pub mod checkpoint;
@@ -44,30 +39,31 @@ use std::ops::Range;
 pub use error::MetastoreResolverError;
 pub use metastore::control_plane_metastore::ControlPlaneMetastore;
 pub use metastore::file_backed::FileBackedMetastore;
-pub(crate) use metastore::index_metadata::serialize::{IndexMetadataV0_7, VersionedIndexMetadata};
+pub(crate) use metastore::index_metadata::serialize::{IndexMetadataV0_8, VersionedIndexMetadata};
 #[cfg(feature = "postgres")]
 pub use metastore::postgres::PostgresqlMetastore;
 pub use metastore::{
     file_backed, AddSourceRequestExt, CreateIndexRequestExt, CreateIndexResponseExt, IndexMetadata,
-    IndexMetadataResponseExt, ListIndexesMetadataResponseExt, ListSplitsQuery,
-    ListSplitsRequestExt, ListSplitsResponseExt, MetastoreServiceExt,
+    IndexMetadataResponseExt, IndexesMetadataResponseExt, ListIndexesMetadataResponseExt,
+    ListSplitsQuery, ListSplitsRequestExt, ListSplitsResponseExt, MetastoreServiceExt,
     MetastoreServiceStreamSplitsExt, PublishSplitsRequestExt, StageSplitsRequestExt,
+    UpdateIndexRequestExt, UpdateSourceRequestExt,
 };
 pub use metastore_factory::{MetastoreFactory, UnsupportedMetastore};
 pub use metastore_resolver::MetastoreResolver;
 use quickwit_common::is_disjoint;
 use quickwit_doc_mapper::tag_pruning::TagFilterAst;
 pub use split_metadata::{Split, SplitInfo, SplitMaturity, SplitMetadata, SplitState};
-pub(crate) use split_metadata_version::{SplitMetadataV0_7, VersionedSplitMetadata};
+pub(crate) use split_metadata_version::{SplitMetadataV0_8, VersionedSplitMetadata};
 
 #[derive(utoipa::OpenApi)]
 #[openapi(components(schemas(
+    IndexMetadataV0_8,
     Split,
+    SplitMetadataV0_8,
     SplitState,
     VersionedIndexMetadata,
-    IndexMetadataV0_7,
     VersionedSplitMetadata,
-    SplitMetadataV0_7,
 )))]
 /// Schema used for the OpenAPI generation which are apart of this crate.
 pub struct MetastoreApiSchemas;

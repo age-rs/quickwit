@@ -4,6 +4,12 @@ api_root: http://localhost:7280/api/v1/
 endpoint: indexes/gharchive
 status_code: null
 ---
+# Delete possibly remaining index
+method: DELETE
+api_root: http://localhost:7280/api/v1/
+endpoint: indexes/empty_index
+status_code: null
+---
 # Create index
 method: POST
 api_root: http://localhost:7280/api/v1/
@@ -30,13 +36,16 @@ json:
     timestamp_field: created_at
     mode: dynamic
     field_mappings:
-        - name: actor.id
-          type: u64
-          fast: true
-          indexed: true
+        - name: repo
+          type: object
+          field_mappings:
+              - name: name
+                type: text
+                fast: true
+                indexed: true
         - name: public
           type: bool
-          fast: false          
+          fast: false
           indexed: true
         - name: created_at
           type: datetime
@@ -48,14 +57,11 @@ json:
       fast:
         normalizer: lowercase
       record: position
-sleep_after: 3
 ---
 # Ingest documents
 method: POST
 endpoint: _bulk
-num_retries: 10
 params:
   refresh: "true"
 headers: {"Content-Type": "application/json", "content-encoding": "gzip"}
 body_from_file: gharchive-bulk.json.gz
-sleep_after: 3

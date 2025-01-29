@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::time::Duration;
 
@@ -36,7 +31,7 @@ use tracing::{debug, error, info, warn};
 use crate::retry::search::LeafSearchRetryPolicy;
 use crate::retry::search_stream::{LeafSearchStreamRetryPolicy, SuccessfulSplitIds};
 use crate::retry::{retry_client, DefaultRetryPolicy, RetryPolicy};
-use crate::{SearchError, SearchJobPlacer, SearchServiceClient};
+use crate::{merge_resource_stats_it, SearchError, SearchJobPlacer, SearchServiceClient};
 
 /// Maximum number of put requests emitted to perform a replicated given PUT KV.
 const MAX_PUT_KV_ATTEMPTS: usize = 6;
@@ -94,21 +89,36 @@ impl ClusterClient {
     ) -> crate::Result<LeafSearchResponse> {
         let mut response_res = client.leaf_search(request.clone()).await;
         let retry_policy = LeafSearchRetryPolicy {};
-        if let Some(retry_request) = retry_policy.retry_request(request, &response_res) {
-            assert!(!retry_request.split_offsets.is_empty());
-            client = retry_client(
-                &self.search_job_placer,
-                client.grpc_addr(),
-                &retry_request.split_offsets[0].split_id,
-            )
-            .await?;
-            debug!(
-                "Leaf search response error: `{:?}`. Retry once to execute {:?} with {:?}",
-                response_res, retry_request, client
+        // We retry only once.
+        let Some(retry_request) = retry_policy.retry_request(request, &response_res) else {
+            return response_res;
+        };
+        let Some(first_split) = retry_request
+            .leaf_requests
+            .iter()
+            .flat_map(|leaf_req| leaf_req.split_offsets.iter())
+            .next()
+        else {
+            warn!(
+                "the retry request did not contain any split to retry. this should never happen, \
+                 please report"
             );
-            let retry_result = client.leaf_search(retry_request).await;
-            response_res = merge_leaf_search_results(response_res, retry_result);
-        }
+            return response_res;
+        };
+        // There could be more than one split in the retry request. We pick a single client
+        // arbitrarily only considering the affinity of the first split.
+        client = retry_client(
+            &self.search_job_placer,
+            client.grpc_addr(),
+            &first_split.split_id,
+        )
+        .await?;
+        debug!(
+            "Leaf search response error: `{:?}`. Retry once to execute {:?} with {:?}",
+            response_res, retry_request, client
+        );
+        let retry_result = client.leaf_search(retry_request).await;
+        response_res = merge_original_with_retry_leaf_search_results(response_res, retry_result);
         response_res
     }
 
@@ -274,16 +284,24 @@ fn merge_intermediate_aggregation(left: &[u8], right: &[u8]) -> crate::Result<Ve
     Ok(serialized)
 }
 
-fn merge_leaf_search_response(
-    mut left_response: LeafSearchResponse,
-    right_response: LeafSearchResponse,
+/// Merge two leaf search response.
+///
+/// # Quirk
+///
+/// This is implemented for a retries.
+/// For instance, the set of attempted splits of right is supposed to be the set of failed
+/// list of the left one, so that the list of the overal failed splits is the list of splits on the
+/// `right_response`.
+fn merge_original_with_retry_leaf_search_response(
+    mut original_response: LeafSearchResponse,
+    retry_response: LeafSearchResponse,
 ) -> crate::Result<LeafSearchResponse> {
-    left_response
+    original_response
         .partial_hits
-        .extend(right_response.partial_hits);
+        .extend(retry_response.partial_hits);
     let intermediate_aggregation_result: Option<Vec<u8>> = match (
-        left_response.intermediate_aggregation_result,
-        right_response.intermediate_aggregation_result,
+        original_response.intermediate_aggregation_result,
+        retry_response.intermediate_aggregation_result,
     ) {
         (Some(left_agg_bytes), Some(right_agg_bytes)) => {
             let intermediate_aggregation_bytes: Vec<u8> =
@@ -294,24 +312,31 @@ fn merge_leaf_search_response(
         (Some(left), None) => Some(left),
         (None, None) => None,
     };
+    let resource_stats = merge_resource_stats_it([
+        &original_response.resource_stats,
+        &retry_response.resource_stats,
+    ]);
     Ok(LeafSearchResponse {
         intermediate_aggregation_result,
-        num_hits: left_response.num_hits + right_response.num_hits,
-        num_attempted_splits: left_response.num_attempted_splits
-            + right_response.num_attempted_splits,
-        failed_splits: right_response.failed_splits,
-        partial_hits: left_response.partial_hits,
+        num_hits: original_response.num_hits + retry_response.num_hits,
+        num_attempted_splits: original_response.num_attempted_splits
+            + retry_response.num_attempted_splits,
+        failed_splits: retry_response.failed_splits,
+        partial_hits: original_response.partial_hits,
+        num_successful_splits: original_response.num_successful_splits
+            + retry_response.num_successful_splits,
+        resource_stats,
     })
 }
 
 // Merge initial leaf search results with results obtained from a retry.
-fn merge_leaf_search_results(
+fn merge_original_with_retry_leaf_search_results(
     left_search_response_result: crate::Result<LeafSearchResponse>,
     right_search_response_result: crate::Result<LeafSearchResponse>,
 ) -> crate::Result<LeafSearchResponse> {
     match (left_search_response_result, right_search_response_result) {
         (Ok(left_response), Ok(right_response)) => {
-            merge_leaf_search_response(left_response, right_response)
+            merge_original_with_retry_leaf_search_response(left_response, right_response)
         }
         (Ok(single_valid_response), Err(_)) => Ok(single_valid_response),
         (Err(_), Ok(single_valid_response)) => Ok(single_valid_response),
@@ -351,8 +376,8 @@ mod tests {
     use std::net::SocketAddr;
 
     use quickwit_proto::search::{
-        PartialHit, SearchRequest, SearchStreamRequest, SortValue, SplitIdAndFooterOffsets,
-        SplitSearchError,
+        LeafRequestRef, PartialHit, SearchRequest, SearchStreamRequest, SortValue,
+        SplitIdAndFooterOffsets, SplitSearchError,
     };
     use quickwit_query::query_ast::qast_json_helper;
 
@@ -380,6 +405,7 @@ mod tests {
                 split_footer_start: 0,
                 timestamp_start: None,
                 timestamp_end: None,
+                num_docs: 0,
             }],
             ..Default::default()
         }
@@ -394,24 +420,30 @@ mod tests {
         };
         LeafSearchRequest {
             search_request: Some(search_request),
-            doc_mapper: "doc_mapper".to_string(),
-            index_uri: "uri".to_string(),
-            split_offsets: vec![
-                SplitIdAndFooterOffsets {
-                    split_id: "split_1".to_string(),
-                    split_footer_start: 0,
-                    split_footer_end: 100,
-                    timestamp_start: None,
-                    timestamp_end: None,
-                },
-                SplitIdAndFooterOffsets {
-                    split_id: "split_2".to_string(),
-                    split_footer_start: 0,
-                    split_footer_end: 100,
-                    timestamp_start: None,
-                    timestamp_end: None,
-                },
-            ],
+            doc_mappers: vec!["doc_mapper".to_string()],
+            index_uris: vec!["uri".to_string()],
+            leaf_requests: vec![LeafRequestRef {
+                index_uri_ord: 0,
+                doc_mapper_ord: 0,
+                split_offsets: vec![
+                    SplitIdAndFooterOffsets {
+                        split_id: "split_1".to_string(),
+                        split_footer_start: 0,
+                        split_footer_end: 100,
+                        timestamp_start: None,
+                        timestamp_end: None,
+                        num_docs: 0,
+                    },
+                    SplitIdAndFooterOffsets {
+                        split_id: "split_2".to_string(),
+                        split_footer_start: 0,
+                        split_footer_end: 100,
+                        timestamp_start: None,
+                        timestamp_end: None,
+                        num_docs: 0,
+                    },
+                ],
+            }],
         }
     }
 
@@ -437,6 +469,7 @@ mod tests {
                     split_footer_end: 100,
                     timestamp_start: None,
                     timestamp_end: None,
+                    num_docs: 0,
                 },
                 SplitIdAndFooterOffsets {
                     split_id: "split_2".to_string(),
@@ -444,6 +477,7 @@ mod tests {
                     split_footer_end: 100,
                     timestamp_start: None,
                     timestamp_end: None,
+                    num_docs: 0,
                 },
             ],
         }
@@ -555,7 +589,7 @@ mod tests {
         let mut mock_search_service = MockSearchService::new();
         mock_search_service
             .expect_leaf_search()
-            .withf(|request| request.split_offsets[0].split_id == "split_1")
+            .withf(|request| request.leaf_requests[0].split_offsets[0].split_id == "split_1")
             .return_once(|_: LeafSearchRequest| {
                 Ok(LeafSearchResponse {
                     num_hits: 1,
@@ -570,7 +604,7 @@ mod tests {
             });
         mock_search_service
             .expect_leaf_search()
-            .withf(|request| request.split_offsets[0].split_id == "split_2")
+            .withf(|request| request.leaf_requests[0].split_offsets[0].split_id == "split_2")
             .return_once(|_: LeafSearchRequest| {
                 Ok(LeafSearchResponse {
                     num_hits: 1,
@@ -617,8 +651,11 @@ mod tests {
             num_attempted_splits: 1,
             ..Default::default()
         };
-        let merged_leaf_search_response =
-            merge_leaf_search_results(Ok(leaf_response), Ok(leaf_response_retry)).unwrap();
+        let merged_leaf_search_response = merge_original_with_retry_leaf_search_results(
+            Ok(leaf_response),
+            Ok(leaf_response_retry),
+        )
+        .unwrap();
         assert_eq!(merged_leaf_search_response.num_attempted_splits, 2);
         assert_eq!(merged_leaf_search_response.num_hits, 2);
         assert_eq!(merged_leaf_search_response.partial_hits.len(), 2);
@@ -640,7 +677,7 @@ mod tests {
             num_attempted_splits: 1,
             ..Default::default()
         };
-        let merged_result = merge_leaf_search_results(
+        let merged_result = merge_original_with_retry_leaf_search_results(
             Err(SearchError::Internal("error".to_string())),
             Ok(leaf_response),
         )
@@ -654,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_merge_leaf_search_retry_error_on_error() -> anyhow::Result<()> {
-        let merge_error = merge_leaf_search_results(
+        let merge_error = merge_original_with_retry_leaf_search_results(
             Err(SearchError::Internal("error".to_string())),
             Err(SearchError::Internal("retry error".to_string())),
         )
@@ -709,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_kv_happy_path() {
         // 3 servers 1, 2, 3
-        // Targetted key has affinity [2, 3, 1].
+        // Targeted key has affinity [2, 3, 1].
         //
         // Put on 2 and 3 is successful
         // Get succeeds on 2.
@@ -754,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_kv_failing_get() {
         // 3 servers 1, 2, 3
-        // Targetted key has affinity [2, 3, 1].
+        // Targeted key has affinity [2, 3, 1].
         //
         // Put on 2 and 3 is successful
         // Get fails on 2.

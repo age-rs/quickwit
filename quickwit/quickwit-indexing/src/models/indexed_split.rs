@@ -1,30 +1,26 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt;
 use std::path::Path;
 
 use quickwit_common::io::IoControls;
+use quickwit_common::metrics::GaugeGuard;
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_metastore::checkpoint::IndexCheckpointDelta;
 use quickwit_proto::indexing::IndexingPipelineId;
-use quickwit_proto::types::{IndexUid, PublishToken};
+use quickwit_proto::types::{DocMappingUid, IndexUid, PublishToken};
 use tantivy::directory::MmapDirectory;
 use tantivy::IndexBuilder;
 use tracing::{instrument, Span};
@@ -81,6 +77,7 @@ impl IndexedSplitBuilder {
         pipeline_id: IndexingPipelineId,
         partition_id: u64,
         last_delete_opstamp: u64,
+        doc_mapping_uid: DocMappingUid,
         scratch_directory: TempDirectory,
         index_builder: IndexBuilder,
         io_controls: IoControls,
@@ -101,7 +98,10 @@ impl IndexedSplitBuilder {
             index_builder.single_segment_index_writer(controlled_directory.clone(), 15_000_000)?;
         Ok(Self {
             split_attrs: SplitAttrs {
-                pipeline_id,
+                node_id: pipeline_id.node_id,
+                index_uid: pipeline_id.index_uid,
+                source_id: pipeline_id.source_id,
+                doc_mapping_uid,
                 partition_id,
                 split_id,
                 num_docs: 0,
@@ -120,10 +120,9 @@ impl IndexedSplitBuilder {
     #[instrument(name="serialize_split",
         skip_all,
         fields(
-            index_id=%self.split_attrs.pipeline_id.index_uid.index_id,
-            source_id=%self.split_attrs.pipeline_id.source_id,
-            node_id=%self.split_attrs.pipeline_id.node_id,
-            pipeline_uid=%self.split_attrs.pipeline_id.pipeline_uid,
+            node_id=%self.split_attrs.node_id,
+            index_uid=%self.split_attrs.index_uid,
+            source_id=%self.split_attrs.source_id,
             split_id=%self.split_attrs.split_id,
             partition_id=%self.split_attrs.partition_id,
             num_docs=%self.split_attrs.num_docs,
@@ -183,9 +182,11 @@ pub struct IndexedSplitBatchBuilder {
     pub publish_token_opt: Option<PublishToken>,
     pub commit_trigger: CommitTrigger,
     pub batch_parent_span: Span,
+    pub memory_usage: GaugeGuard<'static>,
+    pub _split_builders_guard: GaugeGuard<'static>,
 }
 
-/// Sends notifications to the Publisher that the last batch of splits was emtpy.
+/// Sends notifications to the Publisher that the last batch of splits was empty.
 #[derive(Debug)]
 pub struct EmptySplit {
     pub index_uid: IndexUid,
