@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::borrow::Borrow;
 use std::hash::Hash;
@@ -74,6 +69,7 @@ struct NeedMutMemorySizedCache<K: Hash + Eq> {
 
 impl<K: Hash + Eq> Drop for NeedMutMemorySizedCache<K> {
     fn drop(&mut self) {
+        // we don't count this toward evicted entries, as we are clearing the whole cache
         self.cache_counters
             .in_cache_count
             .sub(self.num_items as i64);
@@ -110,6 +106,8 @@ impl<K: Hash + Eq> NeedMutMemorySizedCache<K> {
         self.num_bytes -= num_bytes;
         self.cache_counters.in_cache_count.dec();
         self.cache_counters.in_cache_num_bytes.sub(num_bytes as i64);
+        self.cache_counters.evict_num_items.inc();
+        self.cache_counters.evict_num_bytes.inc_by(num_bytes);
     }
 
     pub fn get<Q>(&mut self, cache_key: &Q) -> Option<OwnedBytes>

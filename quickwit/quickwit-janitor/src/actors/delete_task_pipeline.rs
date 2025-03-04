@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,9 +33,9 @@ use quickwit_indexing::actors::{
 use quickwit_indexing::merge_policy::merge_policy_from_settings;
 use quickwit_indexing::{IndexingSplitStore, PublisherType, SplitsUpdateMailbox};
 use quickwit_metastore::IndexMetadataResponseExt;
-use quickwit_proto::indexing::IndexingPipelineId;
+use quickwit_proto::indexing::MergePipelineId;
 use quickwit_proto::metastore::{IndexMetadataRequest, MetastoreService, MetastoreServiceClient};
-use quickwit_proto::types::{IndexUid, PipelineUid};
+use quickwit_proto::types::{IndexUid, NodeId};
 use quickwit_search::SearchJobPlacer;
 use quickwit_storage::Storage;
 use serde::Serialize;
@@ -156,7 +151,7 @@ impl DeleteTaskPipeline {
 
     pub async fn spawn_pipeline(&mut self, ctx: &ActorContext<Self>) -> anyhow::Result<()> {
         info!(
-            index_id=%self.index_uid.index_id,
+            index_uid=%self.index_uid,
             root_dir=%self.delete_service_task_dir.to_str().unwrap(),
             "spawning delete tasks pipeline",
         );
@@ -181,6 +176,7 @@ impl DeleteTaskPipeline {
             UploaderType::DeleteUploader,
             self.metastore.clone(),
             merge_policy,
+            index_config.retention_policy_opt.clone(),
             split_store.clone(),
             SplitsUpdateMailbox::Publisher(publisher_mailbox),
             self.max_concurrent_split_uploads,
@@ -193,10 +189,9 @@ impl DeleteTaskPipeline {
         let tag_fields = doc_mapper.tag_named_fields()?;
         let packager = Packager::new("MergePackager", tag_fields, uploader_mailbox);
         let (packager_mailbox, packager_supervisor_handler) = ctx.spawn_actor().supervise(packager);
-        let index_pipeline_id = IndexingPipelineId {
+        let pipeline_id = MergePipelineId {
+            node_id: NodeId::from("unknown"),
             index_uid: self.index_uid.clone(),
-            node_id: "unknown".to_string(),
-            pipeline_uid: PipelineUid::from_u128(0u128),
             source_id: "unknown".to_string(),
         };
 
@@ -206,7 +201,7 @@ impl DeleteTaskPipeline {
             .clone()
             .set_component("split_downloader_delete");
         let delete_executor = MergeExecutor::new(
-            index_pipeline_id,
+            pipeline_id,
             self.metastore.clone(),
             doc_mapper.clone(),
             delete_executor_io_controls,
@@ -352,7 +347,7 @@ mod tests {
             serde_json::json!({"body": "delete", "ts": 0 }),
         ];
         test_sandbox.add_documents(docs).await?;
-        let mut metastore = test_sandbox.metastore();
+        let metastore = test_sandbox.metastore();
         metastore
             .create_delete_task(DeleteQuery {
                 index_uid: Some(index_uid.clone()),

@@ -39,8 +39,11 @@ COPY --from=ui-builder /quickwit/quickwit-ui/build /quickwit/quickwit-ui/build
 WORKDIR /quickwit
 
 RUN echo "Building workspace with feature(s) '$CARGO_FEATURES' and profile '$CARGO_PROFILE'" \
-    && cargo build \
+    && RUSTFLAGS="--cfg tokio_unstable" \
+        cargo build \
+        -p quickwit-cli \
         --features $CARGO_FEATURES \
+        --bin quickwit \
         $(test "$CARGO_PROFILE" = "release" && echo "--release") \
     && echo "Copying binaries to /quickwit/bin" \
     && mkdir -p /quickwit/bin \
@@ -56,7 +59,6 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0"
 
 RUN apt-get -y update \
     && apt-get -y install ca-certificates \
-                          curl \
                           libssl3 \
     && rm -rf /var/lib/apt/lists/*
 

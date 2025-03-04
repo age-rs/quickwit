@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -215,12 +210,15 @@ impl Storage for LocalFileStorage {
         let full_path = self.full_path(path)?;
         tokio::task::spawn_blocking(move || {
             use std::io::{Read, Seek};
-
             // we run these io in a spawn_blocking so there is no scheduling delay between each
             // step, as there would be if using tokio async File.
             let mut file = std::fs::File::open(full_path)?;
             file.seek(SeekFrom::Start(range.start as u64))?;
-            let mut content_bytes: Vec<u8> = vec![0u8; range.len()];
+            let mut content_bytes: Vec<u8> = Vec::with_capacity(range.len());
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                content_bytes.set_len(range.len());
+            }
             file.read_exact(&mut content_bytes)?;
             Ok(OwnedBytes::new(content_bytes))
         })
@@ -330,7 +328,7 @@ impl Storage for LocalFileStorage {
                     Ok(metadata.len())
                 } else {
                     Err(StorageErrorKind::NotFound.with_error(anyhow::anyhow!(
-                        "file `{}` is actually a directory",
+                        "file `{}` is not a regular file, cannot determine its size",
                         path.display()
                     )))
                 }

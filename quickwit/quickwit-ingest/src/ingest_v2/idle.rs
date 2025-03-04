@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::time::{Duration, Instant};
 
@@ -63,17 +58,18 @@ impl CloseIdleShardsTask {
             let Some(state) = self.weak_state.upgrade() else {
                 return;
             };
-            let mut state_guard =
-                with_lock_metrics!(state.lock_partially(), "close_idle_shards", "write")
-                    .await
-                    .expect("ingester should be ready");
+            let Ok(mut state_guard) =
+                with_lock_metrics!(state.lock_partially(), "close_idle_shards", "write").await
+            else {
+                return;
+            };
 
             let now = Instant::now();
 
             for (queue_id, shard) in &mut state_guard.shards {
                 if shard.is_open() && shard.is_idle(now, self.idle_shard_timeout) {
-                    info!("closing idle shard `{queue_id}`");
                     shard.close();
+                    info!("closed idle shard `{queue_id}`");
                 }
             }
         }
@@ -104,7 +100,9 @@ mod tests {
             ShardState::Open,
             Position::Beginning,
             Position::Beginning,
+            None,
             now - idle_shard_timeout,
+            false,
         );
         let queue_id_01 = queue_id(&index_uid, "test-source", &ShardId::from(1));
         state_guard.shards.insert(queue_id_01.clone(), shard_01);
@@ -113,7 +111,9 @@ mod tests {
             ShardState::Open,
             Position::Beginning,
             Position::Beginning,
+            None,
             now - idle_shard_timeout / 2,
+            false,
         );
         let queue_id_02 = queue_id(&index_uid, "test-source", &ShardId::from(2));
         state_guard.shards.insert(queue_id_02.clone(), shard_02);

@@ -19,8 +19,8 @@ pub struct VersionedKeyValue {
     pub value: ::prost::alloc::string::String,
     #[prost(uint64, tag = "3")]
     pub version: u64,
-    #[prost(bool, tag = "4")]
-    pub is_tombstone: bool,
+    #[prost(enumeration = "DeletionStatus", tag = "4")]
+    pub status: i32,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -51,6 +51,37 @@ pub struct FetchClusterStateResponse {
     #[prost(message, repeated, tag = "2")]
     pub node_states: ::prost::alloc::vec::Vec<NodeState>,
 }
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DeletionStatus {
+    Set = 0,
+    Deleted = 1,
+    DeleteAfterTtl = 2,
+}
+impl DeletionStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            DeletionStatus::Set => "Set",
+            DeletionStatus::Deleted => "Deleted",
+            DeletionStatus::DeleteAfterTtl => "DeleteAfterTtl",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "Set" => Some(Self::Set),
+            "Deleted" => Some(Self::Deleted),
+            "DeleteAfterTtl" => Some(Self::DeleteAfterTtl),
+            _ => None,
+        }
+    }
+}
 /// BEGIN quickwit-codegen
 #[allow(unused_imports)]
 use std::str::FromStr;
@@ -63,23 +94,18 @@ impl RpcName for FetchClusterStateRequest {
 }
 #[cfg_attr(any(test, feature = "testsuite"), mockall::automock)]
 #[async_trait::async_trait]
-pub trait ClusterService: std::fmt::Debug + dyn_clone::DynClone + Send + Sync + 'static {
+pub trait ClusterService: std::fmt::Debug + Send + Sync + 'static {
     async fn fetch_cluster_state(
-        &mut self,
+        &self,
         request: FetchClusterStateRequest,
     ) -> crate::cluster::ClusterResult<FetchClusterStateResponse>;
 }
-dyn_clone::clone_trait_object!(ClusterService);
-#[cfg(any(test, feature = "testsuite"))]
-impl Clone for MockClusterService {
-    fn clone(&self) -> Self {
-        MockClusterService::new()
-    }
-}
 #[derive(Debug, Clone)]
 pub struct ClusterServiceClient {
-    inner: Box<dyn ClusterService>,
+    inner: InnerClusterServiceClient,
 }
+#[derive(Debug, Clone)]
+struct InnerClusterServiceClient(std::sync::Arc<dyn ClusterService>);
 impl ClusterServiceClient {
     pub fn new<T>(instance: T) -> Self
     where
@@ -89,9 +115,11 @@ impl ClusterServiceClient {
         assert!(
             std::any::TypeId::of:: < T > () != std::any::TypeId::of:: <
             MockClusterService > (),
-            "`MockClusterService` must be wrapped in a `MockClusterServiceWrapper`. Use `MockClusterService::from(mock)` to instantiate the client."
+            "`MockClusterService` must be wrapped in a `MockClusterServiceWrapper`: use `ClusterServiceClient::from_mock(mock)` to instantiate the client"
         );
-        Self { inner: Box::new(instance) }
+        Self {
+            inner: InnerClusterServiceClient(std::sync::Arc::new(instance)),
+        }
     }
     pub fn as_grpc_service(
         &self,
@@ -148,48 +176,47 @@ impl ClusterServiceClient {
         ClusterServiceTowerLayerStack::default()
     }
     #[cfg(any(test, feature = "testsuite"))]
-    pub fn mock() -> MockClusterService {
-        MockClusterService::new()
+    pub fn from_mock(mock: MockClusterService) -> Self {
+        let mock_wrapper = mock_cluster_service::MockClusterServiceWrapper {
+            inner: tokio::sync::Mutex::new(mock),
+        };
+        Self::new(mock_wrapper)
+    }
+    #[cfg(any(test, feature = "testsuite"))]
+    pub fn mocked() -> Self {
+        Self::from_mock(MockClusterService::new())
     }
 }
 #[async_trait::async_trait]
 impl ClusterService for ClusterServiceClient {
     async fn fetch_cluster_state(
-        &mut self,
+        &self,
         request: FetchClusterStateRequest,
     ) -> crate::cluster::ClusterResult<FetchClusterStateResponse> {
-        self.inner.fetch_cluster_state(request).await
+        self.inner.0.fetch_cluster_state(request).await
     }
 }
 #[cfg(any(test, feature = "testsuite"))]
-pub mod cluster_service_mock {
+pub mod mock_cluster_service {
     use super::*;
-    #[derive(Debug, Clone)]
-    struct MockClusterServiceWrapper {
-        inner: std::sync::Arc<tokio::sync::Mutex<MockClusterService>>,
+    #[derive(Debug)]
+    pub struct MockClusterServiceWrapper {
+        pub(super) inner: tokio::sync::Mutex<MockClusterService>,
     }
     #[async_trait::async_trait]
     impl ClusterService for MockClusterServiceWrapper {
         async fn fetch_cluster_state(
-            &mut self,
+            &self,
             request: super::FetchClusterStateRequest,
         ) -> crate::cluster::ClusterResult<super::FetchClusterStateResponse> {
             self.inner.lock().await.fetch_cluster_state(request).await
-        }
-    }
-    impl From<MockClusterService> for ClusterServiceClient {
-        fn from(mock: MockClusterService) -> Self {
-            let mock_wrapper = MockClusterServiceWrapper {
-                inner: std::sync::Arc::new(tokio::sync::Mutex::new(mock)),
-            };
-            ClusterServiceClient::new(mock_wrapper)
         }
     }
 }
 pub type BoxFuture<T, E> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'static>,
 >;
-impl tower::Service<FetchClusterStateRequest> for Box<dyn ClusterService> {
+impl tower::Service<FetchClusterStateRequest> for InnerClusterServiceClient {
     type Response = FetchClusterStateResponse;
     type Error = crate::cluster::ClusterError;
     type Future = BoxFuture<Self::Response, Self::Error>;
@@ -200,36 +227,29 @@ impl tower::Service<FetchClusterStateRequest> for Box<dyn ClusterService> {
         std::task::Poll::Ready(Ok(()))
     }
     fn call(&mut self, request: FetchClusterStateRequest) -> Self::Future {
-        let mut svc = self.clone();
-        let fut = async move { svc.fetch_cluster_state(request).await };
+        let svc = self.clone();
+        let fut = async move { svc.0.fetch_cluster_state(request).await };
         Box::pin(fut)
     }
 }
 /// A tower service stack is a set of tower services.
 #[derive(Debug)]
 struct ClusterServiceTowerServiceStack {
-    inner: Box<dyn ClusterService>,
+    #[allow(dead_code)]
+    inner: InnerClusterServiceClient,
     fetch_cluster_state_svc: quickwit_common::tower::BoxService<
         FetchClusterStateRequest,
         FetchClusterStateResponse,
         crate::cluster::ClusterError,
     >,
 }
-impl Clone for ClusterServiceTowerServiceStack {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            fetch_cluster_state_svc: self.fetch_cluster_state_svc.clone(),
-        }
-    }
-}
 #[async_trait::async_trait]
 impl ClusterService for ClusterServiceTowerServiceStack {
     async fn fetch_cluster_state(
-        &mut self,
+        &self,
         request: FetchClusterStateRequest,
     ) -> crate::cluster::ClusterResult<FetchClusterStateResponse> {
-        self.fetch_cluster_state_svc.ready().await?.call(request).await
+        self.fetch_cluster_state_svc.clone().ready().await?.call(request).await
     }
 }
 type FetchClusterStateLayer = quickwit_common::tower::BoxLayer<
@@ -303,7 +323,8 @@ impl ClusterServiceTowerLayerStack {
     where
         T: ClusterService,
     {
-        self.build_from_boxed(Box::new(instance))
+        let inner_client = InnerClusterServiceClient(std::sync::Arc::new(instance));
+        self.build_from_inner_client(inner_client)
     }
     pub fn build_from_channel(
         self,
@@ -311,23 +332,21 @@ impl ClusterServiceTowerLayerStack {
         channel: tonic::transport::Channel,
         max_message_size: bytesize::ByteSize,
     ) -> ClusterServiceClient {
-        self.build_from_boxed(
-            Box::new(ClusterServiceClient::from_channel(addr, channel, max_message_size)),
-        )
+        let client = ClusterServiceClient::from_channel(addr, channel, max_message_size);
+        let inner_client = client.inner;
+        self.build_from_inner_client(inner_client)
     }
     pub fn build_from_balance_channel(
         self,
         balance_channel: quickwit_common::tower::BalanceChannel<std::net::SocketAddr>,
         max_message_size: bytesize::ByteSize,
     ) -> ClusterServiceClient {
-        self.build_from_boxed(
-            Box::new(
-                ClusterServiceClient::from_balance_channel(
-                    balance_channel,
-                    max_message_size,
-                ),
-            ),
-        )
+        let client = ClusterServiceClient::from_balance_channel(
+            balance_channel,
+            max_message_size,
+        );
+        let inner_client = client.inner;
+        self.build_from_inner_client(inner_client)
     }
     pub fn build_from_mailbox<A>(
         self,
@@ -337,22 +356,31 @@ impl ClusterServiceTowerLayerStack {
         A: quickwit_actors::Actor + std::fmt::Debug + Send + 'static,
         ClusterServiceMailbox<A>: ClusterService,
     {
-        self.build_from_boxed(Box::new(ClusterServiceMailbox::new(mailbox)))
+        let inner_client = InnerClusterServiceClient(
+            std::sync::Arc::new(ClusterServiceMailbox::new(mailbox)),
+        );
+        self.build_from_inner_client(inner_client)
     }
-    fn build_from_boxed(
+    #[cfg(any(test, feature = "testsuite"))]
+    pub fn build_from_mock(self, mock: MockClusterService) -> ClusterServiceClient {
+        let client = ClusterServiceClient::from_mock(mock);
+        let inner_client = client.inner;
+        self.build_from_inner_client(inner_client)
+    }
+    fn build_from_inner_client(
         self,
-        boxed_instance: Box<dyn ClusterService>,
+        inner_client: InnerClusterServiceClient,
     ) -> ClusterServiceClient {
         let fetch_cluster_state_svc = self
             .fetch_cluster_state_layers
             .into_iter()
             .rev()
             .fold(
-                quickwit_common::tower::BoxService::new(boxed_instance.clone()),
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
                 |svc, layer| layer.layer(svc),
             );
         let tower_svc_stack = ClusterServiceTowerServiceStack {
-            inner: boxed_instance.clone(),
+            inner: inner_client,
             fetch_cluster_state_svc,
         };
         ClusterServiceClient::new(tower_svc_stack)
@@ -438,10 +466,10 @@ where
     >,
 {
     async fn fetch_cluster_state(
-        &mut self,
+        &self,
         request: FetchClusterStateRequest,
     ) -> crate::cluster::ClusterResult<FetchClusterStateResponse> {
-        self.call(request).await
+        self.clone().call(request).await
     }
 }
 #[derive(Debug, Clone)]
@@ -479,26 +507,32 @@ where
     T::Future: Send,
 {
     async fn fetch_cluster_state(
-        &mut self,
+        &self,
         request: FetchClusterStateRequest,
     ) -> crate::cluster::ClusterResult<FetchClusterStateResponse> {
         self.inner
+            .clone()
             .fetch_cluster_state(request)
             .await
             .map(|response| response.into_inner())
-            .map_err(|error| error.into())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                FetchClusterStateRequest::rpc_name(),
+            ))
     }
 }
 #[derive(Debug)]
 pub struct ClusterServiceGrpcServerAdapter {
-    inner: Box<dyn ClusterService>,
+    inner: InnerClusterServiceClient,
 }
 impl ClusterServiceGrpcServerAdapter {
     pub fn new<T>(instance: T) -> Self
     where
         T: ClusterService,
     {
-        Self { inner: Box::new(instance) }
+        Self {
+            inner: InnerClusterServiceClient(std::sync::Arc::new(instance)),
+        }
     }
 }
 #[async_trait::async_trait]
@@ -509,11 +543,11 @@ for ClusterServiceGrpcServerAdapter {
         request: tonic::Request<FetchClusterStateRequest>,
     ) -> Result<tonic::Response<FetchClusterStateResponse>, tonic::Status> {
         self.inner
-            .clone()
+            .0
             .fetch_cluster_state(request.into_inner())
             .await
             .map(tonic::Response::new)
-            .map_err(|error| error.into())
+            .map_err(crate::error::grpc_error_to_grpc_status)
     }
 }
 /// Generated client implementations.

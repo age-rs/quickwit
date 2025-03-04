@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::cmp::Ordering;
 use std::collections::{btree_map, btree_set};
@@ -106,10 +101,10 @@ impl<T> SortedIterator for T where T: Iterator + Sorted {}
 
 impl<K, V> Sorted for btree_map::IntoKeys<K, V> {}
 impl<K, V> Sorted for btree_map::IntoValues<K, V> {}
-impl<'a, K, V> Sorted for btree_map::Keys<'a, K, V> {}
-impl<'a, K, V> Sorted for btree_map::Values<'a, K, V> {}
+impl<K, V> Sorted for btree_map::Keys<'_, K, V> {}
+impl<K, V> Sorted for btree_map::Values<'_, K, V> {}
 impl<K> Sorted for btree_set::IntoIter<K> {}
-impl<'a, K> Sorted for btree_set::Iter<'a, K> {}
+impl<K> Sorted for btree_set::Iter<'_, K> {}
 
 /// Same as [`SortedIterator`] but for (key, value) pairs sorted by key.
 pub trait SortedByKeyIterator<K, V>: Iterator + Sized {
@@ -194,7 +189,7 @@ where
 impl<T, K, V> SortedByKeyIterator<K, V> for T where T: Iterator<Item = (K, V)> + Sorted {}
 
 impl<K, V> Sorted for btree_map::IntoIter<K, V> {}
-impl<'a, K, V> Sorted for btree_map::Iter<'a, K, V> {}
+impl<K, V> Sorted for btree_map::Iter<'_, K, V> {}
 
 #[cfg(test)]
 mod tests {

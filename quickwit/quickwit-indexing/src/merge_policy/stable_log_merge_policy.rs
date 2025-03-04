@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -40,7 +35,7 @@ use crate::merge_policy::{splits_short_debug, MergeOperation, MergePolicy};
 ///
 /// The policy first builds the merge operations
 ///
-/// 1. Build merge operations
+/// ### Build merge operations
 /// We start by sorting the splits by reverse date so that the most recent splits are
 /// coming first.
 /// We iterate through the splits and assign them to increasing levels.
@@ -157,8 +152,8 @@ enum MergeCandidateSize {
     /// We should not add an extra split in this candidate.
     /// This can happen for any of the two following reasons:
     /// - the number of splits involved already reached `merge_factor_max`.
-    /// - the overall number of docs that will end up in the merged segment already
-    /// exceeds `max_merge_docs`.
+    /// - the overall number of docs that will end up in the merged segment already exceeds
+    ///   `max_merge_docs`.
     OneMoreSplitWouldBeTooBig,
 }
 
@@ -356,7 +351,7 @@ impl StableLogMergePolicy {
             head + (self.config.merge_factor - 2)
         };
         if tail.is_empty() || num_docs <= first_level_min_saturation_docs as u64 {
-            return (num_docs as usize + head - 1) / head;
+            return (num_docs as usize).div_ceil(head);
         }
         num_docs -= first_level_min_saturation_docs as u64;
         self.config.merge_factor - 1 + self.max_num_splits_knowning_levels(num_docs, tail, sorted)
@@ -662,7 +657,7 @@ mod tests {
         aux_test_simulate_merge_planner_num_docs(
             Arc::new(merge_policy.clone()),
             &vec![10_000; 100_000],
-            |splits| {
+            &|splits| {
                 let num_docs = splits.iter().map(|split| split.num_docs as u64).sum();
                 assert!(splits.len() <= merge_policy.max_num_splits_ideal_case(num_docs))
             },
@@ -691,7 +686,7 @@ mod tests {
             aux_test_simulate_merge_planner_num_docs(
                 Arc::new(merge_policy.clone()),
                 &batch_num_docs,
-                |splits| {
+                &|splits| {
                     let num_docs = splits.iter().map(|split| split.num_docs as u64).sum();
                     assert!(splits.len() <= merge_policy.max_num_splits_worst_case(num_docs));
                 },
@@ -708,7 +703,7 @@ mod tests {
         aux_test_simulate_merge_planner_num_docs(
             Arc::new(merge_policy.clone()),
             &batch_num_docs,
-            |splits| {
+            &|splits| {
                 let num_docs = splits.iter().map(|split| split.num_docs as u64).sum();
                 assert!(splits.len() <= merge_policy.max_num_splits_worst_case(num_docs));
             },
@@ -723,7 +718,7 @@ mod tests {
         aux_test_simulate_merge_planner_num_docs(
             Arc::new(merge_policy.clone()),
             &vec![10_000; 1_000],
-            |splits| {
+            &|splits| {
                 let num_docs = splits.iter().map(|split| split.num_docs as u64).sum();
                 assert!(splits.len() <= merge_policy.max_num_splits_ideal_case(num_docs));
             },
@@ -739,7 +734,7 @@ mod tests {
         aux_test_simulate_merge_planner_num_docs(
             Arc::new(merge_policy.clone()),
             &vals[..],
-            |splits| {
+            &|splits| {
                 let num_docs = splits.iter().map(|split| split.num_docs as u64).sum();
                 assert!(splits.len() <= merge_policy.max_num_splits_worst_case(num_docs));
             },

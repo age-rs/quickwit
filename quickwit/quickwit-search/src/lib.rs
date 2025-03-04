@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! This projects implements quickwit's search API.
 #![warn(missing_docs)]
@@ -41,15 +36,17 @@ mod search_job_placer;
 mod search_response_rest;
 mod search_stream;
 mod service;
-mod thread_pool;
+pub(crate) mod top_k_collector;
 
 mod metrics;
+mod search_permit_provider;
 
 #[cfg(test)]
 mod tests;
 
 pub use collector::QuickwitAggregations;
 use metrics::SEARCH_METRICS;
+use quickwit_common::thread_pool::ThreadPool;
 use quickwit_common::tower::Pool;
 use quickwit_doc_mapper::DocMapper;
 use quickwit_proto::metastore::{
@@ -61,7 +58,7 @@ use tantivy::schema::NamedFieldDocument;
 pub type Result<T> = std::result::Result<T, SearchError>;
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub use find_trace_ids_collector::FindTraceIdsCollector;
 use quickwit_config::SearcherConfig;
@@ -70,7 +67,9 @@ use quickwit_metastore::{
     IndexMetadata, ListIndexesMetadataResponseExt, ListSplitsQuery, ListSplitsRequestExt,
     MetastoreServiceStreamSplitsExt, SplitMetadata, SplitState,
 };
-use quickwit_proto::search::{PartialHit, SearchRequest, SearchResponse, SplitIdAndFooterOffsets};
+use quickwit_proto::search::{
+    PartialHit, ResourceStats, SearchRequest, SearchResponse, SplitIdAndFooterOffsets,
+};
 use quickwit_proto::types::IndexUid;
 use quickwit_storage::StorageResolver;
 pub use service::SearcherContext;
@@ -82,19 +81,24 @@ pub use crate::client::{
 pub use crate::cluster_client::ClusterClient;
 pub use crate::error::{parse_grpc_error, SearchError};
 use crate::fetch_docs::fetch_docs;
-use crate::leaf::leaf_search;
 pub use crate::root::{
-    check_all_index_metadata_found, jobs_to_leaf_requests, root_search, IndexMetasForLeafSearch,
-    SearchJob,
+    check_all_index_metadata_found, jobs_to_leaf_request, root_search, search_plan,
+    IndexMetasForLeafSearch, SearchJob,
 };
 pub use crate::search_job_placer::{Job, SearchJobPlacer};
-pub use crate::search_response_rest::SearchResponseRest;
+pub use crate::search_response_rest::{
+    AggregationResults, SearchPlanResponseRest, SearchResponseRest,
+};
 pub use crate::search_stream::root_search_stream;
 pub use crate::service::{MockSearchService, SearchService, SearchServiceImpl};
-use crate::thread_pool::run_cpu_intensive;
 
 /// A pool of searcher clients identified by their gRPC socket address.
 pub type SearcherPool = Pool<SocketAddr, SearchServiceClient>;
+
+fn search_thread_pool() -> &'static ThreadPool {
+    static SEARCH_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
+    SEARCH_THREAD_POOL.get_or_init(|| ThreadPool::new("search", None))
+}
 
 /// GlobalDocAddress serves as a hit address.
 #[derive(Clone, Eq, Debug, PartialEq, Hash, Ord, PartialOrd)]
@@ -169,6 +173,7 @@ fn extract_split_and_footer_offsets(split_metadata: &SplitMetadata) -> SplitIdAn
             .time_range
             .as_ref()
             .map(|time_range| *time_range.end()),
+        num_docs: split_metadata.num_docs as u64,
     }
 }
 
@@ -188,8 +193,10 @@ pub async fn list_relevant_splits(
     tags_filter_opt: Option<TagFilterAst>,
     metastore: &mut MetastoreServiceClient,
 ) -> crate::Result<Vec<SplitMetadata>> {
-    let mut query =
-        ListSplitsQuery::try_from_index_uids(index_uids)?.with_split_state(SplitState::Published);
+    let Some(mut query) = ListSplitsQuery::try_from_index_uids(index_uids) else {
+        return Ok(Vec::new());
+    };
+    query = query.with_split_state(SplitState::Published);
 
     if let Some(start_ts) = start_timestamp {
         query = query.with_time_range_start_gte(start_ts);
@@ -225,10 +232,10 @@ pub async fn resolve_index_patterns(
 
     // Get the index ids from the request
     let indexes_metadata = metastore
-        .clone()
         .list_indexes_metadata(list_indexes_metadata_request)
         .await?
-        .deserialize_indexes_metadata()?;
+        .deserialize_indexes_metadata()
+        .await?;
     check_all_index_metadata_found(&indexes_metadata, index_id_patterns)?;
     Ok(indexes_metadata)
 }
@@ -240,7 +247,7 @@ pub async fn resolve_index_patterns(
 /// another intermediate json format between the leaves and the root.
 fn convert_document_to_json_string(
     named_field_doc: NamedFieldDocument,
-    doc_mapper: &dyn DocMapper,
+    doc_mapper: &DocMapper,
 ) -> anyhow::Result<String> {
     let NamedFieldDocument(named_field_doc_map) = named_field_doc;
     let doc_json_map = doc_mapper.doc_to_json(named_field_doc_map)?;
@@ -331,4 +338,127 @@ pub fn searcher_pool_for_test(
                 (grpc_addr, client)
             }),
     )
+}
+
+pub(crate) fn merge_resource_stats_it<'a>(
+    stats_it: impl IntoIterator<Item = &'a Option<ResourceStats>>,
+) -> Option<ResourceStats> {
+    let mut acc_stats: Option<ResourceStats> = None;
+    for new_stats in stats_it {
+        merge_resource_stats(new_stats, &mut acc_stats);
+    }
+    acc_stats
+}
+
+fn merge_resource_stats(
+    new_stats_opt: &Option<ResourceStats>,
+    stat_accs_opt: &mut Option<ResourceStats>,
+) {
+    if let Some(new_stats) = new_stats_opt {
+        if let Some(stat_accs) = stat_accs_opt {
+            stat_accs.short_lived_cache_num_bytes += new_stats.short_lived_cache_num_bytes;
+            stat_accs.split_num_docs += new_stats.split_num_docs;
+            stat_accs.warmup_microsecs += new_stats.warmup_microsecs;
+            stat_accs.cpu_thread_pool_wait_microsecs += new_stats.cpu_thread_pool_wait_microsecs;
+            stat_accs.cpu_microsecs += new_stats.cpu_microsecs;
+        } else {
+            *stat_accs_opt = Some(new_stats.clone());
+        }
+    }
+}
+#[cfg(test)]
+mod stats_merge_tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_resource_stats() {
+        let mut acc_stats = None;
+
+        merge_resource_stats(&None, &mut acc_stats);
+
+        assert_eq!(acc_stats, None);
+
+        let stats = Some(ResourceStats {
+            short_lived_cache_num_bytes: 100,
+            split_num_docs: 200,
+            warmup_microsecs: 300,
+            cpu_thread_pool_wait_microsecs: 400,
+            cpu_microsecs: 500,
+        });
+
+        merge_resource_stats(&stats, &mut acc_stats);
+
+        assert_eq!(acc_stats, stats);
+
+        let new_stats = Some(ResourceStats {
+            short_lived_cache_num_bytes: 50,
+            split_num_docs: 100,
+            warmup_microsecs: 150,
+            cpu_thread_pool_wait_microsecs: 200,
+            cpu_microsecs: 250,
+        });
+
+        merge_resource_stats(&new_stats, &mut acc_stats);
+
+        let stats_plus_new_stats = Some(ResourceStats {
+            short_lived_cache_num_bytes: 150,
+            split_num_docs: 300,
+            warmup_microsecs: 450,
+            cpu_thread_pool_wait_microsecs: 600,
+            cpu_microsecs: 750,
+        });
+
+        assert_eq!(acc_stats, stats_plus_new_stats);
+
+        merge_resource_stats(&None, &mut acc_stats);
+
+        assert_eq!(acc_stats, stats_plus_new_stats);
+    }
+
+    #[test]
+    fn test_merge_resource_stats_it() {
+        let merged_stats = merge_resource_stats_it(Vec::<&Option<ResourceStats>>::new());
+        assert_eq!(merged_stats, None);
+
+        let stats1 = Some(ResourceStats {
+            short_lived_cache_num_bytes: 100,
+            split_num_docs: 200,
+            warmup_microsecs: 300,
+            cpu_thread_pool_wait_microsecs: 400,
+            cpu_microsecs: 500,
+        });
+
+        let merged_stats = merge_resource_stats_it(vec![&None, &stats1, &None]);
+
+        assert_eq!(merged_stats, stats1);
+
+        let stats2 = Some(ResourceStats {
+            short_lived_cache_num_bytes: 50,
+            split_num_docs: 100,
+            warmup_microsecs: 150,
+            cpu_thread_pool_wait_microsecs: 200,
+            cpu_microsecs: 250,
+        });
+
+        let stats3 = Some(ResourceStats {
+            short_lived_cache_num_bytes: 25,
+            split_num_docs: 50,
+            warmup_microsecs: 75,
+            cpu_thread_pool_wait_microsecs: 100,
+            cpu_microsecs: 125,
+        });
+
+        let merged_stats = merge_resource_stats_it(vec![&stats1, &stats2, &stats3]);
+
+        assert_eq!(
+            merged_stats,
+            Some(ResourceStats {
+                short_lived_cache_num_bytes: 175,
+                split_num_docs: 350,
+                warmup_microsecs: 525,
+                cpu_thread_pool_wait_microsecs: 700,
+                cpu_microsecs: 875,
+            })
+        );
+    }
 }

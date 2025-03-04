@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::str::FromStr;
 
@@ -26,6 +21,7 @@ use itertools::Itertools;
 use quickwit_common::uri::Uri;
 use quickwit_config::{validate_identifier, ConfigFormat, SourceConfig};
 use quickwit_metastore::checkpoint::SourceCheckpoint;
+use quickwit_proto::types::{IndexId, SourceId};
 use quickwit_storage::{load_file, StorageResolver};
 use serde_json::Value as JsonValue;
 use tabled::{Table, Tabled};
@@ -44,6 +40,20 @@ pub fn build_source_command() -> Command {
                 .args(&[
                     arg!(--index <INDEX_ID> "ID of the target index")
                         .display_order(1)
+                        .required(true),
+                    arg!(--"source-config" <SOURCE_CONFIG> "Path to source config file. Please, refer to the documentation for more details.")
+                        .required(true),
+                ])
+            )
+        .subcommand(
+            Command::new("update")
+                .about("Updates an existing source.")
+                .args(&[
+                    arg!(--index <INDEX_ID> "ID of the target index")
+                        .display_order(1)
+                        .required(true),
+                    arg!(--source <SOURCE_ID> "ID of the source")
+                        .display_order(2)
                         .required(true),
                     arg!(--"source-config" <SOURCE_CONFIG> "Path to source config file. Please, refer to the documentation for more details.")
                         .required(true),
@@ -142,50 +152,59 @@ pub fn build_source_command() -> Command {
 #[derive(Debug, Eq, PartialEq)]
 pub struct CreateSourceArgs {
     pub client_args: ClientArgs,
-    pub index_id: String,
+    pub index_id: IndexId,
+    pub source_config_uri: Uri,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct UpdateSourceArgs {
+    pub client_args: ClientArgs,
+    pub index_id: IndexId,
+    pub source_id: SourceId,
     pub source_config_uri: Uri,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ToggleSourceArgs {
     pub client_args: ClientArgs,
-    pub index_id: String,
-    pub source_id: String,
+    pub index_id: IndexId,
+    pub source_id: SourceId,
     pub enable: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct DeleteSourceArgs {
     pub client_args: ClientArgs,
-    pub index_id: String,
-    pub source_id: String,
+    pub index_id: IndexId,
+    pub source_id: SourceId,
     pub assume_yes: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct DescribeSourceArgs {
     pub client_args: ClientArgs,
-    pub index_id: String,
-    pub source_id: String,
+    pub index_id: IndexId,
+    pub source_id: SourceId,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ListSourcesArgs {
     pub client_args: ClientArgs,
-    pub index_id: String,
+    pub index_id: IndexId,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ResetCheckpointArgs {
     pub client_args: ClientArgs,
-    pub index_id: String,
-    pub source_id: String,
+    pub index_id: IndexId,
+    pub source_id: SourceId,
     pub assume_yes: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum SourceCliCommand {
     CreateSource(CreateSourceArgs),
+    UpdateSource(UpdateSourceArgs),
     ToggleSource(ToggleSourceArgs),
     DeleteSource(DeleteSourceArgs),
     DescribeSource(DescribeSourceArgs),
@@ -197,6 +216,7 @@ impl SourceCliCommand {
     pub async fn execute(self) -> anyhow::Result<()> {
         match self {
             Self::CreateSource(args) => create_source_cli(args).await,
+            Self::UpdateSource(args) => update_source_cli(args).await,
             Self::ToggleSource(args) => toggle_source_cli(args).await,
             Self::DeleteSource(args) => delete_source_cli(args).await,
             Self::DescribeSource(args) => describe_source_cli(args).await,
@@ -211,6 +231,7 @@ impl SourceCliCommand {
             .context("failed to parse source subcommand")?;
         match subcommand.as_str() {
             "create" => Self::parse_create_args(submatches).map(Self::CreateSource),
+            "update" => Self::parse_update_args(submatches).map(Self::UpdateSource),
             "enable" => {
                 Self::parse_toggle_source_args(&subcommand, submatches).map(Self::ToggleSource)
             }
@@ -239,6 +260,26 @@ impl SourceCliCommand {
         Ok(CreateSourceArgs {
             client_args,
             index_id,
+            source_config_uri,
+        })
+    }
+
+    fn parse_update_args(mut matches: ArgMatches) -> anyhow::Result<UpdateSourceArgs> {
+        let client_args = ClientArgs::parse(&mut matches)?;
+        let index_id = matches
+            .remove_one::<String>("index")
+            .expect("`index` should be a required arg.");
+        let source_id = matches
+            .remove_one::<String>("source")
+            .expect("`source` should be a required arg.");
+        let source_config_uri = matches
+            .remove_one::<String>("source-config")
+            .map(|uri_str| Uri::from_str(&uri_str))
+            .expect("`source-config` should be a required arg.")?;
+        Ok(UpdateSourceArgs {
+            client_args,
+            index_id,
+            source_id,
             source_config_uri,
         })
     }
@@ -338,6 +379,23 @@ async fn create_source_cli(args: CreateSourceArgs) -> anyhow::Result<()> {
         .create(source_config_str, config_format)
         .await?;
     println!("{} Source successfully created.", "✔".color(GREEN_COLOR));
+    Ok(())
+}
+
+async fn update_source_cli(args: UpdateSourceArgs) -> anyhow::Result<()> {
+    debug!(args=?args, "update-source");
+    println!("❯ Updating source...");
+    let storage_resolver = StorageResolver::unconfigured();
+    let source_config_content = load_file(&storage_resolver, &args.source_config_uri).await?;
+    let source_config_str: &str = std::str::from_utf8(&source_config_content)
+        .with_context(|| format!("source config is not utf-8: {}", args.source_config_uri))?;
+    let config_format = ConfigFormat::sniff_from_uri(&args.source_config_uri)?;
+    let qw_client = args.client_args.client();
+    qw_client
+        .sources(&args.index_id)
+        .update(&args.source_id, source_config_str, config_format)
+        .await?;
+    println!("{} Source successfully updated.", "✔".color(GREEN_COLOR));
     Ok(())
 }
 
@@ -469,7 +527,7 @@ where I: IntoIterator<Item = SourceConfig> {
 #[derive(Tabled)]
 struct SourceRow {
     #[tabled(rename = "ID")]
-    source_id: String,
+    source_id: SourceId,
     #[tabled(rename = "Type")]
     source_type: String,
     #[tabled(rename = "Enabled")]
@@ -574,8 +632,8 @@ mod tests {
                 json!({"foo": {"bar": JsonValue::Bool(true)}, "baz": JsonValue::Bool(false)})
             ),
             vec![
-                ("foo.bar".to_string(), JsonValue::Bool(true)),
                 ("baz".to_string(), JsonValue::Bool(false)),
+                ("foo.bar".to_string(), JsonValue::Bool(true)),
             ]
         );
     }
@@ -598,6 +656,32 @@ mod tests {
             CliCommand::Source(SourceCliCommand::CreateSource(CreateSourceArgs {
                 client_args: ClientArgs::default(),
                 index_id: "hdfs-logs".to_string(),
+                source_config_uri: Uri::from_str("file:///source-conf.yaml").unwrap(),
+            }));
+        assert_eq!(command, expected_command);
+    }
+
+    #[test]
+    fn test_parse_update_source_args() {
+        let app = build_cli().no_binary_name(true);
+        let matches = app
+            .try_get_matches_from(vec![
+                "source",
+                "update",
+                "--index",
+                "hdfs-logs",
+                "--source",
+                "kafka-foo",
+                "--source-config",
+                "/source-conf.yaml",
+            ])
+            .unwrap();
+        let command = CliCommand::parse_cli_args(matches).unwrap();
+        let expected_command =
+            CliCommand::Source(SourceCliCommand::UpdateSource(UpdateSourceArgs {
+                client_args: ClientArgs::default(),
+                index_id: "hdfs-logs".to_string(),
+                source_id: "kafka-foo".to_string(),
                 source_config_uri: Uri::from_str("file:///source-conf.yaml").unwrap(),
             }));
         assert_eq!(command, expected_command);
@@ -741,10 +825,9 @@ mod tests {
             .collect();
         let sources = vec![SourceConfig {
             source_id: "foo-source".to_string(),
-            desired_num_pipelines: NonZeroUsize::new(1).unwrap(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(1).unwrap(),
+            num_pipelines: NonZeroUsize::new(1).unwrap(),
             enabled: true,
-            source_params: SourceParams::file("path/to/file"),
+            source_params: SourceParams::file_from_str("path/to/file").unwrap(),
             transform_config: None,
             input_format: SourceInputFormat::Json,
         }];
@@ -753,9 +836,10 @@ mod tests {
             source_type: "file".to_string(),
             enabled: "true".to_string(),
         }];
+        let expected_uri = Uri::from_str("path/to/file").unwrap();
         let expected_params = vec![ParamsRow {
             key: "filepath".to_string(),
-            value: JsonValue::String("path/to/file".to_string()),
+            value: JsonValue::String(expected_uri.to_string()),
         }];
         let expected_checkpoint = vec![
             CheckpointRow {
@@ -802,8 +886,7 @@ mod tests {
         let sources = [
             SourceConfig {
                 source_id: "foo-source".to_string(),
-                desired_num_pipelines: NonZeroUsize::new(1).unwrap(),
-                max_num_pipelines_per_indexer: NonZeroUsize::new(1).unwrap(),
+                num_pipelines: NonZeroUsize::new(1).unwrap(),
                 enabled: true,
                 source_params: SourceParams::stdin(),
                 transform_config: None,
@@ -811,8 +894,7 @@ mod tests {
             },
             SourceConfig {
                 source_id: "bar-source".to_string(),
-                desired_num_pipelines: NonZeroUsize::new(1).unwrap(),
-                max_num_pipelines_per_indexer: NonZeroUsize::new(1).unwrap(),
+                num_pipelines: NonZeroUsize::new(1).unwrap(),
                 enabled: true,
                 source_params: SourceParams::stdin(),
                 transform_config: None,
@@ -822,12 +904,12 @@ mod tests {
         let expected_sources = [
             SourceRow {
                 source_id: "bar-source".to_string(),
-                source_type: "file".to_string(),
+                source_type: "stdin".to_string(),
                 enabled: "true".to_string(),
             },
             SourceRow {
                 source_id: "foo-source".to_string(),
-                source_type: "file".to_string(),
+                source_type: "stdin".to_string(),
                 enabled: "true".to_string(),
             },
         ];

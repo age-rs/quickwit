@@ -1,42 +1,67 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt;
 
 use quickwit_actors::AskError;
+use quickwit_proto::error::GrpcServiceError;
+pub use quickwit_proto::error::{grpc_error_to_grpc_status, grpc_status_to_service_error};
+use quickwit_proto::{ServiceError, ServiceErrorCode};
+use serde::{Deserialize, Serialize};
 
 // Service errors have to be handwritten before codegen.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum HelloError {
     #[error("internal error: {0}")]
-    InternalError(String),
-    #[error("transport error: {0}")]
-    TransportError(#[from] tonic::Status),
+    Internal(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    #[error("request timed out: {0}")]
+    Timeout(String),
+    #[error("too many requests")]
+    TooManyRequests,
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
 }
 
-// Service errors must implement `From<tonic::Status>` and `Into<tonic::Status>`.
-impl From<HelloError> for tonic::Status {
-    fn from(error: HelloError) -> Self {
-        match error {
-            HelloError::InternalError(message) => tonic::Status::internal(message),
-            HelloError::TransportError(status) => status,
+impl ServiceError for HelloError {
+    fn error_code(&self) -> ServiceErrorCode {
+        match self {
+            Self::Internal(_) => ServiceErrorCode::Internal,
+            Self::InvalidArgument(_) => ServiceErrorCode::BadRequest,
+            Self::Timeout(_) => ServiceErrorCode::Timeout,
+            Self::TooManyRequests => ServiceErrorCode::TooManyRequests,
+            Self::Unavailable(_) => ServiceErrorCode::Unavailable,
         }
+    }
+}
+
+impl GrpcServiceError for HelloError {
+    fn new_internal(message: String) -> Self {
+        Self::Internal(message)
+    }
+
+    fn new_timeout(message: String) -> Self {
+        Self::Timeout(message)
+    }
+
+    fn new_too_many_requests() -> Self {
+        Self::TooManyRequests
+    }
+
+    fn new_unavailable(message: String) -> Self {
+        Self::Unavailable(message)
     }
 }
 
@@ -44,6 +69,6 @@ impl<E> From<AskError<E>> for HelloError
 where E: fmt::Debug
 {
     fn from(error: AskError<E>) -> Self {
-        HelloError::InternalError(format!("{error:?}"))
+        HelloError::Internal(format!("{error:?}"))
     }
 }

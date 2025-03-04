@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -387,9 +382,8 @@ mod tests {
 
     use quickwit_actors::{ObservationType, Universe};
     use quickwit_metastore::checkpoint::IndexCheckpointDelta;
-    use quickwit_proto::indexing::IndexingPipelineId;
     use quickwit_proto::search::{deserialize_split_fields, ListFieldsEntryResponse};
-    use quickwit_proto::types::{IndexUid, PipelineUid};
+    use quickwit_proto::types::{DocMappingUid, IndexUid, NodeId};
     use tantivy::directory::MmapDirectory;
     use tantivy::schema::{NumericOptions, Schema, Type, FAST, STRING, TEXT};
     use tantivy::{doc, DateTime, IndexBuilder, IndexSettings};
@@ -508,20 +502,21 @@ mod tests {
             }
         }
         let index = index_writer.finalize()?;
-        let pipeline_id = IndexingPipelineId {
-            index_uid: IndexUid::new_with_random_ulid("test-index"),
-            source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
-            pipeline_uid: PipelineUid::default(),
-        };
+
+        let node_id = NodeId::from("test-node");
+        let index_uid = IndexUid::new_with_random_ulid("test-index");
+        let source_id = "test-source".to_string();
 
         // TODO: In the future we would like that kind of segment flush to emit a new split,
         // but this will require work on tantivy.
         let indexed_split = IndexedSplit {
             split_attrs: SplitAttrs {
+                node_id,
+                index_uid,
+                source_id,
+                doc_mapping_uid: DocMappingUid::default(),
                 split_id: "test-split".to_string(),
                 partition_id: 17u64,
-                pipeline_id,
                 num_docs,
                 uncompressed_docs_size_in_bytes: num_docs * 15,
                 time_range: timerange_opt,

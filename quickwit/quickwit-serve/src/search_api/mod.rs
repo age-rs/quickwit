@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 mod grpc_adapter;
 mod rest_handler;
@@ -23,8 +18,9 @@ mod rest_handler;
 pub use self::grpc_adapter::GrpcSearchAdapter;
 pub(crate) use self::rest_handler::{extract_index_id_patterns, extract_index_id_patterns_default};
 pub use self::rest_handler::{
-    search_get_handler, search_post_handler, search_request_from_api_request,
-    search_stream_handler, SearchApi, SearchRequestQueryString, SortBy,
+    search_get_handler, search_plan_get_handler, search_plan_post_handler, search_post_handler,
+    search_request_from_api_request, search_stream_handler, SearchApi, SearchRequestQueryString,
+    SortBy,
 };
 
 #[cfg(test)]
@@ -38,7 +34,7 @@ mod tests {
     use quickwit_indexing::MockSplitBuilder;
     use quickwit_metastore::{IndexMetadata, IndexMetadataResponseExt, ListSplitsResponseExt};
     use quickwit_proto::metastore::{
-        IndexMetadataResponse, ListSplitsResponse, MetastoreServiceClient,
+        IndexMetadataResponse, ListSplitsResponse, MetastoreServiceClient, MockMetastoreService,
     };
     use quickwit_proto::search::search_service_server::SearchServiceServer;
     use quickwit_proto::search::OutputFormat;
@@ -81,13 +77,13 @@ mod tests {
             output_format: OutputFormat::Csv as i32,
             partition_by_field: None,
         };
-        let mut metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         let index_metadata = IndexMetadata::for_test("test-index", "ram:///indexes/test-index");
         let index_uid = index_metadata.index_uid.clone();
-        metastore.expect_index_metadata().returning(move |_| {
+        mock_metastore.expect_index_metadata().returning(move |_| {
             Ok(IndexMetadataResponse::try_from_index_metadata(&index_metadata).unwrap())
         });
-        metastore.expect_list_splits().returning(move |_| {
+        mock_metastore.expect_list_splits().returning(move |_| {
             let splits = vec![
                 MockSplitBuilder::new("split_1")
                     .with_index_uid(&index_uid)
@@ -137,7 +133,7 @@ mod tests {
         let cluster_client = ClusterClient::new(search_job_placer.clone());
         let stream = root_search_stream(
             request,
-            MetastoreServiceClient::from(metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             cluster_client,
         )
         .await?;

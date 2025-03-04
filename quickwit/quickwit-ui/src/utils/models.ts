@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 /* eslint-disable  @typescript-eslint/no-explicit-any */
 export type RawDoc = Record<string, any>
@@ -48,7 +43,7 @@ export type Entry = {
 export const DATE_TIME_WITH_SECONDS_FORMAT = "YYYY/MM/DD HH:mm:ss";
 export const DATE_TIME_WITH_MILLISECONDS_FORMAT = "YYYY/MM/DD HH:mm:ss.SSS";
 
-// Returns a flatten array of fields and nested fields found in the given `FieldMapping` array. 
+// Returns a flatten array of fields and nested fields found in the given `FieldMapping` array.
 export function getAllFields(field_mappings: Array<FieldMapping>): Field[] {
   const fields: Field[] = [];
   for (const field_mapping of field_mappings) {
@@ -86,6 +81,99 @@ export type SearchRequest = {
   endTimestamp: number | null;
   maxHits: number;
   sortByField: SortByField | null;
+  aggregation: boolean;
+  aggregationConfig: Aggregation;
+}
+
+export type Aggregation = {
+  metric: Metric | null;
+  term: TermAgg | null;
+  histogram: HistogramAgg | null;
+}
+
+export type Metric = {
+  type: string;
+  field: string;
+}
+
+export type TermAgg = {
+  field: string;
+  size: number;
+}
+
+export type HistogramAgg = {
+  interval: string;
+}
+
+export type ParsedAggregationResult = TermResult | HistogramResult| null;
+
+export type TermResult = {term: string, value: number}[];
+
+export type HistogramResult = {
+  timestamps: Date[],
+  data: {name: string | undefined, value: number[]}[],
+}
+
+export function extractAggregationResults(aggregation: any): ParsedAggregationResult {
+  const extract_value = (entry: any) => {
+    if ("metric" in entry) {
+      return entry.metric.value || 0;
+    } else {
+      return entry.doc_count;
+    }
+  };
+  if ("histo_agg" in aggregation) {
+    const buckets = aggregation.histo_agg.buckets;
+    const timestamps = buckets.map((entry: any) => entry.key);
+    const value = buckets.map(extract_value);
+    // we are in the "simple histogram" case
+    return {
+      timestamps,
+      data: [{name: undefined, value }]
+    }
+  } else if ("term_agg" in aggregation) {
+    // we have a term aggregation, but maybe there is an histogram inside
+    const term_buckets = aggregation.term_agg.buckets;
+    if (term_buckets.length == 0) {
+      return null;
+    }
+    if (term_buckets.length > 0 && "histo_agg" in term_buckets[0]) {
+      // we have a term+histo aggregation
+      const timestamps_set: Set<number> = new Set();
+      term_buckets.forEach((bucket: any) => bucket.histo_agg.buckets.forEach(
+        (entry: any) => timestamps_set.add(entry.key)
+      ));
+      const timestamps = [... timestamps_set];
+      timestamps.sort();
+
+      const data = term_buckets.map((bucket: any) => {
+        const histo_buckets = bucket.histo_agg.buckets;
+        const first_elem_key = histo_buckets[0].key;
+        const last_elem_key = histo_buckets[histo_buckets.length - 1].key;
+        const prefix_len = timestamps.indexOf(first_elem_key);
+        const suffix_len = timestamps.length - timestamps.indexOf(last_elem_key) - 1;
+        const value = Array(prefix_len).fill(0).concat(
+          histo_buckets.map(extract_value),
+          Array(suffix_len).fill(0),
+        );
+
+        return {name: bucket.key, value, }
+      })
+      return {
+        timestamps: timestamps.map((date) => new Date(date)),
+        data,
+      }
+    } else {
+      return term_buckets.map((bucket: any) => {
+        return {
+          term: bucket.key,
+          value: extract_value(bucket),
+        }
+      });
+    }
+  }
+  // we are in neither case??
+  return null;
 }
 
 export const EMPTY_SEARCH_REQUEST: SearchRequest = {
@@ -95,6 +183,12 @@ export const EMPTY_SEARCH_REQUEST: SearchRequest = {
   endTimestamp: null,
   maxHits: 100,
   sortByField: null,
+  aggregation: false,
+  aggregationConfig: {
+    metric: null,
+    term: null,
+    histogram: null,
+  },
 }
 
 export type ResponseError = {
@@ -107,6 +201,7 @@ export type SearchResponse = {
   hits: Array<RawDoc>;
   elapsed_time_micros: number;
   errors: Array<any> | undefined;
+  aggregations: any | undefined;
 }
 
 export type IndexConfig = {

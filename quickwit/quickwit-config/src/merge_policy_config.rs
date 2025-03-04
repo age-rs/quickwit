@@ -1,27 +1,26 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::time::Duration;
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, utoipa::ToSchema)]
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConstWriteAmplificationMergePolicyConfig {
     /// Number of splits to merge together in a single merge operation.
@@ -42,6 +41,15 @@ pub struct ConstWriteAmplificationMergePolicyConfig {
     #[serde(deserialize_with = "parse_human_duration")]
     #[serde(serialize_with = "serialize_duration")]
     pub maturation_period: Duration,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero")]
+    pub max_finalize_merge_operations: usize,
+    /// Splits with a number of docs higher than
+    /// `max_finalize_split_num_docs` will not be considered
+    /// for finalize split merge operations.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_finalize_split_num_docs: Option<usize>,
 }
 
 impl Default for ConstWriteAmplificationMergePolicyConfig {
@@ -51,11 +59,13 @@ impl Default for ConstWriteAmplificationMergePolicyConfig {
             merge_factor: default_merge_factor(),
             max_merge_factor: default_max_merge_factor(),
             maturation_period: default_maturation_period(),
+            max_finalize_merge_operations: 0,
+            max_finalize_split_num_docs: None,
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, utoipa::ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StableLogMergePolicyConfig {
     /// Number of docs below which all splits are considered as belonging to the same level.
@@ -126,7 +136,7 @@ where S: Serializer {
     s.serialize_str(&value_str)
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq, Hash, utoipa::ToSchema)]
 #[serde(tag = "type")]
 #[serde(deny_unknown_fields)]
 pub enum MergePolicyConfig {
@@ -146,6 +156,10 @@ impl Default for MergePolicyConfig {
 }
 
 impl MergePolicyConfig {
+    pub fn noop() -> Self {
+        MergePolicyConfig::Nop
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         let (merge_factor, max_merge_factor) = match self {
             MergePolicyConfig::Nop => {

@@ -1,138 +1,165 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::iter::zip;
 
 use bytes::Bytes;
+use bytesize::ByteSize;
+use quickwit_common::rate_limited_error;
+use quickwit_common::tower::MakeLoadShedError;
+use serde::{Deserialize, Serialize};
 
 use self::ingester::{PersistFailureReason, ReplicateFailureReason};
 use self::router::IngestFailureReason;
-use super::types::NodeId;
-use super::{ServiceError, ServiceErrorCode};
-use crate::control_plane::ControlPlaneError;
-use crate::types::{queue_id, IndexUid, Position, QueueId, ShardId};
+use super::GrpcServiceError;
+use crate::types::{queue_id, DocUid, NodeIdRef, Position, QueueId, ShardId, SourceUid};
+use crate::{ServiceError, ServiceErrorCode};
 
 pub mod ingester;
 pub mod router;
 
 include!("../codegen/quickwit/quickwit.ingest.rs");
 
+pub const INGEST_FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!("../codegen/quickwit/ingest_descriptor.bin");
+
 pub type IngestV2Result<T> = std::result::Result<T, IngestV2Error>;
 
-#[derive(Debug, Clone, thiserror::Error, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, thiserror::Error, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RateLimitingCause {
+    #[error("router load shedding")]
+    RouterLoadShedding,
+    #[error("load shedding")]
+    LoadShedding,
+    #[error("wal full (memory or disk)")]
+    WalFull,
+    #[error("circuit breaker")]
+    CircuitBreaker,
+    #[error("shard rate limiting")]
+    ShardRateLimiting,
+    #[error("unknown")]
+    Unknown,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IngestV2Error {
-    #[error("an internal error occurred: {0}")]
+    #[error("internal error: {0}")]
     Internal(String),
-    /// Emitted when an ingester was not available for a given operation,
-    /// either directly or through replication.
-    #[error("failed to connect to ingester `{ingester_id}`")]
-    IngesterUnavailable { ingester_id: NodeId },
     #[error("shard `{shard_id}` not found")]
     ShardNotFound { shard_id: ShardId },
-    #[error("request timed out")]
-    Timeout,
-    // This error is provoked by semaphore located on the router.
+    #[error("request timed out: {0}")]
+    Timeout(String),
     #[error("too many requests")]
-    TooManyRequests,
-    // TODO: Merge `Transport` and `IngesterUnavailable` into a single `Unavailable` error.
-    #[error("transport error: {0}")]
-    Transport(String),
+    TooManyRequests(RateLimitingCause),
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
 }
 
-impl IngestV2Error {
-    pub fn label_value(&self) -> &'static str {
-        match self {
-            Self::Timeout { .. } => "timeout",
-            _ => "error",
-        }
+impl From<quickwit_common::tower::TimeoutExceeded> for IngestV2Error {
+    fn from(_: quickwit_common::tower::TimeoutExceeded) -> IngestV2Error {
+        IngestV2Error::Timeout("tower layer timeout".to_string())
     }
 }
 
-impl From<ControlPlaneError> for IngestV2Error {
-    fn from(error: ControlPlaneError) -> Self {
-        Self::Internal(error.to_string())
-    }
-}
-
-impl From<IngestV2Error> for tonic::Status {
-    fn from(error: IngestV2Error) -> tonic::Status {
-        let code = match &error {
-            IngestV2Error::IngesterUnavailable { .. } => tonic::Code::Unavailable,
-            IngestV2Error::Internal(_) => tonic::Code::Internal,
-            IngestV2Error::ShardNotFound { .. } => tonic::Code::NotFound,
-            IngestV2Error::Timeout { .. } => tonic::Code::DeadlineExceeded,
-            IngestV2Error::TooManyRequests => tonic::Code::ResourceExhausted,
-            IngestV2Error::Transport { .. } => tonic::Code::Unavailable,
-        };
-        let error_json: String = serde_json::to_string(&error).unwrap();
-        tonic::Status::new(code, error_json)
-    }
-}
-
-impl From<tonic::Status> for IngestV2Error {
-    fn from(status: tonic::Status) -> Self {
-        if let Ok(error_from_json) = serde_json::from_str(status.message()) {
-            return error_from_json;
-        }
-        match status.code() {
-            tonic::Code::Unavailable => IngestV2Error::Transport(status.message().to_string()),
-            tonic::Code::ResourceExhausted => IngestV2Error::TooManyRequests,
-            _ => IngestV2Error::Internal(status.message().to_string()),
-        }
+impl From<quickwit_common::tower::TaskCancelled> for IngestV2Error {
+    fn from(task_cancelled: quickwit_common::tower::TaskCancelled) -> IngestV2Error {
+        IngestV2Error::Internal(task_cancelled.to_string())
     }
 }
 
 impl ServiceError for IngestV2Error {
     fn error_code(&self) -> ServiceErrorCode {
         match self {
-            Self::IngesterUnavailable { .. } => ServiceErrorCode::Unavailable,
-            Self::Internal { .. } => ServiceErrorCode::Internal,
+            Self::Internal(error_msg) => {
+                rate_limited_error!(limit_per_min = 6, "ingest internal error: {error_msg}");
+                ServiceErrorCode::Internal
+            }
             Self::ShardNotFound { .. } => ServiceErrorCode::NotFound,
-            Self::Timeout { .. } => ServiceErrorCode::Timeout,
-            Self::Transport { .. } => ServiceErrorCode::Unavailable,
-            Self::TooManyRequests => ServiceErrorCode::RateLimited,
+            Self::Timeout(_) => ServiceErrorCode::Timeout,
+            Self::TooManyRequests(_) => ServiceErrorCode::TooManyRequests,
+            Self::Unavailable(_) => ServiceErrorCode::Unavailable,
         }
+    }
+}
+
+impl GrpcServiceError for IngestV2Error {
+    fn new_internal(message: String) -> Self {
+        Self::Internal(message)
+    }
+
+    fn new_timeout(message: String) -> Self {
+        Self::Timeout(message)
+    }
+
+    fn new_too_many_requests() -> Self {
+        Self::TooManyRequests(RateLimitingCause::Unknown)
+    }
+
+    fn new_unavailable(message: String) -> Self {
+        Self::Unavailable(message)
+    }
+}
+
+impl MakeLoadShedError for IngestV2Error {
+    fn make_load_shed_error() -> Self {
+        IngestV2Error::TooManyRequests(RateLimitingCause::LoadShedding)
     }
 }
 
 impl Shard {
     /// List of nodes that are storing the shard (the leader, and optionally the follower).
-    pub fn ingesters(&self) -> impl Iterator<Item = NodeId> + '_ {
+    pub fn ingesters(&self) -> impl Iterator<Item = &NodeIdRef> + '_ {
         [Some(&self.leader_id), self.follower_id.as_ref()]
             .into_iter()
             .flatten()
-            .map(|node_id| NodeId::new(node_id.clone()))
+            .map(|node_id| NodeIdRef::from_str(node_id))
+    }
+
+    pub fn source_uid(&self) -> SourceUid {
+        SourceUid {
+            index_uid: self.index_uid().clone(),
+            source_id: self.source_id.clone(),
+        }
+    }
+}
+
+impl ShardPKey {
+    pub fn queue_id(&self) -> QueueId {
+        queue_id(self.index_uid(), &self.source_id, self.shard_id())
     }
 }
 
 impl DocBatchV2 {
-    pub fn docs(self) -> impl Iterator<Item = Bytes> {
-        let DocBatchV2 {
-            doc_buffer,
-            doc_lengths,
-        } = self;
-        doc_lengths
-            .into_iter()
-            .scan(0, move |start_offset, doc_length| {
-                let start = *start_offset;
-                let end = start + doc_length as usize;
-                *start_offset = end;
-                Some(doc_buffer.slice(start..end))
-            })
+    pub fn docs(&self) -> impl Iterator<Item = (DocUid, Bytes)> + '_ {
+        zip(&self.doc_uids, &self.doc_lengths).scan(
+            self.doc_buffer.clone(),
+            |doc_buffer, (doc_uid, doc_len)| {
+                let doc = doc_buffer.split_to(*doc_len as usize);
+                Some((*doc_uid, doc))
+            },
+        )
+    }
+
+    pub fn into_docs(self) -> impl Iterator<Item = (DocUid, Bytes)> {
+        zip(self.doc_uids, self.doc_lengths).scan(
+            self.doc_buffer,
+            |doc_buffer, (doc_uid, doc_len)| {
+                let doc = doc_buffer.split_to(doc_len as usize);
+                Some((doc_uid, doc))
+            },
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -140,7 +167,7 @@ impl DocBatchV2 {
     }
 
     pub fn num_bytes(&self) -> usize {
-        self.doc_buffer.len()
+        self.doc_buffer.len() + self.doc_lengths.len() * 4
     }
 
     pub fn num_docs(&self) -> usize {
@@ -149,16 +176,19 @@ impl DocBatchV2 {
 
     #[cfg(any(test, feature = "testsuite"))]
     pub fn for_test(docs: impl IntoIterator<Item = &'static str>) -> Self {
+        let mut doc_uids = Vec::new();
         let mut doc_buffer = Vec::new();
         let mut doc_lengths = Vec::new();
 
-        for doc in docs {
+        for (doc_uid, doc) in docs.into_iter().enumerate() {
+            doc_uids.push(DocUid::for_test(doc_uid as u128));
             doc_buffer.extend(doc.as_bytes());
             doc_lengths.push(doc.len() as u32);
         }
         Self {
-            doc_lengths,
+            doc_uids,
             doc_buffer: Bytes::from(doc_buffer),
+            doc_lengths,
         }
     }
 }
@@ -179,8 +209,8 @@ impl MRecordBatch {
         self.mrecord_lengths.is_empty()
     }
 
-    pub fn num_bytes(&self) -> usize {
-        self.mrecord_buffer.len()
+    pub fn estimate_size(&self) -> ByteSize {
+        ByteSize((self.mrecord_buffer.len() + self.mrecord_lengths.len() * 4) as u64)
     }
 
     pub fn num_mrecords(&self) -> usize {
@@ -204,12 +234,6 @@ impl MRecordBatch {
 }
 
 impl Shard {
-    pub fn shard_id(&self) -> &ShardId {
-        self.shard_id
-            .as_ref()
-            .expect("`shard_id` should be a required field")
-    }
-
     pub fn is_open(&self) -> bool {
         self.shard_state().is_open()
     }
@@ -224,12 +248,6 @@ impl Shard {
 
     pub fn queue_id(&self) -> super::types::QueueId {
         queue_id(self.index_uid(), &self.source_id, self.shard_id())
-    }
-
-    pub fn publish_position_inclusive(&self) -> &Position {
-        self.publish_position_inclusive
-            .as_ref()
-            .expect("`publish_position_inclusive` should be a required field")
     }
 }
 
@@ -272,34 +290,22 @@ impl ShardIds {
             .iter()
             .map(|shard_id| queue_id(self.index_uid(), &self.source_id, shard_id))
     }
-}
 
-impl ShardIdPositions {
-    pub fn index_uid(&self) -> &IndexUid {
-        self.index_uid
-            .as_ref()
-            .expect("`index_uid` should be a required field")
-    }
-
-    pub fn queue_id_positions(&self) -> impl Iterator<Item = (QueueId, &Position)> + '_ {
-        self.shard_positions.iter().map(|shard_position| {
-            let queue_id = queue_id(self.index_uid(), &self.source_id, shard_position.shard_id());
-            (queue_id, shard_position.publish_position_inclusive())
+    pub fn pkeys(&self) -> impl Iterator<Item = ShardPKey> + '_ {
+        self.shard_ids.iter().map(move |shard_id| ShardPKey {
+            index_uid: self.index_uid.clone(),
+            source_id: self.source_id.clone(),
+            shard_id: Some(shard_id.clone()),
         })
     }
 }
 
-impl ShardIdPosition {
-    pub fn shard_id(&self) -> &ShardId {
-        self.shard_id
-            .as_ref()
-            .expect("`shard_id` should be a required field")
-    }
-
-    pub fn publish_position_inclusive(&self) -> &Position {
-        self.publish_position_inclusive
-            .as_ref()
-            .expect("`publish_position_inclusive` should be a required field")
+impl ShardIdPositions {
+    pub fn queue_id_positions(&self) -> impl Iterator<Item = (QueueId, Position)> + '_ {
+        self.shard_positions.iter().map(|shard_position| {
+            let queue_id = queue_id(self.index_uid(), &self.source_id, shard_position.shard_id());
+            (queue_id, shard_position.publish_position_inclusive())
+        })
     }
 }
 
@@ -309,8 +315,9 @@ impl From<PersistFailureReason> for IngestFailureReason {
             PersistFailureReason::Unspecified => IngestFailureReason::Unspecified,
             PersistFailureReason::ShardNotFound => IngestFailureReason::NoShardsAvailable,
             PersistFailureReason::ShardClosed => IngestFailureReason::NoShardsAvailable,
-            PersistFailureReason::ResourceExhausted => IngestFailureReason::ResourceExhausted,
-            PersistFailureReason::RateLimited => IngestFailureReason::RateLimited,
+            PersistFailureReason::WalFull => IngestFailureReason::WalFull,
+            PersistFailureReason::ShardRateLimited => IngestFailureReason::ShardRateLimited,
+            PersistFailureReason::Timeout => IngestFailureReason::Timeout,
         }
     }
 }
@@ -321,7 +328,7 @@ impl From<ReplicateFailureReason> for PersistFailureReason {
             ReplicateFailureReason::Unspecified => PersistFailureReason::Unspecified,
             ReplicateFailureReason::ShardNotFound => PersistFailureReason::ShardNotFound,
             ReplicateFailureReason::ShardClosed => PersistFailureReason::ShardClosed,
-            ReplicateFailureReason::ResourceExhausted => PersistFailureReason::ResourceExhausted,
+            ReplicateFailureReason::WalFull => PersistFailureReason::WalFull,
         }
     }
 }
@@ -349,16 +356,5 @@ mod tests {
         assert_eq!(shard_state, ShardState::Closed);
 
         assert!(ShardState::from_json_str_name("unknown").is_none());
-    }
-
-    #[test]
-    fn test_ingest_v2_error_grpc_conversion() {
-        let ingester_id = NodeId::from("test-ingester");
-        let error: IngestV2Error = IngestV2Error::IngesterUnavailable { ingester_id };
-        let grpc_status: tonic::Status = error.into();
-        let error_serdeser = IngestV2Error::from(grpc_status);
-        assert!(
-            matches!(error_serdeser, IngestV2Error::IngesterUnavailable { ingester_id } if ingester_id == "test-ingester")
-        );
     }
 }

@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 
-import subprocess
-import requests
+import copy
 import glob
-import yaml
-import sys
-from os import path as osp
-from os import mkdir
 import gzip
 import http
 import json
-import tempfile
+import os
+import requests
+import random
 import shutil
+import subprocess
+import sys
+import tempfile
 import time
+import yaml
+
+from os import mkdir
+from os import path as osp
 
 def debug_http():
     old_send = http.client.HTTPConnection.send
@@ -26,8 +30,6 @@ def debug_http():
         print(f'{"-"*10} END REQUEST {"-"*10}')
         return old_send(self, data)
     http.client.HTTPConnection.send = new_send
-
-# debug_http()
 
 def open_scenario(scenario_filepath):
     data = open(scenario_filepath).read()
@@ -85,7 +87,7 @@ def run_request_step(method, step, previous_result):
         step["headers"] = {'user-agent': 'my-app/0.0.1'}
     method_req = getattr(requests, method.lower())
     endpoint = step.get("endpoint", "")
-    url = step["api_root"] + endpoint
+    url = "{}/{}".format(step["api_root"].rstrip('/'), endpoint.lstrip('/'))
     kvargs = {
         k: v
         for k, v in step.items()
@@ -97,24 +99,59 @@ def run_request_step(method, step, previous_result):
         kvargs["data"] = open(body_from_file, 'rb').read()
 
     kvargs = resolve_previous_result(kvargs, previous_result)
+    shuffle_ndjson = step.get("shuffle_ndjson", None)
+    if shuffle_ndjson is not None:
+        docs_per_split = distribute_items(shuffle_ndjson, step.get("min_splits", 1), step.get("max_splits", 5), step.get("seed", None))
+
+        for i, bucket in enumerate(docs_per_split):
+            new_step = copy.deepcopy(step)
+            del new_step["shuffle_ndjson"]
+            new_step["ndjson"] = bucket
+            run_request_step(method, new_step, previous_result)
+        return;
     ndjson = step.get("ndjson", None)
     if ndjson is not None:
         # Add a newline at the end to please elasticsearch -> "The bulk request must be terminated by a newline [\\n]".
         kvargs["data"] = "\n".join([json.dumps(doc) for doc in ndjson]) + "\n"
         kvargs.setdefault("headers")["Content-Type"] = "application/json"
     expected_status_code = step.get("status_code", 200)
+    debug = step.get("debug", False)
     num_retries = step.get("num_retries", 0)
     run_req = lambda : method_req(url, **kvargs)
     r = run_request_with_retry(run_req, expected_status_code, num_retries)
     expected_resp = step.get("expected", None)
-    json_res = r.json()
+    json_resp = r.json()
+    if debug:
+        print(expected_status_code)
+        print(json_resp)
     if expected_resp is not None:
         try:
-            check_result(json_res, expected_resp, context_path="")
+            check_result(json_resp, expected_resp, context_path="")
         except Exception as e:
-            print(json.dumps(json_res, indent=2))
+            print(json.dumps(json_resp, indent=2))
             raise e
-    return json_res
+    return json_resp
+
+def distribute_items(items, min_buckets, max_buckets, seed=None):
+    if seed is None:
+        seed = random.randint(0, 10000)
+    random.seed(seed)
+    
+    # Determine the number of buckets
+    num_buckets = random.randint(min_buckets, max_buckets)
+    
+    # Initialize empty buckets
+    buckets = [[] for _ in range(num_buckets)]
+    
+    # Distribute items randomly into buckets
+    for item in items:
+        random_bucket = random.randint(0, num_buckets - 1)
+        buckets[random_bucket].append(item)
+    
+    # Print the seed for reproducibility
+    print(f"Seed: {seed}")
+    
+    return buckets
 
 def check_result(result, expected, context_path = ""):
     if type(expected) == dict and "$expect" in expected:
@@ -137,16 +174,28 @@ def check_result(result, expected, context_path = ""):
 
 def check_result_list(result, expected, context_path=""):
     if len(result) != len(expected):
-        raise(Exception("Wrong length at context %s" % context_path))
+        if len(expected) != 0:
+            # get keys from the expected dicts and filter result to print only the keys that are in the expected dicts
+            expected_keys = set().union(*expected)
+            filtered_result = [{k: v for k, v in d.items() if k in expected_keys} for d in result]
+            # Check if the length differs by more than five
+            if abs(len(filtered_result) - len(expected)) > 5:
+                # Show only the first 5 elements followed by ellipsis if there are more
+                display_filtered_result = filtered_result[:5] + ['...'] if len(filtered_result) > 5 else filtered_result
+            else:
+                display_filtered_result = filtered_result
+            raise Exception("Wrong length at context %s. Expected: %s Received: %s,\n Expected \n%s \n Received \n%s" % (context_path, len(expected), len(result), expected, display_filtered_result))
+        raise Exception("Wrong length at context %s. Expected: %s Received: %s" % (context_path, len(expected), len(result)))
     for (i, (left, right)) in enumerate(zip(result, expected)):
         check_result(left, right, context_path + "[%s]" % i)
 
 def check_result_dict(result, expected, context_path=""):
-    for (k, v) in expected.items():
-        child = result.get(k, None)
-        if child is None:
-            raise Exception("Missing key %s at context %s" % (k, context_path))
-        check_result(child, v, context_path + "." + k)
+    for key, value in expected.items():
+        try:
+            child = result[key]
+        except KeyError:
+            raise Exception("Missing key `%s` at context %s" % (key, context_path))
+        check_result(child, value, context_path + "." + key)
 
 class PathTree:
     def __init__(self):
@@ -242,7 +291,7 @@ class Visitor:
                 num_steps_executed += 1
             except Exception as e:
                 print("🔴 %s" % scenario_path)
-                print("Failed at step %d" % i)
+                print(f"Failed at step '{step['desc']}'" if 'desc' in step else f"Failed at step {i}")
                 print(step)
                 print(e)
                 print("--------------")
@@ -315,7 +364,7 @@ def main():
         prog="rest-api-test",
         description="Runs a set of calls against a REST API and checks for conditions over the results."
     )
-    arg_parser.add_argument("--engine", help="Targetted engine (elastic/quickwit).", default="quickwit")
+    arg_parser.add_argument("--engine", help="Targeted engine (elastic/quickwit).", default="quickwit")
     arg_parser.add_argument("--test", help="Specific prefix to select the tests to run. If not specified, all tests are run.", nargs="*")
     arg_parser.add_argument("--binary", help="Specific the quickwit binary to run.", nargs="?")
     parsed_args = arg_parser.parse_args()
@@ -341,4 +390,3 @@ if __name__ == "__main__":
         sys.exit(0)
     else:
         sys.exit(1)
-

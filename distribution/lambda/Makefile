@@ -27,8 +27,12 @@ package:
 	if [ "$${QW_LAMBDA_BUILD:-0}" = "1" ]
 	then
 	  pushd ../../quickwit/
+	  rustc --version
+	  # TODO: remove --disable-optimizations when upgrading to a release containing
+	  # https://github.com/cargo-lambda/cargo-lambda/issues/649 (> 1.2.1)
 	  cargo lambda build \
 	    -p quickwit-lambda \
+		--disable-optimizations \
 	    --release \
 	    --output-format zip \
 	    --target x86_64-unknown-linux-gnu
@@ -56,14 +60,17 @@ indexer-package-path:
 searcher-package-path:
 	echo -n $(SEARCHER_PACKAGE_PATH)
 
-bootstrap: package check-env
+bootstrap:
 	cdk bootstrap aws://$$CDK_ACCOUNT/$$CDK_REGION
 
 deploy-hdfs: package check-env
-	cdk deploy -a cdk/app.py HdfsStack
+	cdk deploy --require-approval never -a cdk/app.py HdfsStack
 
 deploy-mock-data: package check-env
-	cdk deploy -a cdk/app.py MockDataStack
+	cdk deploy  --require-approval never -a cdk/app.py MockDataStack
+
+print-mock-data-metastore: check-env
+	python -c 'from cdk import cli; cli.print_mock_data_metastore()'
 
 # address https://github.com/aws/aws-cdk/issues/20060
 before-destroy:
@@ -71,13 +78,13 @@ before-destroy:
 	touch $(INDEXER_PACKAGE_PATH)
 	touch $(SEARCHER_PACKAGE_PATH)
 
-destroy-hdfs: before-destroy
+destroy-hdfs: before-destroy check-env
 	python -c 'from cdk import cli; cli.empty_hdfs_bucket()'
-	cdk destroy  --force -a cdk/app.py HdfsStack
+	cdk destroy --force -a cdk/app.py HdfsStack
 
-destroy-mock-data: before-destroy
+destroy-mock-data: before-destroy check-env
 	python -c 'from cdk import cli; cli.empty_mock_data_buckets()'
-	cdk destroy  --force -a cdk/app.py MockDataStack
+	cdk destroy --force -a cdk/app.py MockDataStack
 
 clean:
 	rm -rf cdk.out
@@ -108,6 +115,7 @@ bench-index:
 	done
 
 bench-search-term:
+	export QW_LAMBDA_ENABLE_VERBOSE_JSON_LOGS=true
 	mem_sizes=( 1024 2048 4096 8192 )
 	for mem_size in "$${mem_sizes[@]}"
 	do
@@ -117,6 +125,7 @@ bench-search-term:
 	done
 
 bench-search-histogram:
+	export QW_LAMBDA_ENABLE_VERBOSE_JSON_LOGS=true
 	mem_sizes=( 1024 2048 4096 8192 )
 	for mem_size in "$${mem_sizes[@]}"
 	do
@@ -128,15 +137,13 @@ bench-search-histogram:
 bench-search:
 	for run in {1..30}
 	do 
-		export QW_LAMBDA_DISABLE_SEARCH_CACHE=true
-		$(MAKE) bench-search-term
-		$(MAKE) bench-search-histogram
-		export QW_LAMBDA_DISABLE_SEARCH_CACHE=false
 		export QW_LAMBDA_PARTIAL_REQUEST_CACHE_CAPACITY=0
 		$(MAKE) bench-search-term
 		$(MAKE) bench-search-histogram
-		export QW_LAMBDA_DISABLE_SEARCH_CACHE=false
 		export QW_LAMBDA_PARTIAL_REQUEST_CACHE_CAPACITY=64MB
 		$(MAKE) bench-search-term
 		$(MAKE) bench-search-histogram
 	done
+
+test-mock-data-endpoints:
+	python -c 'from cdk import cli; cli.test_mock_data_endpoints()'

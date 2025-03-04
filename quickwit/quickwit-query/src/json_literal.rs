@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
@@ -129,7 +124,7 @@ impl<'a> InterpretUserInput<'a> for f64 {
     }
 }
 
-impl<'a> InterpretUserInput<'a> for bool {
+impl InterpretUserInput<'_> for bool {
     fn interpret_bool(b: bool) -> Option<Self> {
         Some(b)
     }
@@ -139,14 +134,14 @@ impl<'a> InterpretUserInput<'a> for bool {
     }
 }
 
-impl<'a> InterpretUserInput<'a> for Ipv6Addr {
+impl InterpretUserInput<'_> for Ipv6Addr {
     fn interpret_str(text: &str) -> Option<Self> {
         let ip_addr: IpAddr = text.parse().ok()?;
         Some(ip_addr.into_ipv6_addr())
     }
 }
 
-impl<'a> InterpretUserInput<'a> for tantivy::DateTime {
+impl InterpretUserInput<'_> for tantivy::DateTime {
     fn interpret_str(text: &str) -> Option<Self> {
         let date_time_formats = get_default_date_time_format();
         if let Ok(datetime) = parse_date_time_str(text, date_time_formats) {
@@ -171,7 +166,7 @@ const LENIENT_BASE64_ENGINE: base64::engine::GeneralPurpose = base64::engine::Ge
         .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
 );
 
-impl<'a> InterpretUserInput<'a> for Vec<u8> {
+impl InterpretUserInput<'_> for Vec<u8> {
     fn interpret_str(mut text: &str) -> Option<Vec<u8>> {
         let Some(first_byte) = text.as_bytes().first().copied() else {
             return Some(Vec::new());

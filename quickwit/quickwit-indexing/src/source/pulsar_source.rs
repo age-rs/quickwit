@@ -1,24 +1,19 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
@@ -34,6 +29,7 @@ use pulsar::{
 use quickwit_actors::{ActorContext, ActorExitStatus, Mailbox};
 use quickwit_config::{PulsarSourceAuth, PulsarSourceParams};
 use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpoint};
+use quickwit_proto::metastore::SourceType;
 use quickwit_proto::types::{IndexUid, Position};
 use serde_json::{json, Value as JsonValue};
 use tokio::time;
@@ -41,7 +37,7 @@ use tracing::{debug, info, warn};
 
 use crate::actors::DocProcessor;
 use crate::source::{
-    BatchBuilder, Source, SourceActor, SourceContext, SourceRuntimeArgs, TypedSourceFactory,
+    BatchBuilder, Source, SourceActor, SourceContext, SourceRuntime, TypedSourceFactory,
     BATCH_NUM_BYTES_LIMIT, EMIT_BATCHES_TIMEOUT,
 };
 
@@ -55,11 +51,10 @@ impl TypedSourceFactory for PulsarSourceFactory {
     type Params = PulsarSourceParams;
 
     async fn typed_create_source(
-        ctx: Arc<SourceRuntimeArgs>,
-        params: PulsarSourceParams,
-        checkpoint: SourceCheckpoint,
+        source_runtime: SourceRuntime,
+        source_params: PulsarSourceParams,
     ) -> anyhow::Result<Self::Source> {
-        PulsarSource::try_new(ctx, params, checkpoint).await
+        PulsarSource::try_new(source_runtime, source_params).await
     }
 }
 
@@ -77,36 +72,47 @@ pub struct PulsarSourceState {
 }
 
 pub struct PulsarSource {
-    ctx: Arc<SourceRuntimeArgs>,
+    source_runtime: SourceRuntime,
+    source_params: PulsarSourceParams,
     pulsar_consumer: PulsarConsumer,
-    params: PulsarSourceParams,
     subscription_name: String,
     current_positions: BTreeMap<PartitionId, Position>,
     state: PulsarSourceState,
 }
 
+impl fmt::Debug for PulsarSource {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("PulsarSource")
+            .field("index_uid", self.source_runtime.index_uid())
+            .field("source_id", &self.source_runtime.source_id())
+            .field("subscription_name", &self.subscription_name)
+            .field("topics", &self.source_params.topics.join(", "))
+            .finish()
+    }
+}
+
 impl PulsarSource {
     pub async fn try_new(
-        ctx: Arc<SourceRuntimeArgs>,
-        params: PulsarSourceParams,
-        checkpoint: SourceCheckpoint,
+        source_runtime: SourceRuntime,
+        source_params: PulsarSourceParams,
     ) -> anyhow::Result<Self> {
-        let subscription_name = subscription_name(ctx.index_uid(), ctx.source_id());
+        let subscription_name =
+            subscription_name(source_runtime.index_uid(), source_runtime.source_id());
         info!(
-            index_id=%ctx.index_id(),
-            source_id=%ctx.source_id(),
-            topics=?params.topics,
+            index_id=%source_runtime.index_id(),
+            source_id=%source_runtime.source_id(),
+            topics=?source_params.topics,
             subscription_name=%subscription_name,
             "Create Pulsar source."
         );
-
-        let pulsar = connect_pulsar(&params).await?;
+        let pulsar = connect_pulsar(&source_params).await?;
+        let checkpoint = source_runtime.fetch_checkpoint().await?;
 
         // Current positions are built mapping the topic ID to the last-saved
         // message ID, pulsar ensures these topics (and topic partitions) are
         // unique so that we don't inadvertently clash.
         let mut current_positions = BTreeMap::new();
-        for topic in params.topics.iter() {
+        for topic in source_params.topics.iter() {
             let partitions = pulsar.lookup_partitioned_topic(topic).await?;
 
             for (partition, _) in partitions {
@@ -118,18 +124,17 @@ impl PulsarSource {
                 }
             }
         }
-
         let pulsar_consumer = create_pulsar_consumer(
             subscription_name.clone(),
-            params.clone(),
+            source_params.clone(),
             pulsar,
             current_positions.clone(),
         )
         .await?;
 
         Ok(Self {
-            ctx,
-            params,
+            source_runtime,
+            source_params,
             pulsar_consumer,
             subscription_name,
             current_positions,
@@ -212,8 +217,8 @@ impl Source for PulsarSource {
         ctx: &SourceContext,
     ) -> Result<Duration, ActorExitStatus> {
         let now = Instant::now();
-        let mut batch = BatchBuilder::default();
-        let deadline = time::sleep(EMIT_BATCHES_TIMEOUT);
+        let mut batch_builder = BatchBuilder::new(SourceType::Pulsar);
+        let deadline = time::sleep(*EMIT_BATCHES_TIMEOUT);
         tokio::pin!(deadline);
 
         loop {
@@ -226,9 +231,9 @@ impl Source for PulsarSource {
                         .ok_or_else(|| ActorExitStatus::from(anyhow!("consumer was dropped")))?
                         .map_err(|e| ActorExitStatus::from(anyhow!("failed to get message from consumer: {:?}", e)))?;
 
-                    self.process_message(message, &mut batch).map_err(ActorExitStatus::from)?;
+                    self.process_message(message, &mut batch_builder).map_err(ActorExitStatus::from)?;
 
-                    if batch.num_bytes >= BATCH_NUM_BYTES_LIMIT {
+                    if batch_builder.num_bytes >= BATCH_NUM_BYTES_LIMIT {
                         break;
                     }
                 }
@@ -239,16 +244,16 @@ impl Source for PulsarSource {
             ctx.record_progress();
         }
 
-        if !batch.checkpoint_delta.is_empty() {
+        if !batch_builder.checkpoint_delta.is_empty() {
             debug!(
-                num_docs=%batch.docs.len(),
-                num_bytes=%batch.num_bytes,
+                num_docs=%batch_builder.docs.len(),
+                num_bytes=%batch_builder.num_bytes,
                 num_millis=%now.elapsed().as_millis(),
-                "Sending doc batch to indexer.");
-            let message = batch.build();
+                "sending doc batch to indexer"
+            );
+            let message = batch_builder.build();
             ctx.send_message(doc_processor_mailbox, message).await?;
         }
-
         Ok(Duration::default())
     }
 
@@ -261,16 +266,25 @@ impl Source for PulsarSource {
     }
 
     fn name(&self) -> String {
-        format!("PulsarSource{{source_id={}}}", self.ctx.source_id())
+        format!("{:?}", self)
+    }
+
+    async fn finalize(
+        &mut self,
+        _exit_status: &ActorExitStatus,
+        _ctx: &SourceContext,
+    ) -> anyhow::Result<()> {
+        self.pulsar_consumer.close().await?;
+        Ok(())
     }
 
     fn observable_state(&self) -> JsonValue {
         json!({
-            "index_id": self.ctx.index_id(),
-            "source_id": self.ctx.source_id(),
-            "topics": self.params.topics,
+            "index_id": self.source_runtime.index_id(),
+            "source_id": self.source_runtime.source_id(),
+            "topics": self.source_params.topics,
             "subscription_name": self.subscription_name,
-            "consumer_name": self.params.consumer_name,
+            "consumer_name": self.source_params.consumer_name,
             "num_bytes_processed": self.state.num_bytes_processed,
             "num_messages_processed": self.state.num_messages_processed,
             "num_invalid_messages": self.state.num_invalid_messages,
@@ -410,9 +424,7 @@ async fn connect_pulsar(params: &PulsarSourceParams) -> anyhow::Result<Pulsar<To
             builder = builder.with_auth_provider(OAuth2Authentication::client_credentials(auth));
         }
     }
-
     let pulsar: Pulsar<_> = builder.build().await?;
-
     Ok(pulsar)
 }
 
@@ -431,27 +443,20 @@ mod pulsar_broker_tests {
     use std::collections::HashSet;
     use std::num::NonZeroUsize;
     use std::ops::Range;
-    use std::path::PathBuf;
 
     use futures::future::join_all;
     use quickwit_actors::{ActorHandle, Inbox, Universe, HEARTBEAT};
     use quickwit_common::rand::append_random_suffix;
-    use quickwit_config::{IndexConfig, SourceConfig, SourceInputFormat, SourceParams};
-    use quickwit_metastore::checkpoint::{
-        IndexCheckpointDelta, PartitionId, SourceCheckpointDelta,
-    };
-    use quickwit_metastore::{
-        metastore_for_test, CreateIndexRequestExt, SplitMetadata, StageSplitsRequestExt,
-    };
-    use quickwit_proto::metastore::{
-        CreateIndexRequest, MetastoreService, MetastoreServiceClient, PublishSplitsRequest,
-        StageSplitsRequest,
-    };
+    use quickwit_config::{SourceConfig, SourceInputFormat, SourceParams};
+    use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpointDelta};
+    use quickwit_metastore::metastore_for_test;
+    use quickwit_proto::metastore::MetastoreServiceClient;
     use reqwest::StatusCode;
 
     use super::*;
-    use crate::new_split_id;
     use crate::source::pulsar_source::{msg_id_from_position, msg_id_to_position};
+    use crate::source::test_setup_helper::setup_index;
+    use crate::source::tests::SourceRuntimeBuilder;
     use crate::source::{quickwit_supported_sources, RawDocBatch, SuggestTruncate};
 
     static PULSAR_URI: &str = "pulsar://localhost:6650";
@@ -482,71 +487,13 @@ mod pulsar_broker_tests {
         }};
     }
 
-    async fn setup_index(
-        mut metastore: MetastoreServiceClient,
-        index_id: &str,
-        source_id: &str,
-        partition_deltas: &[(&str, Position, Position)],
-    ) -> IndexUid {
-        let index_uri = format!("ram:///indexes/{index_id}");
-        let index_config = IndexConfig::for_test(index_id, &index_uri);
-        let create_index_request =
-            CreateIndexRequest::try_from_index_config(&index_config).unwrap();
-        let index_uid: IndexUid = metastore
-            .create_index(create_index_request)
-            .await
-            .unwrap()
-            .index_uid()
-            .clone();
-
-        if partition_deltas.is_empty() {
-            return index_uid;
-        }
-        let split_id = new_split_id();
-        let split_metadata = SplitMetadata::for_test(split_id.clone());
-        let stage_splits_request =
-            StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
-                .unwrap();
-        metastore.stage_splits(stage_splits_request).await.unwrap();
-
-        let mut source_delta = SourceCheckpointDelta::default();
-        for (partition_id, from_position, to_position) in partition_deltas {
-            source_delta
-                .record_partition_delta(
-                    PartitionId::from(&**partition_id),
-                    from_position.clone(),
-                    to_position.clone(),
-                )
-                .unwrap();
-        }
-        let checkpoint_delta = IndexCheckpointDelta {
-            source_id: source_id.to_string(),
-            source_delta,
-        };
-        let publish_splits_request = PublishSplitsRequest {
-            index_uid: Some(index_uid.clone()),
-            staged_split_ids: vec![split_id.clone()],
-            replaced_split_ids: Vec::new(),
-            index_checkpoint_delta_json_opt: Some(
-                serde_json::to_string(&checkpoint_delta).unwrap(),
-            ),
-            publish_token_opt: None,
-        };
-        metastore
-            .publish_splits(publish_splits_request)
-            .await
-            .unwrap();
-        index_uid
-    }
-
     fn get_source_config<S: AsRef<str>>(
         topics: impl IntoIterator<Item = S>,
     ) -> (String, SourceConfig) {
         let source_id = append_random_suffix("test-pulsar-source--source");
         let source_config = SourceConfig {
             source_id: source_id.clone(),
-            max_num_pipelines_per_indexer: NonZeroUsize::new(1).unwrap(),
-            desired_num_pipelines: NonZeroUsize::new(1).unwrap(),
+            num_pipelines: NonZeroUsize::new(1).unwrap(),
             enabled: true,
             source_params: SourceParams::Pulsar(PulsarSourceParams {
                 topics: topics.into_iter().map(|v| v.as_ref().to_string()).collect(),
@@ -567,7 +514,7 @@ mod pulsar_broker_tests {
             merged_batch
                 .checkpoint_delta
                 .extend(batch.checkpoint_delta)
-                .expect("Merge batches.");
+                .unwrap();
         }
         merged_batch.docs.sort();
         merged_batch
@@ -696,21 +643,14 @@ mod pulsar_broker_tests {
 
     async fn create_source(
         universe: &Universe,
-        metastore: MetastoreServiceClient,
+        _metastore: MetastoreServiceClient,
         index_uid: IndexUid,
         source_config: SourceConfig,
-        start_checkpoint: SourceCheckpoint,
+        _start_checkpoint: SourceCheckpoint,
     ) -> anyhow::Result<(ActorHandle<SourceActor>, Inbox<DocProcessor>)> {
-        let ctx = SourceRuntimeArgs::for_test(
-            index_uid,
-            source_config,
-            metastore,
-            PathBuf::from("./queues"),
-        );
-
         let source_loader = quickwit_supported_sources();
-        let source = source_loader.load_source(ctx, start_checkpoint).await?;
-
+        let source_runtime = SourceRuntimeBuilder::new(index_uid, source_config).build();
+        let source = source_loader.load_source(source_runtime).await?;
         let (doc_processor_mailbox, doc_processor_inbox) = universe.create_test_mailbox();
         let source_actor = SourceActor {
             source,
@@ -812,7 +752,6 @@ mod pulsar_broker_tests {
 
     #[tokio::test]
     async fn test_doc_batching_logic() {
-        let metastore = metastore_for_test();
         let topic = append_random_suffix("test-pulsar-source-topic");
 
         let index_id = append_random_suffix("test-pulsar-source-index");
@@ -824,20 +763,13 @@ mod pulsar_broker_tests {
             unreachable!()
         };
 
-        let ctx = SourceRuntimeArgs::for_test(
-            index_uid,
-            source_config,
-            metastore,
-            PathBuf::from("./queues"),
-        );
-        let start_checkpoint = SourceCheckpoint::default();
-
-        let mut pulsar_source = PulsarSource::try_new(ctx, params, start_checkpoint)
+        let source_runtime = SourceRuntimeBuilder::new(index_uid, source_config).build();
+        let mut pulsar_source = PulsarSource::try_new(source_runtime, params)
             .await
             .expect("Setup pulsar source");
 
         let position = Position::Beginning;
-        let mut batch = BatchBuilder::default();
+        let mut batch = BatchBuilder::new(SourceType::Pulsar);
         pulsar_source
             .add_doc_to_batch(&topic, position, Bytes::from_static(b""), &mut batch)
             .expect("Add batch should not error on empty doc.");
@@ -849,7 +781,7 @@ mod pulsar_broker_tests {
         assert!(batch.docs.is_empty());
 
         let position = Position::offset(1u64); // Used for testing simplicity.
-        let mut batch = BatchBuilder::default();
+        let mut batch = BatchBuilder::new(SourceType::Pulsar);
         let doc = Bytes::from_static(b"some-demo-data");
         pulsar_source
             .add_doc_to_batch(&topic, position, doc, &mut batch)
@@ -866,7 +798,7 @@ mod pulsar_broker_tests {
         assert_eq!(batch.docs.len(), 1);
 
         let position = Position::offset(4u64); // Used for testing simplicity.
-        let mut batch = BatchBuilder::default();
+        let mut batch = BatchBuilder::new(SourceType::Pulsar);
         let doc = Bytes::from_static(b"some-demo-data-2");
         pulsar_source
             .add_doc_to_batch(&topic, position, doc, &mut batch)
@@ -901,7 +833,7 @@ mod pulsar_broker_tests {
         let index_id = append_random_suffix("test-pulsar-source--topic-ingestion--index");
         let (source_id, source_config) = get_source_config([&topic]);
 
-        let index_uid = setup_index(metastore.clone(), &index_id, &source_id, &[]).await;
+        let index_uid = setup_index(metastore.clone(), &index_id, &source_config, &[]).await;
 
         let (source_handle, doc_processor_inbox) = create_source(
             &universe,
@@ -958,7 +890,7 @@ mod pulsar_broker_tests {
         let index_id = append_random_suffix("test-pulsar-source--topic-ingestion--index");
         let (source_id, source_config) = get_source_config([&topic1, &topic2]);
 
-        let index_uid = setup_index(metastore.clone(), &index_id, &source_id, &[]).await;
+        let index_uid = setup_index(metastore.clone(), &index_id, &source_config, &[]).await;
 
         let (source_handle, doc_processor_inbox) = create_source(
             &universe,
@@ -1026,7 +958,7 @@ mod pulsar_broker_tests {
         let (source_id, source_config) = get_source_config([&topic]);
 
         create_partitioned_topic(&topic, 2).await;
-        let index_uid = setup_index(metastore.clone(), &index_id, &source_id, &[]).await;
+        let index_uid = setup_index(metastore.clone(), &index_id, &source_config, &[]).await;
 
         let (source_handle, doc_processor_inbox) = create_source(
             &universe,
@@ -1080,7 +1012,7 @@ mod pulsar_broker_tests {
         let (source_id, source_config) = get_source_config([&topic]);
 
         create_partitioned_topic(&topic, 2).await;
-        let index_uid = setup_index(metastore.clone(), &index_id, &source_id, &[]).await;
+        let index_uid = setup_index(metastore.clone(), &index_id, &source_config, &[]).await;
 
         let topic_partition_1 = format!("{topic}-partition-0");
         let topic_partition_2 = format!("{topic}-partition-1");
@@ -1164,10 +1096,10 @@ mod pulsar_broker_tests {
 
         let index_id =
             append_random_suffix("test-pulsar-source--partitioned-multi-consumer-failure--index");
-        let (source_id, source_config) = get_source_config([&topic]);
+        let (_, source_config) = get_source_config([&topic]);
 
         create_partitioned_topic(&topic, 2).await;
-        let index_uid = setup_index(metastore.clone(), &index_id, &source_id, &[]).await;
+        let index_uid = setup_index(metastore.clone(), &index_id, &source_config, &[]).await;
 
         let topic_partition_1 = format!("{topic}-partition-0");
         let topic_partition_2 = format!("{topic}-partition-1");
