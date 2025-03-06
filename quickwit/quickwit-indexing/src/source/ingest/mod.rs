@@ -1,25 +1,19 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -38,7 +32,10 @@ use quickwit_proto::ingest::ingester::{
     TruncateShardsSubrequest,
 };
 use quickwit_proto::ingest::IngestV2Error;
-use quickwit_proto::metastore::{AcquireShardsRequest, MetastoreService, MetastoreServiceClient};
+use quickwit_proto::metastore::{
+    AcquireShardsRequest, AcquireShardsResponse, MetastoreService, MetastoreServiceClient,
+    SourceType,
+};
 use quickwit_proto::types::{
     NodeId, PipelineUid, Position, PublishToken, ShardId, SourceId, SourceUid,
 };
@@ -49,8 +46,8 @@ use tracing::{debug, error, info, warn};
 use ulid::Ulid;
 
 use super::{
-    BatchBuilder, Source, SourceContext, SourceRuntimeArgs, TypedSourceFactory,
-    BATCH_NUM_BYTES_LIMIT, EMIT_BATCHES_TIMEOUT,
+    BatchBuilder, Source, SourceContext, SourceRuntime, TypedSourceFactory, BATCH_NUM_BYTES_LIMIT,
+    EMIT_BATCHES_TIMEOUT,
 };
 use crate::actors::DocProcessor;
 use crate::models::{LocalShardPositionsUpdate, NewPublishLock, NewPublishToken, PublishLock};
@@ -63,18 +60,17 @@ impl TypedSourceFactory for IngestSourceFactory {
     type Params = ();
 
     async fn typed_create_source(
-        runtime_args: Arc<SourceRuntimeArgs>,
+        source_runtime: SourceRuntime,
         _params: Self::Params,
-        _checkpoint: SourceCheckpoint,
     ) -> anyhow::Result<Self::Source> {
         // Retry parameters for the fetch stream: retry indefinitely until the shard is complete or
         // unassigned.
         let retry_params = RetryParams {
             max_attempts: usize::MAX,
-            base_delay: Duration::from_secs(1),
+            base_delay: Duration::from_secs(5),
             max_delay: Duration::from_secs(10 * 60), // 10 minutes
         };
-        IngestSource::try_new(runtime_args, retry_params).await
+        IngestSource::try_new(source_runtime, retry_params).await
     }
 }
 
@@ -159,20 +155,20 @@ impl fmt::Debug for IngestSource {
 
 impl IngestSource {
     pub async fn try_new(
-        runtime_args: Arc<SourceRuntimeArgs>,
+        source_runtime: SourceRuntime,
         retry_params: RetryParams,
     ) -> anyhow::Result<IngestSource> {
-        let self_node_id: NodeId = runtime_args.node_id().into();
+        let self_node_id: NodeId = source_runtime.node_id().into();
         let client_id = ClientId::new(
             self_node_id.clone(),
             SourceUid {
-                index_uid: runtime_args.index_uid().clone(),
-                source_id: runtime_args.source_id().to_string(),
+                index_uid: source_runtime.index_uid().clone(),
+                source_id: source_runtime.source_id().to_string(),
             },
-            runtime_args.pipeline_uid(),
+            source_runtime.pipeline_uid(),
         );
-        let metastore = runtime_args.metastore.clone();
-        let ingester_pool = runtime_args.ingester_pool.clone();
+        let metastore = source_runtime.metastore.clone();
+        let ingester_pool = source_runtime.ingester_pool.clone();
         let assigned_shards = FnvHashMap::default();
         let fetch_stream = MultiFetchStream::new(
             self_node_id,
@@ -193,7 +189,7 @@ impl IngestSource {
             fetch_stream,
             publish_lock,
             publish_token,
-            event_broker: runtime_args.event_broker.clone(),
+            event_broker: source_runtime.event_broker.clone(),
         })
     }
 
@@ -217,8 +213,8 @@ impl IngestSource {
         assigned_shard.status = IndexingStatus::Active;
 
         let partition_id = assigned_shard.partition_id.clone();
-        let from_position_exclusive = fetch_payload.from_position_exclusive().clone();
-        let to_position_inclusive = fetch_payload.to_position_inclusive().clone();
+        let from_position_exclusive = fetch_payload.from_position_exclusive();
+        let to_position_inclusive = fetch_payload.to_position_inclusive();
 
         for mrecord in decoded_mrecords(mrecord_batch) {
             match mrecord {
@@ -256,7 +252,7 @@ impl IngestSource {
 
         let partition_id = assigned_shard.partition_id.clone();
         let from_position_exclusive = assigned_shard.current_position_inclusive.clone();
-        let to_position_inclusive = fetch_eof.eof_position().clone();
+        let to_position_inclusive = fetch_eof.eof_position();
 
         batch_builder
             .checkpoint_delta
@@ -297,6 +293,9 @@ impl IngestSource {
     }
 
     async fn truncate(&mut self, truncate_up_to_positions: Vec<(ShardId, Position)>) {
+        if truncate_up_to_positions.is_empty() {
+            return;
+        }
         let shard_positions_update = LocalShardPositionsUpdate::new(
             self.client_id.source_uid.clone(),
             truncate_up_to_positions.clone(),
@@ -309,6 +308,7 @@ impl IngestSource {
                 }
             }
         }
+
         // We publish the event to the event broker.
         self.event_broker.publish(shard_positions_update);
 
@@ -320,7 +320,7 @@ impl IngestSource {
         > = FnvHashMap::default();
 
         for (shard_id, truncate_up_to_position_inclusive) in truncate_up_to_positions {
-            if matches!(truncate_up_to_position_inclusive, Position::Beginning) {
+            if truncate_up_to_position_inclusive.is_beginning() {
                 continue;
             }
             let Some(shard) = self.assigned_shards.get(&shard_id) else {
@@ -345,7 +345,7 @@ impl IngestSource {
                 .push(truncate_shards_subrequest);
         }
         for (ingester_id, truncate_subrequests) in per_ingester_truncate_subrequests {
-            let Some(mut ingester) = self.ingester_pool.get(ingester_id) else {
+            let Some(ingester) = self.ingester_pool.get(ingester_id) else {
                 warn!("failed to truncate shard(s): ingester `{ingester_id}` is unavailable");
                 continue;
             };
@@ -400,7 +400,6 @@ impl IngestSource {
         if new_assigned_shard_ids.is_empty() && self.assigned_shards.is_empty() {
             return Ok(());
         }
-
         // There are two reasons why we might want to reset the pipeline.
         // 1) it has never been initialized in the first place. This happens typically on the first
         // call to `assign_shards` with a non-empty list of shards. We check that by looking at
@@ -463,11 +462,10 @@ impl Source for IngestSource {
         doc_processor_mailbox: &Mailbox<DocProcessor>,
         ctx: &SourceContext,
     ) -> Result<Duration, ActorExitStatus> {
-        let mut batch_builder = BatchBuilder::default();
+        let mut batch_builder = BatchBuilder::new(SourceType::IngestV2);
 
         let now = time::Instant::now();
-        let deadline = now + EMIT_BATCHES_TIMEOUT;
-
+        let deadline = now + *EMIT_BATCHES_TIMEOUT;
         loop {
             match time::timeout_at(deadline, self.fetch_stream.next()).await {
                 Ok(Ok(fetch_message)) => match fetch_message.message {
@@ -536,18 +534,34 @@ impl Source for IngestSource {
             .filter(|shard_id| !self.assigned_shards.contains_key(shard_id))
             .collect();
 
+        assert!(!added_shard_ids.is_empty());
         info!(added_shards=?added_shard_ids, "adding shards assignment");
 
         let acquire_shards_request = AcquireShardsRequest {
             index_uid: Some(self.client_id.source_uid.index_uid.clone()),
             source_id: self.client_id.source_uid.source_id.clone(),
-            shard_ids: added_shard_ids,
+            shard_ids: added_shard_ids.clone(),
             publish_token: self.publish_token.clone(),
         };
-        let acquire_shards_response = ctx
+        let acquire_shards_response: AcquireShardsResponse = ctx
             .protect_future(self.metastore.acquire_shards(acquire_shards_request))
             .await
             .context("failed to acquire shards")?;
+
+        if acquire_shards_response.acquired_shards.len() != added_shard_ids.len() {
+            let missing_shards = added_shard_ids
+                .iter()
+                .filter(|shard_id| {
+                    !acquire_shards_response
+                        .acquired_shards
+                        .iter()
+                        .any(|acquired_shard| acquired_shard.shard_id() == *shard_id)
+                })
+                .collect::<Vec<_>>();
+            // This can happen if the shards have been deleted by the control plane, after building
+            // the plan and before the apply terminated. See #4888.
+            info!(missing_shards=?missing_shards, "failed to acquire all assigned shards");
+        }
 
         let mut truncate_up_to_positions =
             Vec::with_capacity(acquire_shards_response.acquired_shards.len());
@@ -555,8 +569,7 @@ impl Source for IngestSource {
         for acquired_shard in acquire_shards_response.acquired_shards {
             let index_uid = acquired_shard.index_uid().clone();
             let shard_id = acquired_shard.shard_id().clone();
-            let mut current_position_inclusive =
-                acquired_shard.publish_position_inclusive().clone();
+            let mut current_position_inclusive = acquired_shard.publish_position_inclusive();
             let leader_id: NodeId = acquired_shard.leader_id.into();
             let follower_id_opt: Option<NodeId> = acquired_shard.follower_id.map(Into::into);
             let source_id: SourceId = acquired_shard.source_id;
@@ -598,6 +611,7 @@ impl Source for IngestSource {
             };
             self.assigned_shards.insert(shard_id, assigned_shard);
         }
+
         self.truncate(truncate_up_to_positions).await;
 
         Ok(())
@@ -608,13 +622,13 @@ impl Source for IngestSource {
         checkpoint: SourceCheckpoint,
         _ctx: &SourceContext,
     ) -> anyhow::Result<()> {
-        let mut truncate_up_to_positions: Vec<(ShardId, Position)> =
-            Vec::with_capacity(checkpoint.num_partitions());
-
-        for (partition_id, position) in checkpoint.iter() {
-            let shard_id = ShardId::from(partition_id.as_str());
-            truncate_up_to_positions.push((shard_id, position));
-        }
+        let truncate_up_to_positions: Vec<(ShardId, Position)> = checkpoint
+            .iter()
+            .map(|(partition_id, position)| {
+                let shard_id = ShardId::from(partition_id.as_str());
+                (shard_id, position)
+            })
+            .collect();
         self.truncate(truncate_up_to_positions).await;
         Ok(())
     }
@@ -648,18 +662,23 @@ impl Source for IngestSource {
 mod tests {
     use std::iter::once;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
+    use bytesize::ByteSize;
     use itertools::Itertools;
     use quickwit_actors::{ActorContext, Universe};
+    use quickwit_common::metrics::MEMORY_METRICS;
+    use quickwit_common::stream_utils::InFlightValue;
     use quickwit_common::ServiceStream;
-    use quickwit_config::{SourceConfig, SourceParams};
+    use quickwit_config::{IndexingSettings, SourceConfig, SourceParams};
     use quickwit_proto::indexing::IndexingPipelineId;
     use quickwit_proto::ingest::ingester::{
-        FetchMessage, IngesterServiceClient, TruncateShardsResponse,
+        FetchMessage, IngesterServiceClient, MockIngesterService, TruncateShardsResponse,
     };
     use quickwit_proto::ingest::{IngestV2Error, MRecordBatch, Shard, ShardState};
-    use quickwit_proto::metastore::AcquireShardsResponse;
-    use quickwit_proto::types::{IndexUid, PipelineUid};
+    use quickwit_proto::metastore::{AcquireShardsResponse, MockMetastoreService};
+    use quickwit_proto::types::{DocMappingUid, IndexUid, PipelineUid};
     use quickwit_storage::StorageResolver;
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio::sync::watch;
@@ -676,7 +695,7 @@ mod tests {
     #[tokio::test]
     async fn test_ingest_source_assign_shards() {
         let pipeline_id = IndexingPipelineId {
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             index_uid: IndexUid::for_test("test-index", 0),
             source_id: "test-source".to_string(),
             pipeline_uid: PipelineUid::default(),
@@ -685,7 +704,7 @@ mod tests {
         let publish_token = "indexer/test-node/test-index:0/test-source/\
                              00000000000000000000000000/00000000000000000000000000";
 
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_acquire_shards()
             .withf(|request| request.shard_ids == [ShardId::from(0)])
@@ -701,8 +720,10 @@ mod tests {
                         follower_id: None,
                         shard_id: Some(ShardId::from(0)),
                         shard_state: ShardState::Open as i32,
+                        doc_mapping_uid: Some(DocMappingUid::default()),
                         publish_position_inclusive: Some(Position::offset(10u64)),
                         publish_token: Some(publish_token.to_string()),
+                        update_timestamp: 1724158996,
                     }],
                 };
                 Ok(response)
@@ -723,8 +744,10 @@ mod tests {
                         source_id: "test-source".to_string(),
                         shard_id: Some(ShardId::from(1)),
                         shard_state: ShardState::Open as i32,
+                        doc_mapping_uid: Some(DocMappingUid::default()),
                         publish_position_inclusive: Some(Position::offset(11u64)),
                         publish_token: Some(publish_token.to_string()),
+                        update_timestamp: 1724158996,
                     }],
                 };
                 Ok(response)
@@ -746,8 +769,10 @@ mod tests {
                             source_id: "test-source".to_string(),
                             shard_id: Some(ShardId::from(1)),
                             shard_state: ShardState::Open as i32,
+                            doc_mapping_uid: Some(DocMappingUid::default()),
                             publish_position_inclusive: Some(Position::offset(11u64)),
                             publish_token: Some(publish_token.to_string()),
+                            update_timestamp: 1724158996,
                         },
                         Shard {
                             leader_id: "test-ingester-0".to_string(),
@@ -756,8 +781,10 @@ mod tests {
                             source_id: "test-source".to_string(),
                             shard_id: Some(ShardId::from(2)),
                             shard_state: ShardState::Open as i32,
+                            doc_mapping_uid: Some(DocMappingUid::default()),
                             publish_position_inclusive: Some(Position::offset(12u64)),
                             publish_token: Some(publish_token.to_string()),
+                            update_timestamp: 1724158996,
                         },
                     ],
                 };
@@ -769,9 +796,9 @@ mod tests {
         // request.
         let (sequence_tx, mut sequence_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
 
-        let mut ingester_mock_0 = IngesterServiceClient::mock();
+        let mut mock_ingester_0 = MockIngesterService::new();
         let sequence_tx_clone1 = sequence_tx.clone();
-        ingester_mock_0
+        mock_ingester_0
             .expect_open_fetch_stream()
             .withf(|request| {
                 request.from_position_exclusive() == Position::offset(10u64)
@@ -792,7 +819,7 @@ mod tests {
                 Ok(service_stream)
             });
         let sequence_tx_clone2 = sequence_tx.clone();
-        ingester_mock_0
+        mock_ingester_0
             .expect_open_fetch_stream()
             .withf(|request| {
                 request.from_position_exclusive() == Position::offset(11u64)
@@ -813,7 +840,7 @@ mod tests {
                 Ok(service_stream)
             });
         let sequence_tx_clone3 = sequence_tx.clone();
-        ingester_mock_0
+        mock_ingester_0
             .expect_open_fetch_stream()
             .withf(|request| {
                 request.from_position_exclusive() == Position::offset(12u64)
@@ -833,7 +860,7 @@ mod tests {
                 let (_service_stream_tx, service_stream) = ServiceStream::new_bounded(1);
                 Ok(service_stream)
             });
-        ingester_mock_0
+        mock_ingester_0
             .expect_truncate_shards()
             .withf(|truncate_req| truncate_req.subrequests[0].shard_id() == ShardId::from(0))
             .once()
@@ -853,7 +880,7 @@ mod tests {
                 Ok(response)
             });
 
-        ingester_mock_0
+        mock_ingester_0
             .expect_truncate_shards()
             .withf(|truncate_req| truncate_req.subrequests[0].shard_id() == ShardId::from(1))
             .once()
@@ -871,7 +898,7 @@ mod tests {
 
                 Ok(TruncateShardsResponse {})
             });
-        ingester_mock_0
+        mock_ingester_0
             .expect_truncate_shards()
             .withf(|truncate_req| {
                 truncate_req.subrequests.len() == 2
@@ -902,25 +929,23 @@ mod tests {
                 Ok(response)
             });
 
-        let ingester_0: IngesterServiceClient = ingester_mock_0.into();
+        let ingester_0 = IngesterServiceClient::from_mock(mock_ingester_0);
         ingester_pool.insert("test-ingester-0".into(), ingester_0.clone());
 
         let event_broker = EventBroker::default();
 
-        let runtime_args: Arc<SourceRuntimeArgs> = Arc::new(SourceRuntimeArgs {
+        let source_runtime = SourceRuntime {
             pipeline_id,
             source_config,
-            metastore: MetastoreServiceClient::from(mock_metastore),
+            metastore: MetastoreServiceClient::from_mock(mock_metastore),
             ingester_pool: ingester_pool.clone(),
             queues_dir_path: PathBuf::from("./queues"),
             storage_resolver: StorageResolver::for_test(),
             event_broker,
-        });
-        let retry_params = RetryParams {
-            max_attempts: 1,
-            ..Default::default()
+            indexing_setting: IndexingSettings::default(),
         };
-        let mut source = IngestSource::try_new(runtime_args, retry_params)
+        let retry_params = RetryParams::no_retries();
+        let mut source = IngestSource::try_new(source_runtime, retry_params)
             .await
             .unwrap();
 
@@ -1021,7 +1046,7 @@ mod tests {
         // - emission of a suggest truncate
         // - no stream request is emitted
         let pipeline_id = IndexingPipelineId {
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             index_uid: IndexUid::for_test("test-index", 0),
             source_id: "test-source".to_string(),
             pipeline_uid: PipelineUid::default(),
@@ -1030,7 +1055,7 @@ mod tests {
         let publish_token = "indexer/test-node/test-index:0/test-source/\
                              00000000000000000000000000/00000000000000000000000000";
 
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_acquire_shards()
             .once()
@@ -1048,8 +1073,10 @@ mod tests {
                             source_id: "test-source".to_string(),
                             shard_id: Some(ShardId::from(1)),
                             shard_state: ShardState::Open as i32,
+                            doc_mapping_uid: Some(DocMappingUid::default()),
                             publish_position_inclusive: Some(Position::eof(11u64)),
                             publish_token: Some(publish_token.to_string()),
+                            update_timestamp: 1724158996,
                         },
                         Shard {
                             leader_id: "test-ingester-0".to_string(),
@@ -1058,8 +1085,10 @@ mod tests {
                             source_id: "test-source".to_string(),
                             shard_id: Some(ShardId::from(2)),
                             shard_state: ShardState::Open as i32,
+                            doc_mapping_uid: Some(DocMappingUid::default()),
                             publish_position_inclusive: Some(Position::Beginning.as_eof()),
                             publish_token: Some(publish_token.to_string()),
+                            update_timestamp: 1724158996,
                         },
                     ],
                 };
@@ -1067,8 +1096,8 @@ mod tests {
             });
         let ingester_pool = IngesterPool::default();
 
-        let mut ingester_mock_0 = IngesterServiceClient::mock();
-        ingester_mock_0
+        let mut mock_ingester_0 = MockIngesterService::new();
+        mock_ingester_0
             .expect_truncate_shards()
             .once()
             .returning(|request| {
@@ -1097,7 +1126,7 @@ mod tests {
                 Ok(response)
             });
 
-        let ingester_0: IngesterServiceClient = ingester_mock_0.into();
+        let ingester_0 = IngesterServiceClient::from_mock(mock_ingester_0);
         ingester_pool.insert("test-ingester-0".into(), ingester_0.clone());
 
         let event_broker = EventBroker::default();
@@ -1109,17 +1138,18 @@ mod tests {
             })
             .forever();
 
-        let runtime_args = Arc::new(SourceRuntimeArgs {
+        let source_runtime = SourceRuntime {
             pipeline_id,
             source_config,
-            metastore: MetastoreServiceClient::from(mock_metastore),
+            metastore: MetastoreServiceClient::from_mock(mock_metastore),
             ingester_pool: ingester_pool.clone(),
             queues_dir_path: PathBuf::from("./queues"),
             storage_resolver: StorageResolver::for_test(),
             event_broker,
-        });
+            indexing_setting: IndexingSettings::default(),
+        };
         let retry_params = RetryParams::for_test();
-        let mut source = IngestSource::try_new(runtime_args, retry_params)
+        let mut source = IngestSource::try_new(source_runtime, retry_params)
             .await
             .unwrap();
 
@@ -1161,7 +1191,7 @@ mod tests {
         // - emission of a suggest truncate
         // - the stream request emitted does not include the EOF shards
         let pipeline_id = IndexingPipelineId {
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             index_uid: IndexUid::for_test("test-index", 0),
             source_id: "test-source".to_string(),
             pipeline_uid: PipelineUid::default(),
@@ -1170,7 +1200,7 @@ mod tests {
         let publish_token = "indexer/test-node/test-index:0/test-source/\
                              00000000000000000000000000/00000000000000000000000000";
 
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_acquire_shards()
             .once()
@@ -1188,8 +1218,10 @@ mod tests {
                             source_id: "test-source".to_string(),
                             shard_id: Some(ShardId::from(1)),
                             shard_state: ShardState::Open as i32,
+                            doc_mapping_uid: Some(DocMappingUid::default()),
                             publish_position_inclusive: Some(Position::offset(11u64)),
                             publish_token: Some(publish_token.to_string()),
+                            update_timestamp: 1724158996,
                         },
                         Shard {
                             leader_id: "test-ingester-0".to_string(),
@@ -1198,8 +1230,10 @@ mod tests {
                             source_id: "test-source".to_string(),
                             shard_id: Some(ShardId::from(2)),
                             shard_state: ShardState::Closed as i32,
+                            doc_mapping_uid: Some(DocMappingUid::default()),
                             publish_position_inclusive: Some(Position::eof(22u64)),
                             publish_token: Some(publish_token.to_string()),
+                            update_timestamp: 1724158996,
                         },
                     ],
                 };
@@ -1207,8 +1241,8 @@ mod tests {
             });
         let ingester_pool = IngesterPool::default();
 
-        let mut ingester_mock_0 = IngesterServiceClient::mock();
-        ingester_mock_0
+        let mut mock_ingester_0 = MockIngesterService::new();
+        mock_ingester_0
             .expect_open_fetch_stream()
             .once()
             .returning(|request| {
@@ -1225,7 +1259,7 @@ mod tests {
                 let (_service_stream_tx, service_stream) = ServiceStream::new_bounded(1);
                 Ok(service_stream)
             });
-        ingester_mock_0
+        mock_ingester_0
             .expect_truncate_shards()
             .once()
             .returning(|mut request| {
@@ -1257,7 +1291,7 @@ mod tests {
                 Ok(response)
             });
 
-        let ingester_0: IngesterServiceClient = ingester_mock_0.into();
+        let ingester_0 = IngesterServiceClient::from_mock(mock_ingester_0);
         ingester_pool.insert("test-ingester-0".into(), ingester_0.clone());
 
         let event_broker = EventBroker::default();
@@ -1269,17 +1303,18 @@ mod tests {
             })
             .forever();
 
-        let runtime_args = Arc::new(SourceRuntimeArgs {
+        let source_runtime = SourceRuntime {
             pipeline_id,
             source_config,
-            metastore: MetastoreServiceClient::from(mock_metastore),
+            metastore: MetastoreServiceClient::from_mock(mock_metastore),
             ingester_pool: ingester_pool.clone(),
             queues_dir_path: PathBuf::from("./queues"),
             storage_resolver: StorageResolver::for_test(),
             event_broker,
-        });
+            indexing_setting: IndexingSettings::default(),
+        };
         let retry_params = RetryParams::for_test();
-        let mut source = IngestSource::try_new(runtime_args, retry_params)
+        let mut source = IngestSource::try_new(source_runtime, retry_params)
             .await
             .unwrap();
 
@@ -1324,27 +1359,28 @@ mod tests {
     #[tokio::test]
     async fn test_ingest_source_emit_batches() {
         let pipeline_id = IndexingPipelineId {
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             index_uid: IndexUid::for_test("test-index", 0),
             source_id: "test-source".to_string(),
             pipeline_uid: PipelineUid::default(),
         };
         let source_config = SourceConfig::for_test("test-source", SourceParams::Ingest);
-        let mock_metastore = MetastoreServiceClient::mock();
+        let mock_metastore = MockMetastoreService::new();
         let ingester_pool = IngesterPool::default();
         let event_broker = EventBroker::default();
 
-        let runtime_args = Arc::new(SourceRuntimeArgs {
+        let source_runtime = SourceRuntime {
             pipeline_id,
             source_config,
-            metastore: MetastoreServiceClient::from(mock_metastore),
+            metastore: MetastoreServiceClient::from_mock(mock_metastore),
             ingester_pool: ingester_pool.clone(),
             queues_dir_path: PathBuf::from("./queues"),
             storage_resolver: StorageResolver::for_test(),
             event_broker,
-        });
+            indexing_setting: IndexingSettings::default(),
+        };
         let retry_params = RetryParams::for_test();
-        let mut source = IngestSource::try_new(runtime_args, retry_params)
+        let mut source = IngestSource::try_new(source_runtime, retry_params)
             .await
             .unwrap();
 
@@ -1391,8 +1427,14 @@ mod tests {
             from_position_exclusive: Some(Position::offset(11u64)),
             to_position_inclusive: Some(Position::offset(14u64)),
         };
+        let batch_size = fetch_payload.estimate_size();
         let fetch_message = FetchMessage::new_payload(fetch_payload);
-        fetch_message_tx.send(Ok(fetch_message)).await.unwrap();
+        let in_flight_value = InFlightValue::new(
+            fetch_message,
+            batch_size,
+            &MEMORY_METRICS.in_flight.fetch_stream,
+        );
+        fetch_message_tx.send(Ok(in_flight_value)).await.unwrap();
 
         let fetch_payload = FetchPayload {
             index_uid: Some(IndexUid::for_test("test-index", 0)),
@@ -1402,8 +1444,14 @@ mod tests {
             from_position_exclusive: Some(Position::offset(22u64)),
             to_position_inclusive: Some(Position::offset(23u64)),
         };
+        let batch_size = fetch_payload.estimate_size();
         let fetch_message = FetchMessage::new_payload(fetch_payload);
-        fetch_message_tx.send(Ok(fetch_message)).await.unwrap();
+        let in_flight_value = InFlightValue::new(
+            fetch_message,
+            batch_size,
+            &MEMORY_METRICS.in_flight.fetch_stream,
+        );
+        fetch_message_tx.send(Ok(in_flight_value)).await.unwrap();
 
         let fetch_eof = FetchEof {
             index_uid: Some(IndexUid::for_test("test-index", 0)),
@@ -1412,7 +1460,12 @@ mod tests {
             eof_position: Some(Position::eof(23u64)),
         };
         let fetch_message = FetchMessage::new_eof(fetch_eof);
-        fetch_message_tx.send(Ok(fetch_message)).await.unwrap();
+        let in_flight_value = InFlightValue::new(
+            fetch_message,
+            ByteSize(0),
+            &MEMORY_METRICS.in_flight.fetch_stream,
+        );
+        fetch_message_tx.send(Ok(in_flight_value)).await.unwrap();
 
         source
             .emit_batches(&doc_processor_mailbox, &ctx)
@@ -1475,8 +1528,14 @@ mod tests {
             from_position_exclusive: Some(Position::offset(14u64)),
             to_position_inclusive: Some(Position::offset(15u64)),
         };
+        let batch_size = fetch_payload.estimate_size();
         let fetch_message = FetchMessage::new_payload(fetch_payload);
-        fetch_message_tx.send(Ok(fetch_message)).await.unwrap();
+        let in_flight_value = InFlightValue::new(
+            fetch_message,
+            batch_size,
+            &MEMORY_METRICS.in_flight.fetch_stream,
+        );
+        fetch_message_tx.send(Ok(in_flight_value)).await.unwrap();
 
         source
             .emit_batches(&doc_processor_mailbox, &ctx)
@@ -1489,7 +1548,7 @@ mod tests {
     #[tokio::test]
     async fn test_ingest_source_emit_batches_shard_not_found() {
         let pipeline_id = IndexingPipelineId {
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             index_uid: IndexUid::for_test("test-index", 0),
             source_id: "test-source".to_string(),
             pipeline_uid: PipelineUid::default(),
@@ -1498,7 +1557,7 @@ mod tests {
         let publish_token = "indexer/test-node/test-index:0/test-source/\
                              00000000000000000000000000/00000000000000000000000000";
 
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_acquire_shards()
             .once()
@@ -1515,16 +1574,18 @@ mod tests {
                         source_id: "test-source".to_string(),
                         shard_id: Some(ShardId::from(1)),
                         shard_state: ShardState::Open as i32,
+                        doc_mapping_uid: Some(DocMappingUid::default()),
                         publish_position_inclusive: Some(Position::Beginning),
                         publish_token: Some(publish_token.to_string()),
+                        update_timestamp: 1724158996,
                     }],
                 };
                 Ok(response)
             });
         let ingester_pool = IngesterPool::default();
 
-        let mut ingester_mock_0 = IngesterServiceClient::mock();
-        ingester_mock_0
+        let mut mock_ingester_0 = MockIngesterService::new();
+        mock_ingester_0
             .expect_open_fetch_stream()
             .once()
             .returning(|request| {
@@ -1538,21 +1599,22 @@ mod tests {
                 })
             });
 
-        let ingester_0: IngesterServiceClient = ingester_mock_0.into();
+        let ingester_0 = IngesterServiceClient::from_mock(mock_ingester_0);
         ingester_pool.insert("test-ingester-0".into(), ingester_0.clone());
 
         let event_broker = EventBroker::default();
-        let runtime_args = Arc::new(SourceRuntimeArgs {
+        let source_runtime = SourceRuntime {
             pipeline_id,
             source_config,
-            metastore: MetastoreServiceClient::from(mock_metastore),
+            metastore: MetastoreServiceClient::from_mock(mock_metastore),
             ingester_pool,
             queues_dir_path: PathBuf::from("./queues"),
             storage_resolver: StorageResolver::for_test(),
             event_broker,
-        });
+            indexing_setting: IndexingSettings::default(),
+        };
         let retry_params = RetryParams::for_test();
-        let mut source = IngestSource::try_new(runtime_args, retry_params)
+        let mut source = IngestSource::try_new(source_runtime, retry_params)
             .await
             .unwrap();
 
@@ -1596,18 +1658,18 @@ mod tests {
     #[tokio::test]
     async fn test_ingest_source_suggest_truncate() {
         let pipeline_id = IndexingPipelineId {
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             index_uid: IndexUid::for_test("test-index", 0),
             source_id: "test-source".to_string(),
             pipeline_uid: PipelineUid::default(),
         };
         let source_config = SourceConfig::for_test("test-source", SourceParams::Ingest);
-        let mock_metastore = MetastoreServiceClient::mock();
+        let mock_metastore = MockMetastoreService::new();
 
         let ingester_pool = IngesterPool::default();
 
-        let mut ingester_mock_0 = IngesterServiceClient::mock();
-        ingester_mock_0
+        let mut mock_ingester_0 = MockIngesterService::new();
+        mock_ingester_0
             .expect_truncate_shards()
             .once()
             .returning(|request| {
@@ -1637,11 +1699,11 @@ mod tests {
 
                 Ok(TruncateShardsResponse {})
             });
-        let ingester_0: IngesterServiceClient = ingester_mock_0.into();
+        let ingester_0 = IngesterServiceClient::from_mock(mock_ingester_0);
         ingester_pool.insert("test-ingester-0".into(), ingester_0.clone());
 
-        let mut ingester_mock_1 = IngesterServiceClient::mock();
-        ingester_mock_1
+        let mut mock_ingester_1 = MockIngesterService::new();
+        mock_ingester_1
             .expect_truncate_shards()
             .once()
             .returning(|request| {
@@ -1664,11 +1726,11 @@ mod tests {
 
                 Ok(TruncateShardsResponse {})
             });
-        let ingester_1: IngesterServiceClient = ingester_mock_1.into();
+        let ingester_1 = IngesterServiceClient::from_mock(mock_ingester_1);
         ingester_pool.insert("test-ingester-1".into(), ingester_1.clone());
 
-        let mut ingester_mock_3 = IngesterServiceClient::mock();
-        ingester_mock_3
+        let mut mock_ingester_3 = MockIngesterService::new();
+        mock_ingester_3
             .expect_truncate_shards()
             .once()
             .returning(|request| {
@@ -1684,7 +1746,7 @@ mod tests {
 
                 Ok(TruncateShardsResponse {})
             });
-        let ingester_3: IngesterServiceClient = ingester_mock_3.into();
+        let ingester_3 = IngesterServiceClient::from_mock(mock_ingester_3);
         ingester_pool.insert("test-ingester-3".into(), ingester_3.clone());
 
         let event_broker = EventBroker::default();
@@ -1696,17 +1758,18 @@ mod tests {
             })
             .forever();
 
-        let runtime_args = Arc::new(SourceRuntimeArgs {
+        let source_runtime = SourceRuntime {
             pipeline_id,
             source_config,
-            metastore: MetastoreServiceClient::from(mock_metastore),
+            metastore: MetastoreServiceClient::from_mock(mock_metastore),
             ingester_pool: ingester_pool.clone(),
             queues_dir_path: PathBuf::from("./queues"),
             storage_resolver: StorageResolver::for_test(),
             event_broker,
-        });
+            indexing_setting: IndexingSettings::default(),
+        };
         let retry_params = RetryParams::for_test();
-        let mut source = IngestSource::try_new(runtime_args, retry_params)
+        let mut source = IngestSource::try_new(source_runtime, retry_params)
             .await
             .unwrap();
 
@@ -1794,5 +1857,77 @@ mod tests {
             ],
         );
         assert_eq!(local_shards_update, expected_local_shards_update);
+    }
+
+    // Motivated by #4888
+    #[tokio::test]
+    async fn test_assigned_deleted_shards() {
+        // It is possible for the control plan to assign a shard to an indexer and delete it right
+        // away. In that case, the ingester should just ignore the assigned shard, as
+        // opposed to fail as the metastore does not let it `acquire` the shard.
+        let pipeline_id = IndexingPipelineId {
+            node_id: NodeId::from("test-node"),
+            index_uid: IndexUid::for_test("test-index", 0),
+            source_id: "test-source".to_string(),
+            pipeline_uid: PipelineUid::default(),
+        };
+        let source_config = SourceConfig::for_test("test-source", SourceParams::Ingest);
+
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
+            .expect_acquire_shards()
+            .once()
+            .returning(|request: AcquireShardsRequest| {
+                assert_eq!(request.index_uid(), &("test-index", 0));
+                assert_eq!(request.source_id, "test-source");
+                assert_eq!(request.shard_ids, [ShardId::from(1)]);
+
+                let response = AcquireShardsResponse {
+                    acquired_shards: Vec::new(),
+                };
+                Ok(response)
+            });
+        let ingester_pool = IngesterPool::default();
+
+        let event_broker = EventBroker::default();
+        let source_runtime = SourceRuntime {
+            pipeline_id,
+            source_config,
+            metastore: MetastoreServiceClient::from_mock(mock_metastore),
+            ingester_pool,
+            queues_dir_path: PathBuf::from("./queues"),
+            storage_resolver: StorageResolver::for_test(),
+            event_broker: event_broker.clone(),
+            indexing_setting: IndexingSettings::default(),
+        };
+        let retry_params = RetryParams::for_test();
+        let mut source = IngestSource::try_new(source_runtime, retry_params)
+            .await
+            .unwrap();
+
+        let universe = Universe::with_accelerated_time();
+        let (source_mailbox, _source_inbox) = universe.create_test_mailbox::<SourceActor>();
+        let (doc_processor_mailbox, _doc_processor_inbox) =
+            universe.create_test_mailbox::<DocProcessor>();
+        let (observable_state_tx, _observable_state_rx) = watch::channel(serde_json::Value::Null);
+        let ctx: SourceContext =
+            ActorContext::for_test(&universe, source_mailbox, observable_state_tx);
+
+        let shard_ids: BTreeSet<ShardId> = BTreeSet::from_iter([ShardId::from(1)]);
+
+        let truncation_happened = Arc::new(AtomicBool::new(false));
+        let truncation_happened_clone = truncation_happened.clone();
+
+        let _subscription_guard = event_broker.subscribe(move |_: LocalShardPositionsUpdate| {
+            truncation_happened_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        source
+            .assign_shards(shard_ids, &doc_processor_mailbox, &ctx)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!truncation_happened.load(std::sync::atomic::Ordering::Relaxed));
     }
 }

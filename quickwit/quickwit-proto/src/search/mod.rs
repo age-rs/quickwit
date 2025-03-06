@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -25,6 +20,9 @@ use prost::Message;
 pub use sort_by_value::SortValue;
 
 include!("../codegen/quickwit/quickwit.search.rs");
+
+pub const SEARCH_FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!("../codegen/quickwit/search_descriptor.bin");
 
 impl SearchRequest {
     pub fn time_range(&self) -> impl std::ops::RangeBounds<i64> {
@@ -133,25 +131,13 @@ impl Eq for SortValue {}
 impl Copy for SortValue {}
 
 impl Ord for SortValue {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         // We make sure to end up with a total order.
         match (*self, *other) {
             // Same types.
             (SortValue::U64(left), SortValue::U64(right)) => left.cmp(&right),
             (SortValue::I64(left), SortValue::I64(right)) => left.cmp(&right),
-            (SortValue::F64(left), SortValue::F64(right)) => {
-                if left.is_nan() {
-                    if right.is_nan() {
-                        Ordering::Equal
-                    } else {
-                        Ordering::Less
-                    }
-                } else if right.is_nan() {
-                    Ordering::Greater
-                } else {
-                    left.partial_cmp(&right).unwrap_or(Ordering::Less)
-                }
-            }
             (SortValue::Boolean(left), SortValue::Boolean(right)) => left.cmp(&right),
             // We half the logic by making sure we keep
             // the "stronger" type on the left.
@@ -161,13 +147,9 @@ impl Ord for SortValue {
                 }
                 (left as i64).cmp(&right)
             }
-            (SortValue::F64(left), _) if left.is_nan() => Ordering::Less,
-            (SortValue::F64(left), SortValue::U64(right)) => {
-                left.partial_cmp(&(right as f64)).unwrap_or(Ordering::Less)
-            }
-            (SortValue::F64(left), SortValue::I64(right)) => {
-                left.partial_cmp(&(right as f64)).unwrap_or(Ordering::Less)
-            }
+            (SortValue::F64(left), SortValue::F64(right)) => left.total_cmp(&right),
+            (SortValue::F64(left), SortValue::U64(right)) => left.total_cmp(&(right as f64)),
+            (SortValue::F64(left), SortValue::I64(right)) => left.total_cmp(&(right as f64)),
             (SortValue::Boolean(left), right) => SortValue::U64(left as u64).cmp(&right),
             (left, right) => right.cmp(&left).reverse(),
         }
@@ -183,21 +165,18 @@ impl PartialOrd for SortValue {
 impl std::hash::Hash for SortValue {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let this = self.normalize();
+        std::mem::discriminant(&this).hash(state);
         match this {
             SortValue::U64(number) => {
-                0u8.hash(state);
                 number.hash(state);
             }
             SortValue::I64(number) => {
-                1u8.hash(state);
                 number.hash(state);
             }
             SortValue::F64(number) => {
-                2u8.hash(state);
                 number.to_bits().hash(state);
             }
             SortValue::Boolean(b) => {
-                3u8.hash(state);
                 b.hash(state);
             }
         }
@@ -207,7 +186,7 @@ impl std::hash::Hash for SortValue {
 impl SortValue {
     /// Where multiple variant could represent the same logical value, convert to a canonical form.
     ///
-    /// For number, we prefer to represent them, in order, as i64, then as u64 and finaly as f64.
+    /// For number, we prefer to represent them, in order, as i64, then as u64 and finally as f64.
     pub fn normalize(&self) -> Self {
         match self {
             SortValue::I64(_) => *self,

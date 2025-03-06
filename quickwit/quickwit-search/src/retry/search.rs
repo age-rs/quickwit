@@ -1,21 +1,18 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashSet;
 
 use quickwit_proto::search::{LeafSearchRequest, LeafSearchResponse};
 
@@ -39,14 +36,24 @@ impl RetryPolicy<LeafSearchRequest, LeafSearchResponse, SearchError> for LeafSea
                 if response.failed_splits.is_empty() {
                     return None;
                 }
-                request.split_offsets.retain(|split_metadata| {
-                    response
-                        .failed_splits
-                        .iter()
-                        .any(|failed_split| failed_split.split_id == split_metadata.split_id)
-                });
+                let failed_splits_hash_set: HashSet<&str> = response
+                    .failed_splits
+                    .iter()
+                    .map(|failed_split| failed_split.split_id.as_str())
+                    .collect();
+                for request in request.leaf_requests.iter_mut() {
+                    // Keep only failed splits
+                    request.split_offsets.retain(|split_metadata| {
+                        failed_splits_hash_set.contains(split_metadata.split_id.as_str())
+                    });
+                }
+                // Remove requests with empty split_offsets
+                request
+                    .leaf_requests
+                    .retain(|request| !request.split_offsets.is_empty());
                 Some(request)
             }
+            Err(SearchError::Timeout(_)) => None, // Don't retry on timeout
             Err(_) => Some(request),
         }
     }
@@ -55,8 +62,8 @@ impl RetryPolicy<LeafSearchRequest, LeafSearchResponse, SearchError> for LeafSea
 #[cfg(test)]
 mod tests {
     use quickwit_proto::search::{
-        LeafSearchRequest, LeafSearchResponse, SearchRequest, SplitIdAndFooterOffsets,
-        SplitSearchError,
+        LeafRequestRef, LeafSearchRequest, LeafSearchResponse, SearchRequest,
+        SplitIdAndFooterOffsets, SplitSearchError,
     };
     use quickwit_query::query_ast::qast_json_helper;
 
@@ -65,31 +72,38 @@ mod tests {
     use crate::SearchError;
 
     fn mock_leaf_search_request() -> LeafSearchRequest {
+        let search_request = SearchRequest {
+            index_id_patterns: vec!["test-idx".to_string()],
+            query_ast: qast_json_helper("test", &["body"]),
+            max_hits: 10,
+            ..Default::default()
+        };
         LeafSearchRequest {
-            search_request: Some(SearchRequest {
-                index_id_patterns: vec!["test-idx".to_string()],
-                query_ast: qast_json_helper("test", &["body"]),
-                max_hits: 10,
-                ..Default::default()
-            }),
-            doc_mapper: "doc_mapper".to_string(),
-            index_uri: "uri".to_string(),
-            split_offsets: vec![
-                SplitIdAndFooterOffsets {
-                    split_id: "split_1".to_string(),
-                    split_footer_end: 100,
-                    split_footer_start: 0,
-                    timestamp_start: None,
-                    timestamp_end: None,
-                },
-                SplitIdAndFooterOffsets {
-                    split_id: "split_2".to_string(),
-                    split_footer_end: 100,
-                    split_footer_start: 0,
-                    timestamp_start: None,
-                    timestamp_end: None,
-                },
-            ],
+            search_request: Some(search_request),
+            doc_mappers: vec!["doc_mapper".to_string()],
+            index_uris: vec!["uri".to_string()],
+            leaf_requests: vec![LeafRequestRef {
+                index_uri_ord: 0,
+                doc_mapper_ord: 0,
+                split_offsets: vec![
+                    SplitIdAndFooterOffsets {
+                        split_id: "split_1".to_string(),
+                        split_footer_start: 0,
+                        split_footer_end: 100,
+                        timestamp_start: None,
+                        timestamp_end: None,
+                        num_docs: 0,
+                    },
+                    SplitIdAndFooterOffsets {
+                        split_id: "split_2".to_string(),
+                        split_footer_start: 0,
+                        split_footer_end: 100,
+                        timestamp_start: None,
+                        timestamp_end: None,
+                        num_docs: 0,
+                    },
+                ],
+            }],
         }
     }
 
@@ -122,7 +136,9 @@ mod tests {
         let retry_policy = LeafSearchRetryPolicy {};
         let request = mock_leaf_search_request();
         let mut expected_retry_request = request.clone();
-        expected_retry_request.split_offsets.remove(0);
+        expected_retry_request.leaf_requests[0]
+            .split_offsets
+            .remove(0);
         let split_error = SplitSearchError {
             error: "error".to_string(),
             split_id: "split_2".to_string(),

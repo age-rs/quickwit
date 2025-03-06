@@ -1,26 +1,22 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use serde::Deserialize;
 
+use super::LeniencyBool;
 use crate::elastic_query_dsl::{
-    ConvertableToQueryAst, ElasticQueryDslInner, StringOrStructForSerialization,
+    ConvertibleToQueryAst, ElasticQueryDslInner, StringOrStructForSerialization,
 };
 use crate::query_ast::{FullTextParams, FullTextQuery, QueryAst};
 use crate::{BooleanOperand, MatchAllOrNone, OneFieldMap};
@@ -42,14 +38,11 @@ pub(crate) struct MatchQueryParams {
     pub(crate) operator: BooleanOperand,
     #[serde(default)]
     pub(crate) zero_terms_query: MatchAllOrNone,
-    // Regardless of this option Quickwit behaves in elasticsearch definition of
-    // lenient. We include this property here just to accept user queries containing
-    // this option.
-    #[serde(default, rename = "lenient")]
-    pub(crate) _lenient: bool,
+    #[serde(default)]
+    pub(crate) lenient: LeniencyBool,
 }
 
-impl ConvertableToQueryAst for MatchQuery {
+impl ConvertibleToQueryAst for MatchQuery {
     fn convert_to_query_ast(self) -> anyhow::Result<QueryAst> {
         let full_text_params = FullTextParams {
             tokenizer: None,
@@ -60,6 +53,7 @@ impl ConvertableToQueryAst for MatchQuery {
             field: self.field,
             text: self.params.query,
             params: full_text_params,
+            lenient: self.params.lenient,
         }))
     }
 }
@@ -88,7 +82,7 @@ impl From<String> for MatchQueryParams {
             query,
             zero_terms_query: Default::default(),
             operator: Default::default(),
-            _lenient: false,
+            lenient: false,
         }
     }
 }
@@ -137,7 +131,7 @@ mod tests {
                 query: "hello".to_string(),
                 operator: BooleanOperand::And,
                 zero_terms_query: crate::MatchAllOrNone::MatchAll,
-                _lenient: false,
+                lenient: false,
             },
         };
         let ast = match_query.convert_to_query_ast().unwrap();
@@ -145,6 +139,7 @@ mod tests {
             field,
             text,
             params,
+            lenient: _,
         }) = ast
         else {
             panic!()

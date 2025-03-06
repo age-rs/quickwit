@@ -1,26 +1,21 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![deny(clippy::disallowed_methods)]
 
 mod doc_batch;
-mod errors;
+pub mod error;
 mod ingest_api_service;
 #[path = "codegen/ingest_service.rs"]
 mod ingest_service;
@@ -37,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 pub use doc_batch::*;
-pub use errors::IngestServiceError;
+pub use error::IngestServiceError;
 pub use ingest_api_service::{GetMemoryCapacity, GetPartitionId, IngestApiService};
 pub use ingest_service::*;
 pub use ingest_v2::*;
@@ -115,16 +110,6 @@ pub async fn start_ingest_api_service(
     init_ingest_api(universe, &queues_dir_path, config).await
 }
 
-impl CommitType {
-    pub fn to_query_parameter(&self) -> Option<&'static [(&'static str, &'static str)]> {
-        match self {
-            CommitType::Auto => None,
-            CommitType::WaitFor => Some(&[("commit", "wait_for")]),
-            CommitType::Force => Some(&[("commit", "force")]),
-        }
-    }
-}
-
 #[macro_export]
 macro_rules! with_lock_metrics {
     ($future:expr, $($label:tt),*) => {
@@ -137,6 +122,13 @@ macro_rules! with_lock_metrics {
             let now = std::time::Instant::now();
             let guard = $future;
 
+            let elapsed = now.elapsed();
+            if elapsed > std::time::Duration::from_secs(1) {
+                quickwit_common::rate_limited_warn!(
+                    limit_per_min=6,
+                    "lock acquisition took {}ms", elapsed.as_millis()
+                );
+            }
             $crate::ingest_v2::metrics::INGEST_V2_METRICS
                 .wal_acquire_lock_requests_in_flight
                 .with_label_values([$($label),*])
@@ -144,7 +136,7 @@ macro_rules! with_lock_metrics {
             $crate::ingest_v2::metrics::INGEST_V2_METRICS
                 .wal_acquire_lock_request_duration_secs
                 .with_label_values([$($label),*])
-                .observe(now.elapsed().as_secs_f64());
+                .observe(elapsed.as_secs_f64());
 
             guard
         }
@@ -154,8 +146,8 @@ macro_rules! with_lock_metrics {
 #[cfg(test)]
 mod tests {
 
-    use bytesize::ByteSize;
     use quickwit_actors::AskError;
+    use quickwit_proto::ingest::RateLimitingCause;
 
     use super::*;
     use crate::{CreateQueueRequest, IngestRequest, SuggestTruncateRequest};
@@ -244,11 +236,13 @@ mod tests {
         let queues_dir_path = temp_dir.path().join("queues-0");
         get_ingest_api_service(&queues_dir_path).await.unwrap_err();
 
-        let ingest_api_config = IngestApiConfig {
-            max_queue_memory_usage: ByteSize(1200),
-            max_queue_disk_usage: ByteSize::mib(256),
-            ..Default::default()
-        };
+        let ingest_api_config = serde_json::from_str(
+            r#"{
+            "max_queue_memory_usage": "1200b",
+            "max_queue_disk_usage": "256mb"
+        }"#,
+        )
+        .unwrap();
         init_ingest_api(&universe, &queues_dir_path, &ingest_api_config)
             .await
             .unwrap();
@@ -286,7 +280,7 @@ mod tests {
                 .ask_for_res(ingest_request.clone())
                 .await
                 .unwrap_err(),
-            AskError::ErrorReply(IngestServiceError::RateLimited)
+            AskError::ErrorReply(IngestServiceError::RateLimited(RateLimitingCause::WalFull))
         ));
 
         // delete the first batch

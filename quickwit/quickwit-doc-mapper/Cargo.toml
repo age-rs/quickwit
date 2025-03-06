@@ -13,37 +13,35 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 base64 = { workspace = true }
-dyn-clone = { workspace = true }
 fnv = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
-mockall = { workspace = true, optional = true }
 nom = { workspace = true }
 once_cell = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_borrow = { workspace = true }
 siphasher = { workspace = true }
 tantivy = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-typetag = { workspace = true }
 utoipa = { workspace = true }
 
 quickwit-common = { workspace = true }
 quickwit-datetime = { workspace = true }
 quickwit-macros = { workspace = true }
+quickwit-proto = { workspace = true }
 quickwit-query = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
+binggan = { workspace = true }
 matches = { workspace = true }
-proptest = { workspace = true }
 serde_yaml = { workspace = true }
 time = { workspace = true }
 
-quickwit-proto = { workspace = true }
+quickwit-common = { workspace = true, features = ["testsuite"] }
 quickwit-query = { workspace = true, features = ["multilang"] }
 
 [features]

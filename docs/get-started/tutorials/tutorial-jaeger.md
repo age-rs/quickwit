@@ -16,7 +16,7 @@ version: "3"
 
 services:
   quickwit:
-    image: quickwit/quickwit:${QW_VERSION:-0.7.1}
+    image: quickwit/quickwit:${QW_VERSION:-0.8.1}
     volumes:
       - ./qwdata:/quickwit/qwdata
     ports:
@@ -27,11 +27,11 @@ services:
     command: ["run"]
 
   jaeger-query:
-    image: jaegertracing/jaeger-query:1.52
+    image: jaegertracing/jaeger-query:1.60
     ports:
       - 16686:16686
     environment:
-      - SPAN_STORAGE_TYPE=grpc-plugin
+      - SPAN_STORAGE_TYPE=grpc
       - GRPC_STORAGE_SERVER=quickwit:7281
       - GRPC_STORAGE_TLS=false
 ```
@@ -69,7 +69,7 @@ You can also use the Quickwit UI at [http://localhost:7280](http://localhost:728
 Here are a couple of query examples:
 - `service_name:quickwit AND events.event_attributes.level:INFO`
 - `span_duration_millis:>100`
-- `resource_attributes.service.version:v0.7.1`
+- `resource_attributes.service.version:v0.8.1`
 - `service_name:quickwit`
 
 That's it! You can level up with the following tutorials to discover all Quickwit features.

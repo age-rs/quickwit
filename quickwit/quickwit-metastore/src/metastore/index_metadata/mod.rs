@@ -1,37 +1,33 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 pub(crate) mod serialize;
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use quickwit_common::uri::Uri;
-use quickwit_config::{IndexConfig, SourceConfig, TestableForRegression};
+use quickwit_config::{
+    DocMapping, IndexConfig, IndexingSettings, RetentionPolicy, SearchSettings, SourceConfig,
+};
 use quickwit_proto::metastore::{EntityKind, MetastoreError, MetastoreResult};
-use quickwit_proto::types::{IndexUid, Position, SourceId};
+use quickwit_proto::types::{IndexUid, SourceId};
 use serde::{Deserialize, Serialize};
 use serialize::VersionedIndexMetadata;
 use time::OffsetDateTime;
-use ulid::Ulid;
 
-use crate::checkpoint::{IndexCheckpoint, PartitionId, SourceCheckpoint, SourceCheckpointDelta};
+use crate::checkpoint::IndexCheckpoint;
 
 /// An index metadata carries all meta data about an index.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -73,7 +69,7 @@ impl IndexMetadata {
     /// An incarnation id of `0` will be used to complete the index id into a index uuid.
     #[cfg(any(test, feature = "testsuite"))]
     pub fn for_test(index_id: &str, index_uri: &str) -> Self {
-        let index_uid = IndexUid::from_parts(index_id, 0);
+        let index_uid = IndexUid::for_test(index_id, 0);
         let mut index_metadata = IndexMetadata::new(IndexConfig::for_test(index_id, index_uri));
         index_metadata.index_uid = index_uid;
         index_metadata
@@ -99,6 +95,46 @@ impl IndexMetadata {
         &self.index_config().index_uri
     }
 
+    /// Replaces or removes the current retention policy, returning whether a mutation occurred.
+    pub fn set_retention_policy(&mut self, retention_policy_opt: Option<RetentionPolicy>) -> bool {
+        if self.index_config.retention_policy_opt != retention_policy_opt {
+            self.index_config.retention_policy_opt = retention_policy_opt;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Replaces the current search settings, returning whether a mutation occurred.
+    pub fn set_search_settings(&mut self, search_settings: SearchSettings) -> bool {
+        if self.index_config.search_settings != search_settings {
+            self.index_config.search_settings = search_settings;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Replaces the current indexing settings, returning whether a mutation occurred.
+    pub fn set_indexing_settings(&mut self, indexing_settings: IndexingSettings) -> bool {
+        if self.index_config.indexing_settings != indexing_settings {
+            self.index_config.indexing_settings = indexing_settings;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Replaces the current doc mapping, returning whether a mutation occurred.
+    pub fn set_doc_mapping(&mut self, doc_mapping: DocMapping) -> bool {
+        if self.index_config.doc_mapping != doc_mapping {
+            self.index_config.doc_mapping = doc_mapping;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Adds a source to the index. Returns an error if the source already exists.
     pub fn add_source(&mut self, source_config: SourceConfig) -> MetastoreResult<()> {
         match self.sources.entry(source_config.source_id.clone()) {
@@ -114,6 +150,24 @@ impl IndexMetadata {
         }
     }
 
+    /// Adds a source to the index. Returns whether a mutation occurred and an
+    /// error if the source doesn't exist.
+    pub fn update_source(&mut self, source_config: SourceConfig) -> MetastoreResult<bool> {
+        match self.sources.entry(source_config.source_id.clone()) {
+            Entry::Occupied(mut entry) => {
+                if entry.get() == &source_config {
+                    return Ok(false);
+                }
+                entry.insert(source_config);
+                Ok(true)
+            }
+            Entry::Vacant(_) => Err(MetastoreError::NotFound(EntityKind::Source {
+                index_id: self.index_id().to_string(),
+                source_id: source_config.source_id,
+            })),
+        }
+    }
+
     pub(crate) fn toggle_source(&mut self, source_id: &str, enable: bool) -> MetastoreResult<bool> {
         let Some(source_config) = self.sources.get_mut(source_id) else {
             return Err(MetastoreError::NotFound(EntityKind::Source {
@@ -126,8 +180,8 @@ impl IndexMetadata {
         Ok(mutation_occurred)
     }
 
-    /// Deletes a source from the index. Returns whether the index was modified (true).
-    pub(crate) fn delete_source(&mut self, source_id: &str) -> MetastoreResult<bool> {
+    /// Deletes a source from the index.
+    pub(crate) fn delete_source(&mut self, source_id: &str) -> MetastoreResult<()> {
         self.sources.remove(source_id).ok_or_else(|| {
             MetastoreError::NotFound(EntityKind::Source {
                 index_id: self.index_id().to_string(),
@@ -135,12 +189,21 @@ impl IndexMetadata {
             })
         })?;
         self.checkpoint.remove_source(source_id);
-        Ok(true)
+        Ok(())
     }
 }
 
-impl TestableForRegression for IndexMetadata {
+#[cfg(any(test, feature = "testsuite"))]
+impl quickwit_config::TestableForRegression for IndexMetadata {
     fn sample_for_regression() -> IndexMetadata {
+        use std::collections::BTreeMap;
+
+        use quickwit_proto::types::Position;
+
+        use crate::checkpoint::{PartitionId, SourceCheckpoint, SourceCheckpointDelta};
+
+        let index_config = IndexConfig::sample_for_regression();
+
         let mut source_checkpoint = SourceCheckpoint::default();
         let delta = SourceCheckpointDelta::from_partition_delta(
             PartitionId::from(0i64),
@@ -149,12 +212,13 @@ impl TestableForRegression for IndexMetadata {
         )
         .unwrap();
         source_checkpoint.try_apply_delta(delta).unwrap();
-        let mut per_source_checkpoint: BTreeMap<String, SourceCheckpoint> = BTreeMap::default();
-        per_source_checkpoint.insert("kafka-source".to_string(), source_checkpoint);
+
+        let per_source_checkpoint: BTreeMap<String, SourceCheckpoint> =
+            BTreeMap::from_iter([("kafka-source".to_string(), source_checkpoint)]);
         let checkpoint = IndexCheckpoint::from(per_source_checkpoint);
-        let index_config = IndexConfig::sample_for_regression();
+
         let mut index_metadata = IndexMetadata {
-            index_uid: IndexUid::from_parts(&index_config.index_id, Ulid::nil()),
+            index_uid: IndexUid::for_test(&index_config.index_id, 1),
             index_config,
             checkpoint,
             create_timestamp: 1789,

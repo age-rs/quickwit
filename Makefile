@@ -27,13 +27,22 @@ docker-compose-up:
 	COMPOSE_PROFILES=$(DOCKER_SERVICES) docker compose -f docker-compose.yml up -d --remove-orphans --wait
 
 docker-compose-down:
-	docker compose -f docker-compose.yml down --remove-orphans
+	docker compose -p quickwit down --remove-orphans
 
 docker-compose-logs:
-	docker compose logs -f -t
+	docker compose logs -f docker-compose.yml -t
 
 docker-compose-monitoring:
 	COMPOSE_PROFILES=monitoring docker compose -f docker-compose.yml up -d --remove-orphans
+
+docker-rm-postgres-volume:
+	docker volume rm quickwit_postgres_data
+
+docker-rm-volumes:
+	docker volume rm quickwit_azurite_data quickwit_fake_gcs_server_data quickwit_grafana_conf quickwit_grafana_data quickwit_localstack_data quickwit_postgres_data
+
+doc:
+	@$(MAKE) -C $(QUICKWIT_SRC) doc
 
 fmt:
 	@$(MAKE) -C $(QUICKWIT_SRC) fmt
@@ -52,6 +61,10 @@ test-all: docker-compose-up
 
 test-failpoints:
 	@$(MAKE) -C $(QUICKWIT_SRC) test-failpoints
+
+test-lambda: DOCKER_SERVICES=localstack
+test-lambda: docker-compose-up
+	@$(MAKE) -C $(QUICKWIT_SRC) test-lambda
 
 # This will build and push all custom cross images for cross-compilation.
 # You will need to login into Docker Hub with the `quickwit` account.
@@ -95,9 +108,3 @@ build-rustdoc:
 .PHONY: build-ui
 build-ui:
 	$(MAKE) -C $(QUICKWIT_SRC) build-ui
-
-rm-postgres:
-	docker volume rm quickwit_postgres_data
-
-rm-data:
-	docker volume rm quickwit_postgres_data quickwit_localstack_data quickwit_azurite_data

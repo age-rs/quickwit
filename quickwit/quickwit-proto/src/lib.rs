@@ -1,28 +1,22 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![allow(clippy::derive_partial_eq_without_eq)]
 #![deny(clippy::disallowed_methods)]
 #![allow(rustdoc::invalid_html_tags)]
 
 use std::cmp::Ordering;
-use std::fmt;
 
 use ::opentelemetry::global;
 use ::opentelemetry::propagation::{Extractor, Injector};
@@ -34,6 +28,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 pub mod cluster;
 pub mod control_plane;
 pub use {bytes, tonic};
+pub mod developer;
 pub mod error;
 mod getters;
 pub mod indexing;
@@ -42,9 +37,8 @@ pub mod metastore;
 pub mod search;
 pub mod types;
 
-pub use error::{ServiceError, ServiceErrorCode};
-
-use crate::search::ReportSplitsRequest;
+pub use error::{GrpcServiceError, ServiceError, ServiceErrorCode};
+use search::ReportSplitsRequest;
 
 pub mod jaeger {
     pub mod api_v2 {
@@ -67,6 +61,7 @@ pub mod opentelemetry {
                     include!("codegen/opentelemetry/opentelemetry.proto.collector.logs.v1.rs");
                 }
             }
+            // One can dream.
             // pub mod metrics {
             //     pub mod v1 {
             //         include!("codegen/opentelemetry/opentelemetry.proto.collector.metrics.v1.rs"
@@ -109,9 +104,6 @@ pub mod opentelemetry {
     }
 }
 
-#[macro_use]
-extern crate serde;
-
 impl TryFrom<search::SearchStreamRequest> for search::SearchRequest {
     type Error = anyhow::Error;
 
@@ -144,7 +136,7 @@ impl TryFrom<metastore::DeleteQuery> for search::SearchRequest {
 /// `MutMetadataMap` used to extract [`tonic::metadata::MetadataMap`] from a request.
 pub struct MutMetadataMap<'a>(&'a mut tonic::metadata::MetadataMap);
 
-impl<'a> Injector for MutMetadataMap<'a> {
+impl Injector for MutMetadataMap<'_> {
     /// Sets a key-value pair in the [`MetadataMap`]. No-op if the key or value is invalid.
     fn set(&mut self, key: &str, value: String) {
         if let Ok(metadata_key) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()) {
@@ -155,7 +147,7 @@ impl<'a> Injector for MutMetadataMap<'a> {
     }
 }
 
-impl<'a> Extractor for MutMetadataMap<'a> {
+impl Extractor for MutMetadataMap<'_> {
     /// Gets a value for a key from the MetadataMap.  If the value can't be converted to &str,
     /// returns None.
     fn get(&self, key: &str) -> Option<&str> {
@@ -195,7 +187,7 @@ impl Interceptor for SpanContextInterceptor {
 /// tracing keys from request's headers.
 struct MetadataMap<'a>(&'a tonic::metadata::MetadataMap);
 
-impl<'a> Extractor for MetadataMap<'a> {
+impl Extractor for MetadataMap<'_> {
     /// Gets a value for a key from the MetadataMap.  If the value can't be converted to &str,
     /// returns None.
     fn get(&self, key: &str) -> Option<&str> {
@@ -221,16 +213,6 @@ pub fn set_parent_span_from_request_metadata(request_metadata: &tonic::metadata:
     Span::current().set_parent(parent_cx);
 }
 
-impl<E: fmt::Debug + ServiceError> ServiceError for quickwit_actors::AskError<E> {
-    fn error_code(&self) -> ServiceErrorCode {
-        match self {
-            quickwit_actors::AskError::MessageNotDelivered => ServiceErrorCode::Internal,
-            quickwit_actors::AskError::ProcessMessageError => ServiceErrorCode::Internal,
-            quickwit_actors::AskError::ErrorReply(err) => err.error_code(),
-        }
-    }
-}
-
 impl search::SortOrder {
     #[inline(always)]
     pub fn compare_opt<T: Ord>(&self, this: &Option<T>, other: &Option<T>) -> Ordering {
@@ -252,3 +234,10 @@ impl search::SortOrder {
 }
 
 impl quickwit_common::pubsub::Event for ReportSplitsRequest {}
+
+/// Shard update_timestamp to use when reading file metastores <v0.9
+pub fn compatibility_shard_update_timestamp() -> i64 {
+    // We prefer a fix value here because it makes backward compatibility tests
+    // simpler. Very few users use the shard API in versions <0.9 anyway.
+    1704067200 // 2024-00-00T00:00:00Z
+}

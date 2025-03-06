@@ -63,36 +63,28 @@ impl RpcName for PingRequest {
 pub type HelloStream<T> = quickwit_common::ServiceStream<crate::HelloResult<T>>;
 #[cfg_attr(any(test, feature = "testsuite"), mockall::automock)]
 #[async_trait::async_trait]
-pub trait Hello: std::fmt::Debug + dyn_clone::DynClone + Send + Sync + 'static {
+pub trait Hello: std::fmt::Debug + Send + Sync + 'static {
     /// Says hello.
-    async fn hello(
-        &mut self,
-        request: HelloRequest,
-    ) -> crate::HelloResult<HelloResponse>;
+    async fn hello(&self, request: HelloRequest) -> crate::HelloResult<HelloResponse>;
     /// Says goodbye.
     async fn goodbye(
-        &mut self,
+        &self,
         request: GoodbyeRequest,
     ) -> crate::HelloResult<GoodbyeResponse>;
     /// Ping pong.
     async fn ping(
-        &mut self,
+        &self,
         request: quickwit_common::ServiceStream<PingRequest>,
     ) -> crate::HelloResult<HelloStream<PingResponse>>;
-    async fn check_connectivity(&mut self) -> anyhow::Result<()>;
+    async fn check_connectivity(&self) -> anyhow::Result<()>;
     fn endpoints(&self) -> Vec<quickwit_common::uri::Uri>;
-}
-dyn_clone::clone_trait_object!(Hello);
-#[cfg(any(test, feature = "testsuite"))]
-impl Clone for MockHello {
-    fn clone(&self) -> Self {
-        MockHello::new()
-    }
 }
 #[derive(Debug, Clone)]
 pub struct HelloClient {
-    inner: Box<dyn Hello>,
+    inner: InnerHelloClient,
 }
+#[derive(Debug, Clone)]
+struct InnerHelloClient(std::sync::Arc<dyn Hello>);
 impl HelloClient {
     pub fn new<T>(instance: T) -> Self
     where
@@ -101,9 +93,11 @@ impl HelloClient {
         #[cfg(any(test, feature = "testsuite"))]
         assert!(
             std::any::TypeId::of:: < T > () != std::any::TypeId::of:: < MockHello > (),
-            "`MockHello` must be wrapped in a `MockHelloWrapper`. Use `MockHello::from(mock)` to instantiate the client."
+            "`MockHello` must be wrapped in a `MockHelloWrapper`: use `HelloClient::from_mock(mock)` to instantiate the client"
         );
-        Self { inner: Box::new(instance) }
+        Self {
+            inner: InnerHelloClient(std::sync::Arc::new(instance)),
+        }
     }
     pub fn as_grpc_service(
         &self,
@@ -150,84 +144,80 @@ impl HelloClient {
         HelloTowerLayerStack::default()
     }
     #[cfg(any(test, feature = "testsuite"))]
-    pub fn mock() -> MockHello {
-        MockHello::new()
+    pub fn from_mock(mock: MockHello) -> Self {
+        let mock_wrapper = mock_hello::MockHelloWrapper {
+            inner: tokio::sync::Mutex::new(mock),
+        };
+        Self::new(mock_wrapper)
+    }
+    #[cfg(any(test, feature = "testsuite"))]
+    pub fn mocked() -> Self {
+        Self::from_mock(MockHello::new())
     }
 }
 #[async_trait::async_trait]
 impl Hello for HelloClient {
-    async fn hello(
-        &mut self,
-        request: HelloRequest,
-    ) -> crate::HelloResult<HelloResponse> {
-        self.inner.hello(request).await
+    async fn hello(&self, request: HelloRequest) -> crate::HelloResult<HelloResponse> {
+        self.inner.0.hello(request).await
     }
     async fn goodbye(
-        &mut self,
+        &self,
         request: GoodbyeRequest,
     ) -> crate::HelloResult<GoodbyeResponse> {
-        self.inner.goodbye(request).await
+        self.inner.0.goodbye(request).await
     }
     async fn ping(
-        &mut self,
+        &self,
         request: quickwit_common::ServiceStream<PingRequest>,
     ) -> crate::HelloResult<HelloStream<PingResponse>> {
-        self.inner.ping(request).await
+        self.inner.0.ping(request).await
     }
-    async fn check_connectivity(&mut self) -> anyhow::Result<()> {
-        self.inner.check_connectivity().await
+    async fn check_connectivity(&self) -> anyhow::Result<()> {
+        self.inner.0.check_connectivity().await
     }
     fn endpoints(&self) -> Vec<quickwit_common::uri::Uri> {
-        self.inner.endpoints()
+        self.inner.0.endpoints()
     }
 }
 #[cfg(any(test, feature = "testsuite"))]
-pub mod hello_mock {
+pub mod mock_hello {
     use super::*;
-    #[derive(Debug, Clone)]
-    struct MockHelloWrapper {
-        inner: std::sync::Arc<tokio::sync::Mutex<MockHello>>,
+    #[derive(Debug)]
+    pub struct MockHelloWrapper {
+        pub(super) inner: tokio::sync::Mutex<MockHello>,
     }
     #[async_trait::async_trait]
     impl Hello for MockHelloWrapper {
         async fn hello(
-            &mut self,
+            &self,
             request: super::HelloRequest,
         ) -> crate::HelloResult<super::HelloResponse> {
             self.inner.lock().await.hello(request).await
         }
         async fn goodbye(
-            &mut self,
+            &self,
             request: super::GoodbyeRequest,
         ) -> crate::HelloResult<super::GoodbyeResponse> {
             self.inner.lock().await.goodbye(request).await
         }
         async fn ping(
-            &mut self,
+            &self,
             request: quickwit_common::ServiceStream<super::PingRequest>,
         ) -> crate::HelloResult<HelloStream<super::PingResponse>> {
             self.inner.lock().await.ping(request).await
         }
-        async fn check_connectivity(&mut self) -> anyhow::Result<()> {
+        async fn check_connectivity(&self) -> anyhow::Result<()> {
             self.inner.lock().await.check_connectivity().await
         }
         fn endpoints(&self) -> Vec<quickwit_common::uri::Uri> {
             futures::executor::block_on(self.inner.lock()).endpoints()
         }
     }
-    impl From<MockHello> for HelloClient {
-        fn from(mock: MockHello) -> Self {
-            let mock_wrapper = MockHelloWrapper {
-                inner: std::sync::Arc::new(tokio::sync::Mutex::new(mock)),
-            };
-            HelloClient::new(mock_wrapper)
-        }
-    }
 }
 pub type BoxFuture<T, E> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'static>,
 >;
-impl tower::Service<HelloRequest> for Box<dyn Hello> {
+impl tower::Service<HelloRequest> for InnerHelloClient {
     type Response = HelloResponse;
     type Error = crate::HelloError;
     type Future = BoxFuture<Self::Response, Self::Error>;
@@ -238,12 +228,12 @@ impl tower::Service<HelloRequest> for Box<dyn Hello> {
         std::task::Poll::Ready(Ok(()))
     }
     fn call(&mut self, request: HelloRequest) -> Self::Future {
-        let mut svc = self.clone();
-        let fut = async move { svc.hello(request).await };
+        let svc = self.clone();
+        let fut = async move { svc.0.hello(request).await };
         Box::pin(fut)
     }
 }
-impl tower::Service<GoodbyeRequest> for Box<dyn Hello> {
+impl tower::Service<GoodbyeRequest> for InnerHelloClient {
     type Response = GoodbyeResponse;
     type Error = crate::HelloError;
     type Future = BoxFuture<Self::Response, Self::Error>;
@@ -254,12 +244,12 @@ impl tower::Service<GoodbyeRequest> for Box<dyn Hello> {
         std::task::Poll::Ready(Ok(()))
     }
     fn call(&mut self, request: GoodbyeRequest) -> Self::Future {
-        let mut svc = self.clone();
-        let fut = async move { svc.goodbye(request).await };
+        let svc = self.clone();
+        let fut = async move { svc.0.goodbye(request).await };
         Box::pin(fut)
     }
 }
-impl tower::Service<quickwit_common::ServiceStream<PingRequest>> for Box<dyn Hello> {
+impl tower::Service<quickwit_common::ServiceStream<PingRequest>> for InnerHelloClient {
     type Response = HelloStream<PingResponse>;
     type Error = crate::HelloError;
     type Future = BoxFuture<Self::Response, Self::Error>;
@@ -273,15 +263,16 @@ impl tower::Service<quickwit_common::ServiceStream<PingRequest>> for Box<dyn Hel
         &mut self,
         request: quickwit_common::ServiceStream<PingRequest>,
     ) -> Self::Future {
-        let mut svc = self.clone();
-        let fut = async move { svc.ping(request).await };
+        let svc = self.clone();
+        let fut = async move { svc.0.ping(request).await };
         Box::pin(fut)
     }
 }
 /// A tower service stack is a set of tower services.
 #[derive(Debug)]
 struct HelloTowerServiceStack {
-    inner: Box<dyn Hello>,
+    #[allow(dead_code)]
+    inner: InnerHelloClient,
     hello_svc: quickwit_common::tower::BoxService<
         HelloRequest,
         HelloResponse,
@@ -298,41 +289,28 @@ struct HelloTowerServiceStack {
         crate::HelloError,
     >,
 }
-impl Clone for HelloTowerServiceStack {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            hello_svc: self.hello_svc.clone(),
-            goodbye_svc: self.goodbye_svc.clone(),
-            ping_svc: self.ping_svc.clone(),
-        }
-    }
-}
 #[async_trait::async_trait]
 impl Hello for HelloTowerServiceStack {
-    async fn hello(
-        &mut self,
-        request: HelloRequest,
-    ) -> crate::HelloResult<HelloResponse> {
-        self.hello_svc.ready().await?.call(request).await
+    async fn hello(&self, request: HelloRequest) -> crate::HelloResult<HelloResponse> {
+        self.hello_svc.clone().ready().await?.call(request).await
     }
     async fn goodbye(
-        &mut self,
+        &self,
         request: GoodbyeRequest,
     ) -> crate::HelloResult<GoodbyeResponse> {
-        self.goodbye_svc.ready().await?.call(request).await
+        self.goodbye_svc.clone().ready().await?.call(request).await
     }
     async fn ping(
-        &mut self,
+        &self,
         request: quickwit_common::ServiceStream<PingRequest>,
     ) -> crate::HelloResult<HelloStream<PingResponse>> {
-        self.ping_svc.ready().await?.call(request).await
+        self.ping_svc.clone().ready().await?.call(request).await
     }
-    async fn check_connectivity(&mut self) -> anyhow::Result<()> {
-        self.inner.check_connectivity().await
+    async fn check_connectivity(&self) -> anyhow::Result<()> {
+        self.inner.0.check_connectivity().await
     }
     fn endpoints(&self) -> Vec<quickwit_common::uri::Uri> {
-        self.inner.endpoints()
+        self.inner.0.endpoints()
     }
 }
 type HelloLayer = quickwit_common::tower::BoxLayer<
@@ -516,7 +494,8 @@ impl HelloTowerLayerStack {
     where
         T: Hello,
     {
-        self.build_from_boxed(Box::new(instance))
+        let inner_client = InnerHelloClient(std::sync::Arc::new(instance));
+        self.build_from_inner_client(inner_client)
     }
     pub fn build_from_channel(
         self,
@@ -524,20 +503,21 @@ impl HelloTowerLayerStack {
         channel: tonic::transport::Channel,
         max_message_size: bytesize::ByteSize,
     ) -> HelloClient {
-        self.build_from_boxed(
-            Box::new(HelloClient::from_channel(addr, channel, max_message_size)),
-        )
+        let client = HelloClient::from_channel(addr, channel, max_message_size);
+        let inner_client = client.inner;
+        self.build_from_inner_client(inner_client)
     }
     pub fn build_from_balance_channel(
         self,
         balance_channel: quickwit_common::tower::BalanceChannel<std::net::SocketAddr>,
         max_message_size: bytesize::ByteSize,
     ) -> HelloClient {
-        self.build_from_boxed(
-            Box::new(
-                HelloClient::from_balance_channel(balance_channel, max_message_size),
-            ),
-        )
+        let client = HelloClient::from_balance_channel(
+            balance_channel,
+            max_message_size,
+        );
+        let inner_client = client.inner;
+        self.build_from_inner_client(inner_client)
     }
     pub fn build_from_mailbox<A>(
         self,
@@ -547,15 +527,24 @@ impl HelloTowerLayerStack {
         A: quickwit_actors::Actor + std::fmt::Debug + Send + 'static,
         HelloMailbox<A>: Hello,
     {
-        self.build_from_boxed(Box::new(HelloMailbox::new(mailbox)))
+        let inner_client = InnerHelloClient(
+            std::sync::Arc::new(HelloMailbox::new(mailbox)),
+        );
+        self.build_from_inner_client(inner_client)
     }
-    fn build_from_boxed(self, boxed_instance: Box<dyn Hello>) -> HelloClient {
+    #[cfg(any(test, feature = "testsuite"))]
+    pub fn build_from_mock(self, mock: MockHello) -> HelloClient {
+        let client = HelloClient::from_mock(mock);
+        let inner_client = client.inner;
+        self.build_from_inner_client(inner_client)
+    }
+    fn build_from_inner_client(self, inner_client: InnerHelloClient) -> HelloClient {
         let hello_svc = self
             .hello_layers
             .into_iter()
             .rev()
             .fold(
-                quickwit_common::tower::BoxService::new(boxed_instance.clone()),
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
                 |svc, layer| layer.layer(svc),
             );
         let goodbye_svc = self
@@ -563,7 +552,7 @@ impl HelloTowerLayerStack {
             .into_iter()
             .rev()
             .fold(
-                quickwit_common::tower::BoxService::new(boxed_instance.clone()),
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
                 |svc, layer| layer.layer(svc),
             );
         let ping_svc = self
@@ -571,11 +560,11 @@ impl HelloTowerLayerStack {
             .into_iter()
             .rev()
             .fold(
-                quickwit_common::tower::BoxService::new(boxed_instance.clone()),
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
                 |svc, layer| layer.layer(svc),
             );
         let tower_svc_stack = HelloTowerServiceStack {
-            inner: boxed_instance.clone(),
+            inner: inner_client,
             hello_svc,
             goodbye_svc,
             ping_svc,
@@ -674,25 +663,22 @@ where
             Future = BoxFuture<HelloStream<PingResponse>, crate::HelloError>,
         >,
 {
-    async fn hello(
-        &mut self,
-        request: HelloRequest,
-    ) -> crate::HelloResult<HelloResponse> {
-        self.call(request).await
+    async fn hello(&self, request: HelloRequest) -> crate::HelloResult<HelloResponse> {
+        self.clone().call(request).await
     }
     async fn goodbye(
-        &mut self,
+        &self,
         request: GoodbyeRequest,
     ) -> crate::HelloResult<GoodbyeResponse> {
-        self.call(request).await
+        self.clone().call(request).await
     }
     async fn ping(
-        &mut self,
+        &self,
         request: quickwit_common::ServiceStream<PingRequest>,
     ) -> crate::HelloResult<HelloStream<PingResponse>> {
-        self.call(request).await
+        self.clone().call(request).await
     }
-    async fn check_connectivity(&mut self) -> anyhow::Result<()> {
+    async fn check_connectivity(&self) -> anyhow::Result<()> {
         if self.inner.is_disconnected() {
             anyhow::bail!("actor `{}` is disconnected", self.inner.actor_instance_id())
         }
@@ -736,41 +722,54 @@ where
         + Send,
     T::Future: Send,
 {
-    async fn hello(
-        &mut self,
-        request: HelloRequest,
-    ) -> crate::HelloResult<HelloResponse> {
+    async fn hello(&self, request: HelloRequest) -> crate::HelloResult<HelloResponse> {
         self.inner
+            .clone()
             .hello(request)
             .await
             .map(|response| response.into_inner())
-            .map_err(|error| error.into())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                HelloRequest::rpc_name(),
+            ))
     }
     async fn goodbye(
-        &mut self,
+        &self,
         request: GoodbyeRequest,
     ) -> crate::HelloResult<GoodbyeResponse> {
         self.inner
+            .clone()
             .goodbye(request)
             .await
             .map(|response| response.into_inner())
-            .map_err(|error| error.into())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                GoodbyeRequest::rpc_name(),
+            ))
     }
     async fn ping(
-        &mut self,
+        &self,
         request: quickwit_common::ServiceStream<PingRequest>,
     ) -> crate::HelloResult<HelloStream<PingResponse>> {
         self.inner
+            .clone()
             .ping(request)
             .await
             .map(|response| {
                 let streaming: tonic::Streaming<_> = response.into_inner();
                 let stream = quickwit_common::ServiceStream::from(streaming);
-                stream.map_err(|error| error.into())
+                stream
+                    .map_err(|status| crate::error::grpc_status_to_service_error(
+                        status,
+                        PingRequest::rpc_name(),
+                    ))
             })
-            .map_err(|error| error.into())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                PingRequest::rpc_name(),
+            ))
     }
-    async fn check_connectivity(&mut self) -> anyhow::Result<()> {
+    async fn check_connectivity(&self) -> anyhow::Result<()> {
         if self.connection_addrs_rx.borrow().len() == 0 {
             anyhow::bail!("no server currently available")
         }
@@ -788,14 +787,16 @@ where
 }
 #[derive(Debug)]
 pub struct HelloGrpcServerAdapter {
-    inner: Box<dyn Hello>,
+    inner: InnerHelloClient,
 }
 impl HelloGrpcServerAdapter {
     pub fn new<T>(instance: T) -> Self
     where
         T: Hello,
     {
-        Self { inner: Box::new(instance) }
+        Self {
+            inner: InnerHelloClient(std::sync::Arc::new(instance)),
+        }
     }
 }
 #[async_trait::async_trait]
@@ -805,22 +806,22 @@ impl hello_grpc_server::HelloGrpc for HelloGrpcServerAdapter {
         request: tonic::Request<HelloRequest>,
     ) -> Result<tonic::Response<HelloResponse>, tonic::Status> {
         self.inner
-            .clone()
+            .0
             .hello(request.into_inner())
             .await
             .map(tonic::Response::new)
-            .map_err(|error| error.into())
+            .map_err(crate::error::grpc_error_to_grpc_status)
     }
     async fn goodbye(
         &self,
         request: tonic::Request<GoodbyeRequest>,
     ) -> Result<tonic::Response<GoodbyeResponse>, tonic::Status> {
         self.inner
-            .clone()
+            .0
             .goodbye(request.into_inner())
             .await
             .map(tonic::Response::new)
-            .map_err(|error| error.into())
+            .map_err(crate::error::grpc_error_to_grpc_status)
     }
     type PingStream = quickwit_common::ServiceStream<tonic::Result<PingResponse>>;
     async fn ping(
@@ -828,14 +829,16 @@ impl hello_grpc_server::HelloGrpc for HelloGrpcServerAdapter {
         request: tonic::Request<tonic::Streaming<PingRequest>>,
     ) -> Result<tonic::Response<Self::PingStream>, tonic::Status> {
         self.inner
-            .clone()
+            .0
             .ping({
                 let streaming: tonic::Streaming<_> = request.into_inner();
                 quickwit_common::ServiceStream::from(streaming)
             })
             .await
-            .map(|stream| tonic::Response::new(stream.map_err(|error| error.into())))
-            .map_err(|error| error.into())
+            .map(|stream| tonic::Response::new(
+                stream.map_err(crate::error::grpc_error_to_grpc_status),
+            ))
+            .map_err(crate::error::grpc_error_to_grpc_status)
     }
 }
 /// Generated client implementations.

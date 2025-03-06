@@ -1,5 +1,6 @@
 ---
-title: Google GKE
+title: Install Quickwit on Google GKE
+sidebar_label: Google GKE
 sidebar_position: 2
 ---
 
@@ -63,6 +64,10 @@ image:
     repository: quickwit/quickwit
     pullPolicy: Always
     tag: edge
+
+serviceAccount:
+  create: false
+  name: quickwit-sa
 
 config:
   default_index_root_uri: gs://{BUCKET}/qw-indexes

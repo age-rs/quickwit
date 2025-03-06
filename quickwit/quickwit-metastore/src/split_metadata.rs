@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -25,7 +20,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use bytesize::ByteSize;
-use quickwit_proto::types::IndexUid;
+use quickwit_proto::types::{DocMappingUid, IndexUid, SourceId, SplitId};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DurationMilliSeconds};
 use time::OffsetDateTime;
@@ -60,7 +55,7 @@ impl Split {
 /// Carries immutable split metadata.
 /// This struct can deserialize older format automatically
 /// but can only serialize to the last version.
-#[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(into = "VersionedSplitMetadata")]
 #[serde(try_from = "VersionedSplitMetadata")]
 pub struct SplitMetadata {
@@ -68,7 +63,8 @@ pub struct SplitMetadata {
     /// should be enough to uniquely identify a split.
     /// In reality, some information may be implicitly configured
     /// in the storage resolver: for instance, the Amazon S3 region.
-    pub split_id: String,
+    #[schema(value_type = String)]
+    pub split_id: SplitId,
 
     /// Id of the index this split belongs to.
     pub index_uid: IndexUid,
@@ -82,7 +78,7 @@ pub struct SplitMetadata {
     pub partition_id: u64,
 
     /// Source ID.
-    pub source_id: String,
+    pub source_id: SourceId,
 
     /// Node ID.
     pub node_id: String,
@@ -132,6 +128,10 @@ pub struct SplitMetadata {
     /// Number of merge operations that was involved to create
     /// this split.
     pub num_merge_ops: usize,
+
+    /// Doc mapping UID used when creating this split. This split may only be merged with other
+    /// splits using the same doc mapping UID.
+    pub doc_mapping_uid: DocMappingUid,
 }
 
 impl fmt::Debug for SplitMetadata {
@@ -183,10 +183,10 @@ impl fmt::Debug for SplitMetadata {
 impl SplitMetadata {
     /// Creates a new instance of split metadata.
     pub fn new(
-        split_id: String,
+        split_id: SplitId,
         index_uid: IndexUid,
         partition_id: u64,
-        source_id: String,
+        source_id: SourceId,
         node_id: String,
     ) -> Self {
         Self {
@@ -220,7 +220,7 @@ impl SplitMetadata {
 
     #[cfg(any(test, feature = "testsuite"))]
     /// Returns an instance of `SplitMetadata` for testing.
-    pub fn for_test(split_id: String) -> SplitMetadata {
+    pub fn for_test(split_id: SplitId) -> SplitMetadata {
         SplitMetadata {
             split_id,
             ..Default::default()
@@ -245,7 +245,8 @@ impl SplitMetadata {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SplitInfo {
     /// The split ID.
-    pub split_id: String,
+    #[schema(value_type = String)]
+    pub split_id: SplitId,
     /// The number of documents in the split.
     pub num_docs: usize,
     /// The sum of the sizes of the original JSON payloads in bytes.
@@ -262,11 +263,9 @@ pub struct SplitInfo {
 #[cfg(any(test, feature = "testsuite"))]
 impl quickwit_config::TestableForRegression for SplitMetadata {
     fn sample_for_regression() -> Self {
-        use ulid::Ulid;
-
         SplitMetadata {
             split_id: "split".to_string(),
-            index_uid: IndexUid::from_parts("my-index", Ulid::nil()),
+            index_uid: IndexUid::for_test("my-index", 1),
             source_id: "source".to_string(),
             node_id: "node".to_string(),
             delete_opstamp: 10,
@@ -281,6 +280,7 @@ impl quickwit_config::TestableForRegression for SplitMetadata {
             tags: ["234".to_string(), "aaa".to_string()].into_iter().collect(),
             footer_offsets: 1000..2000,
             num_merge_ops: 3,
+            doc_mapping_uid: DocMappingUid::default(),
         }
     }
 
@@ -339,7 +339,7 @@ impl FromStr for SplitState {
 /// or `Immature` with a given maturation period.
 /// The maturity is determined by the `MergePolicy`.
 #[serde_as]
-#[derive(Clone, Copy, Debug, Default, Eq, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Serialize, Deserialize, PartialEq, PartialOrd, Ord)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum SplitMaturity {
@@ -399,10 +399,7 @@ mod tests {
     fn test_split_metadata_debug() {
         let split_metadata = SplitMetadata {
             split_id: "split-1".to_string(),
-            index_uid: IndexUid::from_parts(
-                "00000000-0000-0000-0000-000000000000",
-                ulid::Ulid::nil(),
-            ),
+            index_uid: IndexUid::for_test("00000000-0000-0000-0000-000000000000", 0),
             partition_id: 0,
             source_id: "source-1".to_string(),
             node_id: "node-1".to_string(),
@@ -423,6 +420,7 @@ mod tests {
             footer_offsets: 0..1024,
             delete_opstamp: 0,
             num_merge_ops: 0,
+            doc_mapping_uid: DocMappingUid::default(),
         };
 
         let expected_output = "SplitMetadata { split_id: \"split-1\", index_uid: IndexUid { \
@@ -435,5 +433,22 @@ mod tests {
                                footer_offsets: 0..1024, delete_opstamp: 0, num_merge_ops: 0 }";
 
         assert_eq!(format!("{:?}", split_metadata), expected_output);
+    }
+
+    #[test]
+    fn test_spit_maturity_order() {
+        assert!(
+            SplitMaturity::Mature
+                < SplitMaturity::Immature {
+                    maturation_period: Duration::from_secs(0)
+                }
+        );
+        assert!(
+            SplitMaturity::Immature {
+                maturation_period: Duration::from_secs(0)
+            } < SplitMaturity::Immature {
+                maturation_period: Duration::from_secs(1)
+            }
+        );
     }
 }

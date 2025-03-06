@@ -101,11 +101,10 @@ This tutorial assumes that the Kafka cluster is available locally on the default
 #
 # Kafka source config file.
 #
-version: 0.7
+version: 0.8
 source_id: kafka-source
 source_type: kafka
-max_num_pipelines_per_indexer: 1
-desired_num_pipelines: 2
+num_pipelines: 2
 params:
   topic: gh-archive
   client_params:
@@ -176,6 +175,65 @@ curl -XPOST -H 'Content-Type: application/json' 'http://localhost:7280/api/v1/gh
   }
 }'
 ```
+
+
+## Secured Kafka connection (optional)
+
+The Quickwit Kafka source supports SSL and SASL authentication. This is
+particularly useful when consuming data from an external Kafka service.
+
+:::tip
+
+The certificate and key files must be present on all Quickwit nodes for the
+Kafka source to be created and for the indexing pipelines to run successfully.
+
+:::
+
+### SSL configuration
+
+```yaml
+version: 0.8
+source_id: kafka-source-ssl
+source_type: kafka
+num_pipelines: 2
+params:
+  topic: gh-archive
+  client_params:
+    bootstrap.servers: your-kafka-broker.com
+    security.protocol: SSL
+    ssl.ca.location: /path/to/ca.pem
+    ssl.certificate.location: /path/to/service.cert
+    ssl.key.location: /path/to/service.key
+```
+
+### SASL configuration
+
+```yaml
+version: 0.8
+source_id: kafka-source-sasl
+source_type: kafka
+num_pipelines: 2
+params:
+  topic: gh-archive
+  client_params:
+    bootstrap.servers: your-kafka-broker.com
+    ssl.ca.location: /path/to/ca.pem
+    security.protocol: SASL_SSL
+    sasl.mechanisms: SCRAM-SHA-256
+    sasl.username: your_sasl_username
+    sasl.password: your_sasl_password
+```
+
+:::note
+
+If you get the following error:
+
+```Client creation error: ssl.ca.location failed: error:05880002:x509 certificate routines::system lib```
+
+It usually means the path to the CA certificate is incorrect. Update the
+`ssl.ca.location` parameter accordingly.
+
+:::
 
 ## Tear down resources (optional)
 

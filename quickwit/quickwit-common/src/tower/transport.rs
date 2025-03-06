@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -31,7 +26,7 @@ use futures::{Stream, StreamExt};
 use http::Uri;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tower::balance::p2c::Balance;
 use tower::buffer::Buffer;
 use tower::discover::Change as TowerChange;
@@ -134,6 +129,19 @@ where K: Hash + Eq + Send + Sync + Clone + 'static
     pub fn connection_keys_watcher(&self) -> watch::Receiver<HashSet<K>> {
         self.connection_keys_rx.clone()
     }
+
+    pub async fn wait_for(
+        &self,
+        timeout_after: Duration,
+        predicate: impl Fn(&HashSet<K>) -> bool,
+    ) -> bool {
+        tokio::time::timeout(
+            timeout_after,
+            self.connection_keys_watcher().wait_for(predicate),
+        )
+        .await
+        .is_ok()
+    }
 }
 
 /// `tower::buffer::Buffer` and `tower::balance::Balance` lazily polls their inner services. As a
@@ -187,17 +195,23 @@ where K: Hash + Eq + Clone + Send + Sync + 'static
 /// Creates a channel from a socket address.
 ///
 /// The function is marked as `async` because it requires an executor (`connect_lazy`).
-pub async fn make_channel(socket_addr: SocketAddr) -> Channel {
+pub async fn make_channel(socket_addr: SocketAddr, tls_config: Option<ClientTlsConfig>) -> Channel {
+    let scheme = if tls_config.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     let uri = Uri::builder()
-        .scheme("http")
+        .scheme(scheme)
         .authority(socket_addr.to_string())
         .path_and_query("/")
         .build()
         .expect("provided arguments should be valid");
-    Endpoint::from(uri)
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .connect_lazy()
+    let mut endpoint = Endpoint::from(uri).connect_timeout(Duration::from_secs(5));
+    if let Some(tls_config) = tls_config {
+        endpoint = endpoint.tls_config(tls_config).expect("sadness TODO");
+    }
+    endpoint.connect_lazy()
 }
 
 /// Forces a channel to initiate the underlying HTTP connection. Calling this function only makes

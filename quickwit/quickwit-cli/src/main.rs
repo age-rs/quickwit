@@ -1,22 +1,22 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+#![recursion_limit = "256"]
+
+use std::collections::BTreeMap;
+
+use anyhow::Context;
 use colored::Colorize;
 use opentelemetry::global;
 use quickwit_cli::busy_detector;
@@ -25,21 +25,52 @@ use quickwit_cli::cli::{build_cli, CliCommand};
 #[cfg(feature = "jemalloc")]
 use quickwit_cli::jemalloc::start_jemalloc_metrics_loop;
 use quickwit_cli::logger::setup_logging_and_tracing;
+use quickwit_common::runtimes::scrape_tokio_runtime_metrics;
 use quickwit_serve::BuildInfo;
+use tracing::error;
+
+/// The main tokio runtime takes num_cores / 3 threads by default, and can be overridden by the
+/// QW_RUNTIME_NUM_THREADS environment variable.
+fn get_main_runtime_num_threads() -> usize {
+    let default_num_runtime_threads: usize = quickwit_common::num_cpus().div_ceil(3);
+    quickwit_common::get_from_env("QW_TOKIO_RUNTIME_NUM_THREADS", default_num_runtime_threads)
+}
 
 fn main() -> anyhow::Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let main_runtime_num_threads: usize = get_main_runtime_num_threads();
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .on_thread_unpark(busy_detector::thread_unpark)
         .on_thread_park(busy_detector::thread_park)
+        .thread_name("main_runtime_thread")
+        .worker_threads(main_runtime_num_threads)
         .build()
-        .unwrap()
-        .block_on(main_impl())
+        .context("failed to start main Tokio runtime")?;
+
+    scrape_tokio_runtime_metrics(rt.handle(), "main");
+
+    rt.block_on(main_impl())
+}
+
+fn register_build_info_metric() {
+    use itertools::Itertools;
+    let build_info = BuildInfo::get();
+    let mut build_kvs = BTreeMap::default();
+    build_kvs.insert("build_date", build_info.build_date.to_string());
+    build_kvs.insert("commit_hash", build_info.commit_short_hash.to_string());
+    build_kvs.insert("version", build_info.version.to_string());
+    if !build_info.commit_tags.is_empty() {
+        let tags_str = build_info.commit_tags.iter().join(",");
+        build_kvs.insert("commit_tags", tags_str);
+    }
+    build_kvs.insert("target", build_info.build_target.to_string());
+    quickwit_common::metrics::register_info("build_info", "Quickwit's build info", build_kvs);
 }
 
 async fn main_impl() -> anyhow::Result<()> {
     #[cfg(feature = "openssl-support")]
     openssl_probe::init_ssl_cert_env_vars();
+    register_build_info_metric();
 
     let about_text = about_text();
     let version_text = BuildInfo::get_version_text();
@@ -62,8 +93,14 @@ async fn main_impl() -> anyhow::Result<()> {
     let build_info = BuildInfo::get();
     let env_filter_reload_fn =
         setup_logging_and_tracing(command.default_log_level(), ansi_colors, build_info)?;
-    let return_code: i32 = if let Err(err) = command.execute(env_filter_reload_fn).await {
-        eprintln!("{} command failed: {:?}\n", "✘".color(RED_COLOR), err);
+
+    let return_code: i32 = if let Err(command_error) = command.execute(env_filter_reload_fn).await {
+        error!(error=%command_error, "command failed");
+        eprintln!(
+            "{} command failed: {:?}\n",
+            "✘".color(RED_COLOR),
+            command_error
+        );
         1
     } else {
         0
@@ -180,32 +217,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ingest_v2_args() {
-        let app = build_cli().no_binary_name(true);
-        let matches = app
-            .try_get_matches_from(["index", "ingest", "--index", "wikipedia", "--v2"])
-            .unwrap();
-        let command = CliCommand::parse_cli_args(matches).unwrap();
-        assert!(matches!(
-            command,
-            CliCommand::Index(IndexCliCommand::Ingest(
-                IngestDocsArgs {
-                    client_args,
-                    index_id,
-                    input_path_opt: None,
-                    batch_size_limit_opt: None,
-                    commit_type: CommitType::Auto,
-                })) if &index_id == "wikipedia"
-                && client_args.timeout.is_none()
-                && client_args.connect_timeout.is_none()
-                && client_args.commit_timeout.is_none()
-                && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:7280").unwrap()
-                && client_args.ingest_v2
-
-        ));
-    }
-
-    #[test]
     fn test_parse_ingest_args() -> anyhow::Result<()> {
         let app = build_cli().no_binary_name(true);
         let matches = app.try_get_matches_from([
@@ -226,12 +237,12 @@ mod tests {
                     input_path_opt: None,
                     batch_size_limit_opt: None,
                     commit_type: CommitType::Auto,
+                    detailed_response: false,
                 })) if &index_id == "wikipedia"
                 && client_args.timeout.is_none()
                 && client_args.connect_timeout.is_none()
                 && client_args.commit_timeout.is_none()
                 && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:8000").unwrap()
-                && !client_args.ingest_v2
         ));
 
         let app = build_cli().no_binary_name(true);
@@ -240,6 +251,7 @@ mod tests {
             "ingest",
             "--index",
             "wikipedia",
+            "--detailed-response",
             "--batch-size-limit",
             "8MB",
             "--force",
@@ -254,12 +266,12 @@ mod tests {
                     input_path_opt: None,
                     batch_size_limit_opt: Some(batch_size_limit),
                     commit_type: CommitType::Force,
+                    detailed_response: true,
                 })) if &index_id == "wikipedia"
                         && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:7280").unwrap()
                         && client_args.timeout.is_none()
                         && client_args.connect_timeout.is_none()
                         && client_args.commit_timeout.is_none()
-                        && !client_args.ingest_v2
                         && batch_size_limit == ByteSize::mb(8)
         ));
 
@@ -283,12 +295,12 @@ mod tests {
                     input_path_opt: None,
                     batch_size_limit_opt: Some(batch_size_limit),
                     commit_type: CommitType::WaitFor,
+                    detailed_response: false,
                 })) if &index_id == "wikipedia"
                     && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:7280").unwrap()
                     && client_args.timeout.is_none()
                     && client_args.connect_timeout.is_none()
                     && client_args.commit_timeout.is_none()
-                    && !client_args.ingest_v2
                     && batch_size_limit == ByteSize::kb(4)
         ));
 
@@ -313,6 +325,7 @@ mod tests {
                     input_path_opt: None,
                     batch_size_limit_opt: None,
                     commit_type: CommitType::Auto,
+                    detailed_response: false,
                 })) if &index_id == "wikipedia"
                         && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:7280").unwrap()
                         && client_args.timeout == Some(Timeout::from_secs(10))
@@ -344,6 +357,7 @@ mod tests {
                     input_path_opt: None,
                     batch_size_limit_opt: None,
                     commit_type: CommitType::WaitFor,
+                    detailed_response: false,
                 })) if &index_id == "wikipedia"
                         && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:7280").unwrap()
                         && client_args.timeout == Some(Timeout::none())

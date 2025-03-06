@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! [`FileBackedIndex`] module. It is public so that the crate `quickwit-backward-compat` can
 //! import [`FileBackedIndex`] and run backward-compatibility tests. You should not have to import
@@ -30,11 +25,13 @@ use std::ops::Bound;
 
 use itertools::Itertools;
 use quickwit_common::pretty::PrettySample;
-use quickwit_config::{SourceConfig, INGEST_V2_SOURCE_ID};
+use quickwit_config::{
+    DocMapping, IndexingSettings, RetentionPolicy, SearchSettings, SourceConfig,
+};
 use quickwit_proto::metastore::{
-    AcquireShardsRequest, AcquireShardsResponse, DeleteQuery, DeleteShardsRequest, DeleteTask,
-    EntityKind, ListShardsSubrequest, ListShardsSubresponse, MetastoreError, MetastoreResult,
-    OpenShardsSubrequest, OpenShardsSubresponse,
+    AcquireShardsRequest, AcquireShardsResponse, DeleteQuery, DeleteShardsRequest,
+    DeleteShardsResponse, DeleteTask, EntityKind, ListShardsSubrequest, ListShardsSubresponse,
+    MetastoreError, MetastoreResult, OpenShardSubrequest, OpenShardSubresponse, PruneShardsRequest,
 };
 use quickwit_proto::types::{IndexUid, PublishToken, SourceId, SplitId};
 use serde::{Deserialize, Serialize};
@@ -45,6 +42,7 @@ use tracing::{info, warn};
 
 use super::MutationOccurred;
 use crate::checkpoint::IndexCheckpointDelta;
+use crate::metastore::{use_shard_api, SortBy};
 use crate::{split_tag_filter, IndexMetadata, ListSplitsQuery, Split, SplitMetadata, SplitState};
 
 /// A `FileBackedIndex` object carries an index metadata and its split metadata.
@@ -79,8 +77,9 @@ pub(crate) struct FileBackedIndex {
 #[cfg(any(test, feature = "testsuite"))]
 impl quickwit_config::TestableForRegression for FileBackedIndex {
     fn sample_for_regression() -> Self {
+        use quickwit_config::INGEST_V2_SOURCE_ID;
         use quickwit_proto::ingest::{Shard, ShardState};
-        use quickwit_proto::types::{Position, ShardId};
+        use quickwit_proto::types::{DocMappingUid, Position, ShardId};
 
         let index_metadata = IndexMetadata::sample_for_regression();
         let index_uid = index_metadata.index_uid.clone();
@@ -102,7 +101,9 @@ impl quickwit_config::TestableForRegression for FileBackedIndex {
             shard_state: ShardState::Open as i32,
             leader_id: "leader-ingester".to_string(),
             follower_id: Some("follower-ingester".to_string()),
+            doc_mapping_uid: Some(DocMappingUid::for_test(1)),
             publish_position_inclusive: Some(Position::Beginning),
+            update_timestamp: 1724240908,
             ..Default::default()
         };
         let shards = Shards::from_shards_vec(index_uid.clone(), source_id.clone(), vec![shard]);
@@ -211,6 +212,26 @@ impl FileBackedIndex {
     /// Index metadata accessor.
     pub fn metadata(&self) -> &IndexMetadata {
         &self.metadata
+    }
+
+    /// Replaces the retention policy in the index config, returning whether a mutation occurred.
+    pub fn set_retention_policy(&mut self, retention_policy_opt: Option<RetentionPolicy>) -> bool {
+        self.metadata.set_retention_policy(retention_policy_opt)
+    }
+
+    /// Replaces the search settings in the index config, returning whether a mutation occurred.
+    pub fn set_search_settings(&mut self, search_settings: SearchSettings) -> bool {
+        self.metadata.set_search_settings(search_settings)
+    }
+
+    /// Replaces the indexing settings in the index config, returning whether a mutation occurred.
+    pub fn set_indexing_settings(&mut self, search_settings: IndexingSettings) -> bool {
+        self.metadata.set_indexing_settings(search_settings)
+    }
+
+    /// Replaces the doc mapping in the index config, returning whether a mutation occurred.
+    pub fn set_doc_mapping(&mut self, doc_mapping: DocMapping) -> bool {
+        self.metadata.set_doc_mapping(doc_mapping)
     }
 
     /// Stages a single split.
@@ -357,8 +378,14 @@ impl FileBackedIndex {
     ) -> MetastoreResult<()> {
         if let Some(checkpoint_delta) = checkpoint_delta_opt {
             let source_id = checkpoint_delta.source_id.clone();
+            let source = self.metadata.sources.get(&source_id).ok_or_else(|| {
+                MetastoreError::NotFound(EntityKind::Source {
+                    index_id: self.index_id().to_string(),
+                    source_id: source_id.clone(),
+                })
+            })?;
 
-            if source_id == INGEST_V2_SOURCE_ID {
+            if use_shard_api(&source.source_params) {
                 let publish_token = publish_token_opt.ok_or_else(|| {
                     let message = format!(
                         "publish token is required for publishing splits for source `{source_id}`"
@@ -371,6 +398,11 @@ impl FileBackedIndex {
                     .checkpoint
                     .try_apply_delta(checkpoint_delta)
                     .map_err(|error| {
+                        quickwit_common::rate_limited_error!(
+                            limit_per_min = 6,
+                            index = self.index_id(),
+                            "failed to apply checkpoint delta"
+                        );
                         let entity = EntityKind::CheckpointDelta {
                             index_id: self.index_id().to_string(),
                             source_id,
@@ -387,25 +419,19 @@ impl FileBackedIndex {
 
     /// Lists splits.
     pub(crate) fn list_splits(&self, query: &ListSplitsQuery) -> MetastoreResult<Vec<Split>> {
-        let limit = query.limit.unwrap_or(usize::MAX);
-        let offset = query.offset.unwrap_or_default();
+        let limit = query
+            .limit
+            .map(|limit| limit + query.offset.unwrap_or_default())
+            .unwrap_or(usize::MAX);
+        // skip is done at a higher layer in case other indexes give spltis that would go before
+        // ours
 
-        let splits: Vec<Split> = if query.sort_by_staleness {
+        let results = if query.sort_by == SortBy::None {
+            // internally sorted_unstable_by collect everything to an intermediary vec. When not
+            // sorting at all, skip that.
             self.splits
                 .values()
                 .filter(|split| split_query_predicate(split, query))
-                .sorted_unstable_by(|left_split, right_split| {
-                    left_split
-                        .split_metadata
-                        .delete_opstamp
-                        .cmp(&right_split.split_metadata.delete_opstamp)
-                        .then_with(|| {
-                            left_split
-                                .publish_timestamp
-                                .cmp(&right_split.publish_timestamp)
-                        })
-                })
-                .skip(offset)
                 .take(limit)
                 .cloned()
                 .collect()
@@ -413,12 +439,12 @@ impl FileBackedIndex {
             self.splits
                 .values()
                 .filter(|split| split_query_predicate(split, query))
-                .skip(offset)
+                .sorted_unstable_by(|lhs, rhs| query.sort_by.compare(lhs, rhs))
                 .take(limit)
                 .cloned()
                 .collect()
         };
-        Ok(splits)
+        Ok(results)
     }
 
     /// Deletes a split.
@@ -486,13 +512,18 @@ impl FileBackedIndex {
         Ok(())
     }
 
+    /// Updates a source. Returns whether a mutation occurred.
+    pub(crate) fn update_source(&mut self, source_config: SourceConfig) -> MetastoreResult<bool> {
+        self.metadata.update_source(source_config)
+    }
+
     /// Enables or disables a source. Returns whether a mutation occurred.
     pub(crate) fn toggle_source(&mut self, source_id: &str, enable: bool) -> MetastoreResult<bool> {
         self.metadata.toggle_source(source_id, enable)
     }
 
     /// Deletes the source. Returns whether a mutation occurred.
-    pub(crate) fn delete_source(&mut self, source_id: &str) -> MetastoreResult<bool> {
+    pub(crate) fn delete_source(&mut self, source_id: &str) -> MetastoreResult<()> {
         self.metadata.delete_source(source_id)
     }
 
@@ -575,15 +606,15 @@ impl FileBackedIndex {
 
     pub(crate) fn open_shards(
         &mut self,
-        subrequests: Vec<OpenShardsSubrequest>,
-    ) -> MetastoreResult<MutationOccurred<Vec<OpenShardsSubresponse>>> {
+        subrequests: Vec<OpenShardSubrequest>,
+    ) -> MetastoreResult<MutationOccurred<Vec<OpenShardSubresponse>>> {
         let mut mutation_occurred = false;
         let mut subresponses = Vec::with_capacity(subrequests.len());
 
         for subrequest in subrequests {
             let subresponse = match self
                 .get_shards_for_source_mut(&subrequest.source_id)?
-                .open_shards(subrequest)?
+                .open_shard(subrequest)?
             {
                 MutationOccurred::Yes(subresponse) => {
                     mutation_occurred = true;
@@ -611,9 +642,17 @@ impl FileBackedIndex {
     pub(crate) fn delete_shards(
         &mut self,
         request: DeleteShardsRequest,
-    ) -> MetastoreResult<MutationOccurred<()>> {
+    ) -> MetastoreResult<MutationOccurred<DeleteShardsResponse>> {
         self.get_shards_for_source_mut(&request.source_id)?
             .delete_shards(request)
+    }
+
+    pub(crate) fn prune_shards(
+        &mut self,
+        request: PruneShardsRequest,
+    ) -> MetastoreResult<MutationOccurred<()>> {
+        self.get_shards_for_source_mut(&request.source_id)?
+            .prune_shards(request)
     }
 
     pub(crate) fn list_shards(
@@ -695,8 +734,25 @@ fn split_query_predicate(split: &&Split, query: &ListSplitsQuery) -> bool {
         Bound::Unbounded => {}
     }
 
-    if let Some(range) = split.split_metadata.time_range.as_ref() {
+    if let Some(range) = &split.split_metadata.time_range {
         if !query.time_range.overlaps_with(range.clone()) {
+            return false;
+        }
+    }
+
+    if let Some(node_id) = &query.node_id {
+        if split.split_metadata.node_id != *node_id {
+            return false;
+        }
+    }
+
+    if let Some((index_uid, split_id)) = &query.after_split {
+        if *index_uid > split.split_metadata.index_uid {
+            return false;
+        }
+        if *index_uid == split.split_metadata.index_uid
+            && *split_id >= split.split_metadata.split_id
+        {
             return false;
         }
     }
@@ -709,7 +765,6 @@ mod tests {
     use std::collections::BTreeSet;
 
     use quickwit_doc_mapper::tag_pruning::TagFilterAst;
-    use quickwit_doc_mapper::{BinaryFormat, FieldMappingType};
     use quickwit_proto::ingest::Shard;
     use quickwit_proto::metastore::ListShardsSubrequest;
     use quickwit_proto::types::{IndexUid, SourceId};
@@ -880,107 +935,5 @@ mod tests {
         assert!(!split_query_predicate(&&split_1, &query));
         assert!(!split_query_predicate(&&split_2, &query));
         assert!(!split_query_predicate(&&split_3, &query));
-    }
-
-    #[test]
-    fn test_index_otel_bytes_fields_format_conversion() {
-        // TODO: remove after 0.8 release.
-        let index_json_str = r#"
-        {
-            "version": "0.6",
-            "splits": [],
-            "index": {
-                "version": "0.6",
-                "sources": [],
-                "index_uid": "otel-traces-v0_6:00000000000000000000000000",
-                "checkpoint": {
-                "kafka-source": {
-                    "00000000000000000000": "00000000000000000042"
-                }
-                },
-                "create_timestamp": 1789,
-                "index_config": {
-                    "version": "0.6",
-                    "index_id": "otel-traces-v0_6",
-                    "index_uri": "s3://otel-traces-v0_6",
-                    "doc_mapping": {
-                        "field_mappings": [
-                            {
-                                "name": "timestamp",
-                                "type": "datetime",
-                                "fast": true
-                            },
-                            {
-                                "name": "tenant_id",
-                                "type": "bytes",
-                                "fast": true,
-                                "input_format": "base64",
-                                "output_format": "base64"
-                            },
-                            {
-                                "name": "trace_id",
-                                "type": "bytes",
-                                "fast": true,
-                                "input_format": "base64",
-                                "output_format": "base64"
-                            },
-                            {
-                                "name": "span_id",
-                                "type": "bytes",
-                                "fast": true,
-                                "input_format": "base64",
-                                "output_format": "base64"
-                            }
-                        ],
-                        "tag_fields": [],
-                        "timestamp_field": "timestamp",
-                        "store_source": false
-                    }
-                }
-            }
-        }
-        "#;
-
-        let file_backed_index: FileBackedIndex = serde_json::from_str(index_json_str).unwrap();
-        let field_mapping = file_backed_index
-            .metadata
-            .index_config
-            .doc_mapping
-            .field_mappings;
-        assert_eq!(
-            field_mapping
-                .iter()
-                .filter(|field_mapping| field_mapping.name == "tenant_id")
-                .count(),
-            1
-        );
-        assert_eq!(
-            field_mapping
-                .iter()
-                .filter(|field_mapping| field_mapping.name == "trace_id")
-                .count(),
-            1
-        );
-        assert_eq!(
-            field_mapping
-                .iter()
-                .filter(|field_mapping| field_mapping.name == "span_id")
-                .count(),
-            1
-        );
-        for field_mapping in &field_mapping {
-            if field_mapping.name == "tenant_id" {
-                if let FieldMappingType::Bytes(bytes_options, _) = &field_mapping.mapping_type {
-                    assert_eq!(bytes_options.input_format, BinaryFormat::Base64);
-                    assert_eq!(bytes_options.output_format, BinaryFormat::Base64);
-                }
-            }
-            if field_mapping.name == "trace_id" || field_mapping.name == "span_id" {
-                if let FieldMappingType::Bytes(bytes_options, _) = &field_mapping.mapping_type {
-                    assert_eq!(bytes_options.input_format, BinaryFormat::Hex);
-                    assert_eq!(bytes_options.output_format, BinaryFormat::Hex);
-                }
-            }
-        }
     }
 }
