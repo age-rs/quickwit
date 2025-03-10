@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::sync::Arc;
 
@@ -23,6 +18,7 @@ use quickwit_config::NodeConfig;
 use serde_json::json;
 use warp::{Filter, Rejection};
 
+use crate::rest::recover_fn;
 use crate::{with_arg, BuildInfo, RuntimeInfo};
 
 #[derive(utoipa::OpenApi)]
@@ -34,7 +30,10 @@ pub fn node_info_handler(
     runtime_info: &'static RuntimeInfo,
     config: Arc<NodeConfig>,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
-    node_version_handler(build_info, runtime_info).or(node_config_handler(config))
+    node_version_handler(build_info, runtime_info)
+        .or(node_config_handler(config))
+        .recover(recover_fn)
+        .boxed()
 }
 
 #[utoipa::path(get, tag = "Node Info", path = "/version")]
@@ -105,7 +104,7 @@ mod tests {
 
         let runtime_info_json = info_json.get("runtime").unwrap();
         let expected_runtime_info_json = serde_json::json!({
-            "num_cpus_physical": runtime_info.num_cpus_physical,
+            "num_cpus": runtime_info.num_cpus,
         });
         assert_json_include!(
             actual: runtime_info_json,

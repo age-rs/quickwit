@@ -3,6 +3,10 @@ method: DELETE
 endpoint: gharchive
 status_code: null
 ---
+method: DELETE
+endpoint: empty_index
+status_code: null
+---
 # empty index
 method: PUT
 endpoint: empty_index
@@ -21,6 +25,17 @@ json: {
 method: PUT
 endpoint: gharchive
 json: {
+  "settings": {
+    "analysis": {
+    "normalizer": {
+      "keyword_lowercase": {
+        "type": "custom",
+        "filter": ["lowercase"]
+      },
+      "keyword_keepcase": { "type": "custom" }
+    }
+  }
+  },
   "mappings": {
     "properties": {
       "id": {
@@ -43,7 +58,8 @@ json: {
             "store": true
           },
           "login": {
-            "type": "text",
+            "type": "keyword",
+            "normalizer": "keyword_lowercase",
             "store": true,
             "norms": false,
             "index_options": "docs"
@@ -75,7 +91,8 @@ json: {
             "store": true
           },
           "name": {
-            "type": "text",
+            "type": "keyword",
+            "normalizer": "keyword_keepcase",
             "store": true
           },
           "url": {
@@ -97,6 +114,10 @@ json: {
   }
 }
 ---
+method: PUT
+endpoint: gharchive/_settings
+json: { "number_of_replicas": 0 }
+---
 # Ingest documents
 method: POST
 endpoint: _bulk
@@ -104,4 +125,3 @@ params:
   refresh: "true"
 headers: {"Content-Type": "application/json", "content-encoding": "gzip"}
 body_from_file: gharchive-bulk.json.gz
-

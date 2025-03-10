@@ -1,36 +1,32 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use fnv::FnvHashMap;
 use mrecordlog::error::{DeleteQueueError, TruncateError};
 use quickwit_common::pretty::PrettyDisplay;
 use quickwit_common::rate_limiter::{RateLimiter, RateLimiterSettings};
+use quickwit_doc_mapper::DocMapper;
 use quickwit_proto::control_plane::AdviseResetShardsResponse;
 use quickwit_proto::ingest::ingester::IngesterStatus;
 use quickwit_proto::ingest::{IngestV2Error, IngestV2Result, ShardState};
-use quickwit_proto::types::{Position, QueueId};
+use quickwit_proto::types::{DocMappingUid, Position, QueueId};
 use tokio::sync::{watch, Mutex, MutexGuard, RwLock, RwLockMappedWriteGuard, RwLockWriteGuard};
 use tracing::{error, info};
 
@@ -56,12 +52,13 @@ pub(super) struct IngesterState {
 }
 
 pub(super) struct InnerIngesterState {
-    pub shards: FnvHashMap<QueueId, IngesterShard>,
-    pub rate_trackers: FnvHashMap<QueueId, (RateLimiter, RateMeter)>,
+    pub shards: HashMap<QueueId, IngesterShard>,
+    pub doc_mappers: HashMap<DocMappingUid, Weak<DocMapper>>,
+    pub rate_trackers: HashMap<QueueId, (RateLimiter, RateMeter)>,
     // Replication stream opened with followers.
-    pub replication_streams: FnvHashMap<FollowerId, ReplicationStreamTaskHandle>,
+    pub replication_streams: HashMap<FollowerId, ReplicationStreamTaskHandle>,
     // Replication tasks running for each replication stream opened with leaders.
-    pub replication_tasks: FnvHashMap<LeaderId, ReplicationTaskHandle>,
+    pub replication_tasks: HashMap<LeaderId, ReplicationTaskHandle>,
     status: IngesterStatus,
     status_tx: watch::Sender<IngesterStatus>,
 }
@@ -83,6 +80,7 @@ impl IngesterState {
         let (status_tx, status_rx) = watch::channel(status);
         let inner = InnerIngesterState {
             shards: Default::default(),
+            doc_mappers: Default::default(),
             rate_trackers: Default::default(),
             replication_streams: Default::default(),
             replication_tasks: Default::default(),
@@ -138,7 +136,11 @@ impl IngesterState {
         info!("opening WAL located at `{}`", wal_dir_path.display());
         let open_result = MultiRecordLogAsync::open_with_prefs(
             wal_dir_path,
-            mrecordlog::SyncPolicy::OnDelay(Duration::from_secs(5)),
+            mrecordlog::PersistPolicy::OnDelay {
+                interval: Duration::from_secs(5),
+                // TODO maybe we want to fsync too?
+                action: mrecordlog::PersistAction::Flush,
+            },
         )
         .await;
 
@@ -177,12 +179,16 @@ impl IngesterState {
                 } else {
                     Position::offset(*position_range.start() - 1)
                 };
-                let solo_shard = IngesterShard::new_solo(
+                let mut solo_shard = IngesterShard::new_solo(
                     ShardState::Closed,
                     replication_position_inclusive,
                     truncation_position_inclusive,
+                    None,
                     now,
+                    false,
                 );
+                // We want to advertise the shard as read-only right away.
+                solo_shard.is_advertisable = true;
                 inner_guard.shards.insert(queue_id.clone(), solo_shard);
 
                 let rate_limiter = RateLimiter::from_settings(rate_limiter_settings);
@@ -336,8 +342,21 @@ impl FullyLockedIngesterState<'_> {
                 self.rate_trackers.remove(queue_id);
 
                 // Log only if the shard was actually removed.
-                if self.shards.remove(queue_id).is_some() {
+                if let Some(shard) = self.shards.remove(queue_id) {
                     info!("deleted shard `{queue_id}`");
+
+                    if let Some(doc_mapper) = shard.doc_mapper_opt {
+                        // At this point, we hold the lock so we can safely check the strong count.
+                        // The other locations where the doc mapper is cloned also require holding
+                        // the lock.
+                        if Arc::strong_count(&doc_mapper) == 1 {
+                            let doc_mapping_uid = doc_mapper.doc_mapping_uid();
+
+                            if self.doc_mappers.remove(&doc_mapping_uid).is_some() {
+                                info!("evicted doc mapper `{doc_mapping_uid}` from cache`");
+                            }
+                        }
+                    }
                 }
             }
             Err(DeleteQueueError::IoError(io_error)) => {
@@ -351,7 +370,7 @@ impl FullyLockedIngesterState<'_> {
     pub async fn truncate_shard(
         &mut self,
         queue_id: &QueueId,
-        truncate_up_to_position_inclusive: &Position,
+        truncate_up_to_position_inclusive: Position,
     ) {
         // TODO: Replace with if-let-chains when stabilized.
         let Some(truncate_up_to_offset_inclusive) = truncate_up_to_position_inclusive.as_u64()
@@ -361,7 +380,7 @@ impl FullyLockedIngesterState<'_> {
         let Some(shard) = self.inner.shards.get_mut(queue_id) else {
             return;
         };
-        if shard.truncation_position_inclusive >= *truncate_up_to_position_inclusive {
+        if shard.truncation_position_inclusive >= truncate_up_to_position_inclusive {
             return;
         }
         match self
@@ -370,7 +389,8 @@ impl FullyLockedIngesterState<'_> {
             .await
         {
             Ok(_) => {
-                shard.truncation_position_inclusive = truncate_up_to_position_inclusive.clone();
+                info!("truncated shard `{queue_id}` at {truncate_up_to_position_inclusive}");
+                shard.truncation_position_inclusive = truncate_up_to_position_inclusive;
             }
             Err(TruncateError::MissingQueue(_)) => {
                 error!("failed to truncate shard `{queue_id}`: WAL queue not found");
@@ -387,6 +407,7 @@ impl FullyLockedIngesterState<'_> {
     /// Deletes and truncates the shards as directed by the `advise_reset_shards_response` returned
     /// by the control plane.
     pub async fn reset_shards(&mut self, advise_reset_shards_response: &AdviseResetShardsResponse) {
+        info!("resetting shards");
         for shard_ids in &advise_reset_shards_response.shards_to_delete {
             for queue_id in shard_ids.queue_ids() {
                 self.delete_shard(&queue_id).await;

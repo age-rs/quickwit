@@ -1,23 +1,18 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
+use tantivy::json_utils::convert_to_fast_value_and_append_to_json_term;
 use tantivy::query::TermQuery as TantivyTermQuery;
 use tantivy::schema::{
     Field, FieldEntry, FieldType, IndexRecordOption, JsonObjectOptions, Schema as TantivySchema,
@@ -30,42 +25,46 @@ use crate::query_ast::full_text_query::FullTextParams;
 use crate::query_ast::tantivy_query_ast::{TantivyBoolQuery, TantivyQueryAst};
 use crate::tokenizers::TokenizerManager;
 use crate::InvalidQuery;
+use crate::MatchAllOrNone::MatchNone as TantivyEmptyQuery;
 
-const DYNAMIC_FIELD_NAME: &str = "_dynamic";
+pub(crate) const DYNAMIC_FIELD_NAME: &str = "_dynamic";
 
 fn make_term_query(term: Term) -> TantivyQueryAst {
     TantivyTermQuery::new(term, IndexRecordOption::WithFreqs).into()
 }
 
+/// Find the field or fallback to the dynamic field if it exists
 pub fn find_field_or_hit_dynamic<'a>(
     full_path: &'a str,
     schema: &'a TantivySchema,
-) -> Result<(Field, &'a FieldEntry, &'a str), InvalidQuery> {
+) -> Option<(Field, &'a FieldEntry, &'a str)> {
     let (field, path) = if let Some((field, path)) = schema.find_field(full_path) {
         (field, path)
     } else {
-        let dynamic_field =
-            schema
-                .get_field(DYNAMIC_FIELD_NAME)
-                .map_err(|_| InvalidQuery::FieldDoesNotExist {
-                    full_path: full_path.to_string(),
-                })?;
+        let dynamic_field = schema.get_field(DYNAMIC_FIELD_NAME).ok()?;
         (dynamic_field, full_path)
     };
     let field_entry = schema.get_field_entry(field);
     let typ = field_entry.field_type().value_type();
-    if path.is_empty() {
-        if typ == Type::Json {
-            return Err(InvalidQuery::JsonFieldRootNotSearchable {
-                full_path: full_path.to_string(),
-            });
-        }
-    } else if typ != Type::Json {
-        return Err(InvalidQuery::FieldDoesNotExist {
-            full_path: full_path.to_string(),
-        });
+    if !path.is_empty() && typ != Type::Json {
+        return None;
     }
-    Ok((field, field_entry, path))
+    Some((field, field_entry, path))
+}
+
+/// Find all the fields that are below the given path.
+///
+/// This will return a list of fields only when the path is that of a composite
+/// type in the doc mapping.
+pub fn find_subfields<'a>(
+    path: &'a str,
+    schema: &'a TantivySchema,
+) -> Vec<(Field, &'a FieldEntry)> {
+    let prefix = format!("{}.", path);
+    schema
+        .fields()
+        .filter(|(_, field_entry)| field_entry.name().starts_with(&prefix))
+        .collect()
 }
 
 /// Creates a full text query.
@@ -77,8 +76,17 @@ pub(crate) fn full_text_query(
     full_text_params: &FullTextParams,
     schema: &TantivySchema,
     tokenizer_manager: &TokenizerManager,
+    lenient: bool,
 ) -> Result<TantivyQueryAst, InvalidQuery> {
-    let (field, field_entry, path) = find_field_or_hit_dynamic(full_path, schema)?;
+    let Some((field, field_entry, path)) = find_field_or_hit_dynamic(full_path, schema) else {
+        if lenient {
+            return Ok(TantivyEmptyQuery.into());
+        } else {
+            return Err(InvalidQuery::FieldDoesNotExist {
+                full_path: full_path.to_string(),
+            });
+        }
+    };
     compute_query_with_field(
         field,
         field_entry,
@@ -186,14 +194,8 @@ fn compute_tantivy_ast_query_for_json(
     tokenizer_manager: &TokenizerManager,
 ) -> Result<TantivyQueryAst, InvalidQuery> {
     let mut bool_query = TantivyBoolQuery::default();
-    let mut term = Term::with_capacity(100);
-    let mut json_term_writer = JsonTermWriter::from_field_and_json_path(
-        field,
-        json_path,
-        json_options.is_expand_dots_enabled(),
-        &mut term,
-    );
-    if let Some(term) = convert_to_fast_value_and_get_term(&mut json_term_writer, text) {
+    let term = Term::from_field_json_path(field, json_path, json_options.is_expand_dots_enabled());
+    if let Some(term) = convert_to_fast_value_and_append_to_json_term(term, text, true) {
         bool_query
             .should
             .push(TantivyTermQuery::new(term, IndexRecordOption::Basic).into());

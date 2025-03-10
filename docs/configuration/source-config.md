@@ -29,14 +29,65 @@ The source type designates the kind of source being configured. As of version 0.
 
 The source parameters indicate how to connect to a data store and are specific to the source type.
 
-### File source (CLI only)
+### File source
 
-A file source reads data from a local file. The file must consist of JSON objects separated by a newline (NDJSON).
-As of version 0.5, a file source can only be ingested with the [CLI command](/docs/reference/cli.md#tool-local-ingest). Compressed files (bz2, gzip, ...) and remote files (Amazon S3, HTTP, ...) are not supported.
+A file source reads data from files containing JSON objects separated by newlines (NDJSON). Gzip compression is supported provided that the file name ends with the `.gz` suffix.
+
+#### Ingest a single file (CLI only)
+
+To ingest a specific file, run the indexing directly in an adhoc CLI process with:
 
 ```bash
-./quickwit tool local-ingest --input-path <INPUT_PATH>
+./quickwit tool local-ingest --index <index> --input-path <input-path>
 ```
+
+Both local and object files are supported, provided that the environment is configured with the appropriate permissions. A tutorial is available [here](/docs/ingest-data/ingest-local-file.md).
+
+#### Notification based file ingestion (beta)
+
+Quickwit can automatically ingest all new files that are uploaded to an S3 bucket. This requires creating and configuring an [SQS notification queue](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ways-to-add-notification-config-to-bucket.html). A complete example can be found [in this tutorial](/docs/ingest-data/sqs-files.md).
+
+
+The `notifications` parameter takes an array of notification settings. Currently one notifier can be configured per source and only the SQS notification `type` is supported.
+
+Required fields for the SQS `notifications` parameter items:
+- `type`: `sqs`
+- `queue_url`: complete URL of the SQS queue (e.g `https://sqs.us-east-1.amazonaws.com/123456789012/queue-name`)
+- `message_type`: format of the message payload, either
+  - `s3_notification`: an [S3 event notification](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html)
+  - `raw_uri`: a message containing just the file object URI (e.g. `s3://mybucket/mykey`)
+  - `deduplication_window_duration_sec`: maximum duration for which ingested files checkpoints are kept (default 3600)
+  - `deduplication_window_max_messages`: maximum number of ingested file checkpoints kept (default 100k)
+  - `deduplication_cleanup_interval_secs`: frequency at which outdated file checkpoints are cleaned up
+
+*Adding a file source with SQS notifications to an index with the [CLI](../reference/cli.md#source)*
+
+```bash
+cat << EOF > source-config.yaml
+version: 0.8
+source_id: my-sqs-file-source
+source_type: file
+num_pipelines: 2
+params:
+  notifications:
+    - type: sqs
+      queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/queue-name
+      message_type: s3_notification
+EOF
+./quickwit source create --index my-index --source-config source-config.yaml
+```
+
+:::note
+
+- Quickwit does not automatically delete the source files after a successful ingestion. You can use [S3 object expiration](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html) to configure how long they should be retained in the bucket.
+- Configure the notification to only forward events of type `s3:ObjectCreated:*`. Other events are acknowledged by the source without further processing and an warning is logged.
+- We strongly recommend using a [dead letter queue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html) to receive all messages that couldn't be processed by the file source. A `maxReceiveCount` of 5 is a good default value. Here are some common situations where the notification message ends up in the dead letter queue:
+  - the notification message could not be parsed (e.g it is not a valid S3 notification)
+  - the file was not found
+  - the file is corrupted (e.g unexpected compression)
+- AWS S3 notifications and AWS SQS provide "at least once" delivery guaranties. To avoid duplicates, the file source includes a mechanism that prevents the same file from being ingested twice. It works by storing checkpoints in the metastore that track the indexing progress for each file. You can decrease `deduplication_window_*` or increase `deduplication_cleanup_interval_secs` to reduce the load on the metastore.
+
+:::
 
 ### Ingest API source
 
@@ -68,7 +119,7 @@ Comma-separated list of host and port pairs that are the addresses of a subset o
 Defines the behavior of the source when consuming a partition for which there is no initial offset saved in the checkpoint. `earliest` consumes from the beginning of the partition, whereas `latest` (default) consumes from the end.
 
 - `enable.auto.commit`
-The Kafka source manages commit offsets manually using the [checkpoint API](../overview/concepts/indexing.md#checkpoint) and disables auto-commit.
+This setting is ignored because the Kafka source manages commit offsets internally using the [checkpoint API](../overview/concepts/indexing.md#checkpoint) and forces auto-commits to be disabled.
 
 - `group.id`
 Kafka-based distributed indexing relies on consumer groups. Unless overridden in the client parameters, the default group ID assigned to each consumer managed by the source is `quickwit-{index_uid}-{source_id}`.
@@ -80,11 +131,10 @@ Short max poll interval durations may cause a source to crash when back pressure
 
 ```bash
 cat << EOF > source-config.yaml
-version: 0.7
+version: 0.8
 source_id: my-kafka-source
 source_type: kafka
-max_num_pipelines_per_indexer: 1
-desired_num_pipelines: 2
+num_pipelines: 2
 params:
   topic: my-topic
   client_params:
@@ -164,38 +214,26 @@ EOF
 ./quickwit source create --index my-index --source-config source-config.yaml
 ```
 
-## Maximum number of pipelines per indexer
+## Number of pipelines
 
-The `max_num_pipelines_per_indexer` parameter is only available for sources that can be distributed: Kafka, GCP PubSub and Pulsar(coming soon).
+The `num_pipelines` parameter is only available for distributed sources like Kafka, GCP PubSub, and Pulsar.
 
-The maximum number of indexing pipelines defines the limit of pipelines spawned for the source on a given indexer.
-This maximum can be reached only if there are enough `desired_num_pipelines` to run.
+It defines the number of pipelines to run on a cluster for the source. The actual placement of these pipelines on the different indexer
+will be decided by the control plane.
 
-:::note
+:::info
 
-With the following parameters, only one pipeline will run on one indexer.
+Note that distributing the indexing load of partitioned sources like Kafka is done by assigning the different partitions to different pipelines. As a result, it is important to ensure that the number of partitions is a multiple of `num_pipelines`.
 
-- `max_num_pipelines_per_indexer=2`
-- `desired_num_pipelines=1`
+Also, assuming you are only indexing a single Kafka source in your Quickwit cluster, you should set the number of pipelines to a multiple of the number of indexers. Finally, if your indexing throughput is high, you should provision between 2 and 4 vCPUs per pipeline.
 
+For instance, assume you want to index a 60-partition topic, with each partition receiving a throughput of 10 MB/s. If you measured that Quickwit can index your data at a pace of 40MB/s per pipeline, a possible setting could be:
+- 5 indexers with 8 vCPUs each
+- 15 pipelines
+
+Each indexer will then be in charge of 3 pipelines, and each pipeline will cover 4 partitions.
 :::
 
-## Desired number of pipelines
-
-`desired_num_pipelines` parameter is only available for sources that can be distributed: Kafka, GCP PubSub and Pulsar (coming soon).
-
-The desired number of indexing pipelines defines the number of pipelines to run on a cluster for the source. It is a "desired"
-number as it cannot be reach it there is not enough indexers in
-the cluster.
-
-:::note
-
-With the following parameters, only one pipeline will start on the sole indexer.
-
-- `max_num_pipelines_per_indexer=1`
-- `desired_num_pipelines=2`
-
-:::
 
 ## Transform parameters
 
@@ -219,11 +257,21 @@ transform:
 
 ## Input format
 
-The `input_format` parameter specifies the expected data format of the source. Two formats are currently supported:
-- `json`: JSON, the default
-- `plain_text`: unstructured text document
+The `input_format` parameter specifies the expected data format of the source. The formats currently supported are:
+- `json` (default)
+- `otlp_logs_json`
+- `otlp_logs_proto`
+- `otlp_traces_json`
+- `otlp_traces_proto`
+- `plain_text`
 
-Internally, Quickwit can only index JSON data. To allow the ingestion of plain text documents, Quickwit transform them on the fly into JSON objects of the following form: `{"plain_text": "<original plain text document>"}`. Then, they can be optionally transformed into more complex documents using a VRL script. (see [transform feature](#transform-parameters)).
+*OTLP formats*
+
+When ingesting OTLP data into an OTLP logs or traces index with a source other than the native OTEL endpoints, use this parameter to specify whether the exported logs or traces will be serialized in JSON or Protobuf. When possible, prefer the latter, which is a more compact encoding.
+
+*Plaint text format*
+
+Use this parameter for unstructured text data. Internally, Quickwit can only index JSON data. To allow the ingestion of plain text documents, Quickwit transform them on the fly into JSON objects of the following form: `{"plain_text": "<original plain text document>"}`. Then, they can be optionally transformed into more complex documents using a VRL script. (see [transform feature](#transform-parameters)).
 
 The following is an example of how one could parse and transform a CSV dataset containing a list of users described by 3 attributes: first name, last name, and age.
 
@@ -240,7 +288,7 @@ transform:
     del(.plain_text)
 ```
 
-## Enabling/Disabling a source from an index
+## Enabling/disabling a source from an index
 
 A source can be enabled or disabled from an index using the [CLI command](../reference/cli.md) `quickwit source enable` or `quickwit source disable`:
 

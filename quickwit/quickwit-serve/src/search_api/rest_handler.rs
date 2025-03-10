@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::convert::TryFrom;
 use std::sync::Arc;
@@ -26,9 +21,10 @@ use hyper::HeaderMap;
 use percent_encoding::percent_decode_str;
 use quickwit_config::validate_index_id_pattern;
 use quickwit_proto::search::{CountHits, OutputFormat, SortField, SortOrder};
+use quickwit_proto::types::IndexId;
 use quickwit_proto::ServiceError;
 use quickwit_query::query_ast::query_ast_from_user_text;
-use quickwit_search::{SearchError, SearchResponseRest, SearchService};
+use quickwit_search::{SearchError, SearchPlanResponseRest, SearchResponseRest, SearchService};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 use tracing::info;
@@ -42,12 +38,19 @@ use crate::{with_arg, BodyFormat};
 
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(search_get_handler, search_post_handler, search_stream_handler,),
+    paths(
+        search_get_handler,
+        search_post_handler,
+        search_stream_handler,
+        search_plan_get_handler,
+        search_plan_post_handler,
+    ),
     components(schemas(
         BodyFormat,
         OutputFormat,
         SearchRequestQueryString,
         SearchResponseRest,
+        SearchPlanResponseRest,
         SortBy,
         SortField,
         SortOrder,
@@ -231,6 +234,10 @@ pub struct SearchRequestQueryString {
     #[serde(with = "count_hits_from_bool")]
     #[serde(default = "count_hits_from_bool::default")]
     pub count_all: CountHits,
+    #[param(value_type = bool)]
+    #[schema(value_type = bool)]
+    #[serde(default)]
+    pub allow_failed_splits: bool,
 }
 
 mod count_hits_from_bool {
@@ -294,8 +301,22 @@ async fn search_endpoint(
     search_request: SearchRequestQueryString,
     search_service: &dyn SearchService,
 ) -> Result<SearchResponseRest, SearchError> {
+    let allow_failed_splits = search_request.allow_failed_splits;
     let search_request = search_request_from_api_request(index_id_patterns, search_request)?;
-    let search_response = search_service.root_search(search_request).await?;
+    let search_response =
+        search_service
+            .root_search(search_request)
+            .await
+            .and_then(|search_response| {
+                if !allow_failed_splits || search_response.num_successful_splits == 0 {
+                    if let Some(search_error) =
+                        SearchError::from_split_errors(&search_response.failed_splits[..])
+                    {
+                        return Err(search_error);
+                    }
+                }
+                Ok(search_response)
+            })?;
     let search_response_rest = SearchResponseRest::try_from(search_response)?;
     Ok(search_response_rest)
 }
@@ -317,6 +338,23 @@ fn search_post_filter(
         .and(warp::body::json())
 }
 
+fn search_plan_get_filter(
+) -> impl Filter<Extract = (Vec<String>, SearchRequestQueryString), Error = Rejection> + Clone {
+    warp::path!(String / "search-plan")
+        .and_then(extract_index_id_patterns)
+        .and(warp::get())
+        .and(serde_qs::warp::query(serde_qs::Config::default()))
+}
+
+fn search_plan_post_filter(
+) -> impl Filter<Extract = (Vec<String>, SearchRequestQueryString), Error = Rejection> + Clone {
+    warp::path!(String / "search-plan")
+        .and_then(extract_index_id_patterns)
+        .and(warp::post())
+        .and(warp::body::content_length_limit(1024 * 1024))
+        .and(warp::body::json())
+}
+
 async fn search(
     index_id_patterns: Vec<String>,
     search_request: SearchRequestQueryString,
@@ -325,6 +363,22 @@ async fn search(
     info!(request =? search_request, "search");
     let body_format = search_request.format;
     let result = search_endpoint(index_id_patterns, search_request, &*search_service).await;
+    into_rest_api_response(result, body_format)
+}
+
+async fn search_plan(
+    index_id_patterns: Vec<String>,
+    search_request: SearchRequestQueryString,
+    search_service: Arc<dyn SearchService>,
+) -> impl warp::Reply {
+    let body_format = search_request.format;
+    let result: Result<SearchPlanResponseRest, SearchError> = async {
+        let plan_request = search_request_from_api_request(index_id_patterns, search_request)?;
+        let plan_response = search_service.search_plan(plan_request).await?;
+        let response = serde_json::from_str(&plan_response.result)?;
+        Ok(response)
+    }
+    .await;
     into_rest_api_response(result, body_format)
 }
 
@@ -397,6 +451,52 @@ pub fn search_stream_handler(
         .then(search_stream)
 }
 
+#[utoipa::path(
+    get,
+    tag = "Search",
+    path = "/{index_id}/search-plan",
+    responses(
+        (status = 200, description = "Metadata about how a request would be executed.", body = SearchPlanResponseRest)
+    ),
+    params(
+        SearchRequestQueryString,
+        ("index_id" = String, Path, description = "The index ID to search."),
+    )
+)]
+/// Plan Query (GET Variant)
+///
+/// Parses the search request from the request query string.
+pub fn search_plan_get_handler(
+    search_service: Arc<dyn SearchService>,
+) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
+    search_plan_get_filter()
+        .and(with_arg(search_service))
+        .then(search_plan)
+}
+
+#[utoipa::path(
+    post,
+    tag = "Search",
+    path = "/{index_id}/search-plan",
+    request_body = SearchRequestQueryString,
+    responses(
+        (status = 200, description = "Metadata about how a request would be executed.", body = SearchPlanResponseRest)
+    ),
+    params(
+        ("index_id" = String, Path, description = "The index ID to search."),
+    )
+)]
+/// Plan Query (POST Variant)
+///
+/// Parses the search request from the request body.
+pub fn search_plan_post_handler(
+    search_service: Arc<dyn SearchService>,
+) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
+    search_plan_post_filter()
+        .and(with_arg(search_service))
+        .then(search_plan)
+}
+
 /// This struct represents the search stream query passed to
 /// the REST API.
 #[derive(Deserialize, Debug, Eq, PartialEq, utoipa::IntoParams)]
@@ -431,7 +531,7 @@ struct SearchStreamRequestQueryString {
 }
 
 async fn search_stream_endpoint(
-    index_id: String,
+    index_id: IndexId,
     search_request: SearchStreamRequestQueryString,
     search_service: &dyn SearchService,
 ) -> Result<hyper::Body, SearchError> {
@@ -489,16 +589,16 @@ fn make_streaming_reply(result: Result<hyper::Body, SearchError>) -> impl Reply 
             status_code = StatusCode::OK;
             warp::reply::Response::new(body)
         }
-        Err(err) => {
-            status_code = err.error_code().to_http_status_code();
-            warp::reply::Response::new(hyper::Body::from(err.to_string()))
+        Err(error) => {
+            status_code = error.error_code().http_status_code();
+            warp::reply::Response::new(hyper::Body::from(error.to_string()))
         }
     };
     reply::with_status(body, status_code)
 }
 
 async fn search_stream(
-    index_id: String,
+    index_id: IndexId,
     request: SearchStreamRequestQueryString,
     search_service: Arc<dyn SearchService>,
 ) -> impl warp::Reply {
@@ -536,7 +636,9 @@ mod tests {
         let mock_search_service_in_arc = Arc::new(mock_search_service);
         search_get_handler(mock_search_service_in_arc.clone())
             .or(search_post_handler(mock_search_service_in_arc.clone()))
-            .or(search_stream_handler(mock_search_service_in_arc))
+            .or(search_stream_handler(mock_search_service_in_arc.clone()))
+            .or(search_plan_get_handler(mock_search_service_in_arc.clone()))
+            .or(search_plan_post_handler(mock_search_service_in_arc.clone()))
             .recover(recover_fn)
     }
 
@@ -1253,15 +1355,7 @@ mod tests {
                 .path("/abc!/search?query=*")
                 .reply(&rest_search_api_handler)
                 .await;
-            println!("{:?}", response.body());
-            assert_eq!(
-                warp::test::request()
-                    .path("/abc!/search?query=*")
-                    .reply(&rest_search_api_handler)
-                    .await
-                    .status(),
-                400
-            );
+            assert_eq!(response.status(), 400);
         }
     }
 }

@@ -35,7 +35,6 @@ Some of those parameters can be omitted. The following PostgreSQL URIs are for i
 postgres://localhost/mydb
 postgres://user@localhost
 postgres://user:secret@localhost
-postgres://host1:123,host2:456/mydb
 ```
 
 The database has to be created in advance.
@@ -65,7 +64,11 @@ By default, the File-Backed Metastore is only read once when you start a Quickwi
 
 You can also configure it to poll the File-Backed Metastore periodically to keep a fresh view of it. This is useful for a Searcher instance that needs to be aware of new splits published by an Indexer running in parallel.
 
-To configure the polling interval (in seconds only), add a URI fragment to the storage URI like this: `s3://quickwit/my-indexes#polling_interval=30s`
+To configure the polling interval (in seconds), add a URI fragment to the storage URI as follows: `s3://quickwit/my-indexes#polling_interval=30s`
+
+:::note
+The polling interval can be configured in seconds only; other units, such as minutes or hours, are not supported.
+:::
 
 :::tip
 Amazon S3 charges $0.0004 per 1000 GET requests. Polling a metastore every 30 seconds costs $0.04 per month and index.

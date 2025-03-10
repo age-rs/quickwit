@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::mem;
 
@@ -28,8 +23,8 @@ use utoipa::openapi::Tag;
 use utoipa::OpenApi;
 
 use crate::cluster_api::ClusterApi;
-use crate::debugging_api::DebugApi;
 use crate::delete_task_api::DeleteTaskApi;
+use crate::developer_api::DeveloperApi;
 use crate::elasticsearch_api::ElasticCompatibleApi;
 use crate::health_check_api::HealthCheckApi;
 use crate::index_api::IndexApi;
@@ -38,6 +33,7 @@ use crate::ingest_api::{IngestApi, IngestApiSchemas};
 use crate::jaeger_api::JaegerApi;
 use crate::metrics_api::MetricsApi;
 use crate::node_info_handler::NodeInfoApi;
+use crate::otlp_api::OtlpApi;
 use crate::search_api::SearchApi;
 use crate::template_api::IndexTemplateApi;
 
@@ -78,25 +74,28 @@ pub fn build_docs() -> utoipa::openapi::OpenApi {
         Tag::new("Indexing"),
         Tag::new("Splits"),
         Tag::new("Jaeger"),
-        Tag::new("Debugging"),
+        Tag::new("Open Telemetry"),
+        Tag::new("Debug"),
     ];
     docs_base.tags = Some(tags);
 
     // Routing
-    docs_base.merge_components_and_paths(HealthCheckApi::openapi().with_path_prefix("/health"));
-    docs_base.merge_components_and_paths(MetricsApi::openapi().with_path_prefix("/metrics"));
-    docs_base.merge_components_and_paths(DebugApi::openapi().with_path_prefix("/debugging"));
     docs_base.merge_components_and_paths(ClusterApi::openapi().with_path_prefix("/api/v1"));
     docs_base.merge_components_and_paths(DeleteTaskApi::openapi().with_path_prefix("/api/v1"));
-    docs_base.merge_components_and_paths(IndexApi::openapi().with_path_prefix("/api/v1"));
-    docs_base.merge_components_and_paths(IndexingApi::openapi().with_path_prefix("/api/v1"));
-    docs_base.merge_components_and_paths(IngestApi::openapi().with_path_prefix("/api/v1"));
-    docs_base.merge_components_and_paths(SearchApi::openapi().with_path_prefix("/api/v1"));
+    docs_base
+        .merge_components_and_paths(DeveloperApi::openapi().with_path_prefix("/api/developer"));
     docs_base
         .merge_components_and_paths(ElasticCompatibleApi::openapi().with_path_prefix("/api/v1"));
-    docs_base.merge_components_and_paths(NodeInfoApi::openapi().with_path_prefix("/api/v1"));
-    docs_base.merge_components_and_paths(JaegerApi::openapi().with_path_prefix("/api/v1"));
+    docs_base.merge_components_and_paths(OtlpApi::openapi().with_path_prefix("/api/v1"));
+    docs_base.merge_components_and_paths(HealthCheckApi::openapi().with_path_prefix("/health"));
+    docs_base.merge_components_and_paths(IndexApi::openapi().with_path_prefix("/api/v1"));
+    docs_base.merge_components_and_paths(IndexingApi::openapi().with_path_prefix("/api/v1"));
     docs_base.merge_components_and_paths(IndexTemplateApi::openapi().with_path_prefix("/api/v1"));
+    docs_base.merge_components_and_paths(IngestApi::openapi().with_path_prefix("/api/v1"));
+    docs_base.merge_components_and_paths(JaegerApi::openapi().with_path_prefix("/api/v1"));
+    docs_base.merge_components_and_paths(MetricsApi::openapi().with_path_prefix("/metrics"));
+    docs_base.merge_components_and_paths(NodeInfoApi::openapi().with_path_prefix("/api/v1"));
+    docs_base.merge_components_and_paths(SearchApi::openapi().with_path_prefix("/api/v1"));
 
     // Schemas
     docs_base.merge_components_and_paths(MetastoreApiSchemas::openapi());

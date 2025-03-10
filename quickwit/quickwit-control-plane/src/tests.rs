@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -34,7 +29,7 @@ use quickwit_indexing::IndexingService;
 use quickwit_metastore::{IndexMetadata, ListIndexesMetadataResponseExt};
 use quickwit_proto::indexing::{ApplyIndexingPlanRequest, CpuCapacity, IndexingServiceClient};
 use quickwit_proto::metastore::{
-    ListIndexesMetadataResponse, ListShardsResponse, MetastoreServiceClient,
+    ListIndexesMetadataResponse, ListShardsResponse, MetastoreServiceClient, MockMetastoreService,
 };
 use quickwit_proto::types::NodeId;
 use serde_json::json;
@@ -43,18 +38,15 @@ use crate::control_plane::{ControlPlane, CONTROL_PLAN_LOOP_INTERVAL};
 use crate::indexing_scheduler::MIN_DURATION_BETWEEN_SCHEDULING;
 use crate::IndexerNodeInfo;
 
-fn index_metadata_for_test(
-    index_id: &str,
-    source_id: &str,
-    desired_num_pipelines: usize,
-    max_num_pipelines_per_indexer: usize,
-) -> IndexMetadata {
+fn index_metadata_for_test(index_id: &str, source_id: &str, num_pipelines: usize) -> IndexMetadata {
     let mut index_metadata = IndexMetadata::for_test(index_id, "ram://indexes/test-index");
-    let source_config = SourceConfig {
+    let ingest_source_config = SourceConfig::ingest_v2();
+    index_metadata.add_source(ingest_source_config).unwrap();
+
+    let kafka_source_config = SourceConfig {
         enabled: true,
         source_id: source_id.to_string(),
-        max_num_pipelines_per_indexer: NonZeroUsize::new(max_num_pipelines_per_indexer).unwrap(),
-        desired_num_pipelines: NonZeroUsize::new(desired_num_pipelines).unwrap(),
+        num_pipelines: NonZeroUsize::new(num_pipelines).unwrap(),
         source_params: SourceParams::Kafka(KafkaSourceParams {
             topic: "topic".to_string(),
             client_log_level: None,
@@ -66,16 +58,14 @@ fn index_metadata_for_test(
         transform_config: None,
         input_format: SourceInputFormat::Json,
     };
-    index_metadata
-        .sources
-        .insert(source_id.to_string(), source_config);
+    index_metadata.add_source(kafka_source_config).unwrap();
     index_metadata
 }
 
 pub fn test_indexer_change_stream(
     cluster_change_stream: impl Stream<Item = ClusterChange> + Send + 'static,
-    indexing_clients: FnvHashMap<String, Mailbox<IndexingService>>,
-) -> impl Stream<Item = Change<String, IndexerNodeInfo>> + Send + 'static {
+    indexing_clients: FnvHashMap<NodeId, Mailbox<IndexingService>>,
+) -> impl Stream<Item = Change<NodeId, IndexerNodeInfo>> + Send + 'static {
     cluster_change_stream.filter_map(move |cluster_change| {
         let indexing_clients = indexing_clients.clone();
         Box::pin(async move {
@@ -83,23 +73,24 @@ pub fn test_indexer_change_stream(
                 ClusterChange::Add(node)
                     if node.enabled_services().contains(&QuickwitService::Indexer) =>
                 {
-                    let node_id = node.node_id().to_string();
+                    let node_id = node.node_id().to_owned();
                     let generation_id = node.chitchat_id().generation_id;
                     let indexing_tasks = node.indexing_tasks().to_vec();
                     let client_mailbox = indexing_clients.get(&node_id).unwrap().clone();
                     let client = IndexingServiceClient::from_mailbox(client_mailbox);
-                    Some(Change::Insert(
+                    let change = Change::Insert(
                         node_id.clone(),
                         IndexerNodeInfo {
-                            node_id: NodeId::from(node_id),
+                            node_id,
                             generation_id,
                             client,
                             indexing_tasks,
                             indexing_capacity: CpuCapacity::from_cpu_millis(4_000),
                         },
-                    ))
+                    );
+                    Some(change)
                 }
-                ClusterChange::Remove(node) => Some(Change::Remove(node.node_id().to_string())),
+                ClusterChange::Remove(node) => Some(Change::Remove(node.node_id().to_owned())),
                 _ => None,
             }
         })
@@ -115,17 +106,17 @@ async fn start_control_plane(
     let source_1 = "source-1";
     let index_2 = "test-indexing-plan-2";
     let source_2 = "source-2";
-    let index_metadata_1 = index_metadata_for_test(index_1, source_1, 2, 2);
-    let mut index_metadata_2 = index_metadata_for_test(index_2, source_2, 1, 1);
+    let index_metadata_1 = index_metadata_for_test(index_1, source_1, 2);
+    let mut index_metadata_2 = index_metadata_for_test(index_2, source_2, 1);
     index_metadata_2.create_timestamp = index_metadata_1.create_timestamp + 1;
-    let mut metastore = MetastoreServiceClient::mock();
-    metastore.expect_list_indexes_metadata().returning(
+    let mut mock_metastore = MockMetastoreService::new();
+    mock_metastore.expect_list_indexes_metadata().returning(
         move |_list_indexes_request: quickwit_proto::metastore::ListIndexesMetadataRequest| {
             let indexes_metadata = vec![index_metadata_2.clone(), index_metadata_1.clone()];
-            Ok(ListIndexesMetadataResponse::try_from_indexes_metadata(indexes_metadata).unwrap())
+            Ok(ListIndexesMetadataResponse::for_test(indexes_metadata))
         },
     );
-    metastore.expect_list_shards().returning(|_| {
+    mock_metastore.expect_list_shards().returning(|_| {
         Ok(ListShardsResponse {
             subresponses: Vec::new(),
         })
@@ -138,7 +129,7 @@ async fn start_control_plane(
 
     for indexer in indexers {
         let (indexing_service_mailbox, indexing_service_inbox) = universe.create_test_mailbox();
-        indexing_clients.insert(indexer.self_node_id().to_string(), indexing_service_mailbox);
+        indexing_clients.insert(indexer.self_node_id().to_owned(), indexing_service_mailbox);
         indexer_inboxes.push(indexing_service_inbox);
     }
     let indexer_change_stream =
@@ -148,15 +139,15 @@ async fn start_control_plane(
     let mut cluster_config = ClusterConfig::for_test();
     cluster_config.cluster_id = cluster.cluster_id().to_string();
 
-    let self_node_id: NodeId = cluster.self_node_id().to_string().into();
-    let (control_plane_mailbox, _control_plane_handle) = ControlPlane::spawn(
+    let self_node_id = cluster.self_node_id().to_owned();
+    let (control_plane_mailbox, _control_plane_handle, _is_ready_rx) = ControlPlane::spawn(
         universe,
         cluster_config,
         self_node_id,
         cluster,
         indexer_pool,
         ingester_pool,
-        MetastoreServiceClient::from(metastore),
+        MetastoreServiceClient::from_mock(mock_metastore),
     );
 
     (indexer_inboxes, control_plane_mailbox)
@@ -226,8 +217,7 @@ async fn test_scheduler_scheduling_and_control_loop_apply_plan_again() {
     // `ApplyIndexingPlanRequest`.
     cluster
         .update_self_node_indexing_tasks(&indexing_tasks)
-        .await
-        .unwrap();
+        .await;
     let scheduler_state = control_plane_mailbox
         .ask(Observe)
         .await
@@ -242,8 +232,7 @@ async fn test_scheduler_scheduling_and_control_loop_apply_plan_again() {
     // receive a new `ApplyIndexingPlanRequest`.
     cluster
         .update_self_node_indexing_tasks(&[indexing_tasks[0].clone()])
-        .await
-        .unwrap();
+        .await;
     tokio::time::sleep(MIN_DURATION_BETWEEN_SCHEDULING.mul_f32(1.2)).await;
     let scheduler_state = control_plane_mailbox
         .ask(Observe)
@@ -382,12 +371,10 @@ async fn test_scheduler_scheduling_multiple_indexers() {
     assert_eq!(indexing_service_inbox_messages_2.len(), 1);
     cluster_indexer_1
         .update_self_node_indexing_tasks(&indexing_service_inbox_messages_1[0].indexing_tasks)
-        .await
-        .unwrap();
+        .await;
     cluster_indexer_2
         .update_self_node_indexing_tasks(&indexing_service_inbox_messages_2[0].indexing_tasks)
-        .await
-        .unwrap();
+        .await;
 
     // Wait 2 CONTROL_PLAN_LOOP_INTERVAL again and check the scheduler will not apply the plan
     // several times.

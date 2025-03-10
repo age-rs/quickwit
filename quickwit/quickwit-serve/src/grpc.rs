@@ -1,59 +1,83 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
+use std::error::Error;
 use std::sync::Arc;
 
-use bytesize::ByteSize;
+use anyhow::Context;
 use quickwit_cluster::cluster_grpc_server;
 use quickwit_common::tower::BoxFutureInfaillible;
 use quickwit_config::service::QuickwitService;
+use quickwit_config::GrpcConfig;
+use quickwit_proto::developer::DeveloperServiceClient;
 use quickwit_proto::indexing::IndexingServiceClient;
 use quickwit_proto::jaeger::storage::v1::span_reader_plugin_server::SpanReaderPluginServer;
 use quickwit_proto::opentelemetry::proto::collector::logs::v1::logs_service_server::LogsServiceServer;
 use quickwit_proto::opentelemetry::proto::collector::trace::v1::trace_service_server::TraceServiceServer;
 use quickwit_proto::search::search_service_server::SearchServiceServer;
 use quickwit_proto::tonic::codegen::CompressionEncoding;
-use quickwit_proto::tonic::transport::Server;
+use quickwit_proto::tonic::transport::server::TcpIncoming;
+use quickwit_proto::tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tokio::net::TcpListener;
+use tonic_reflection::server::{ServerReflection, ServerReflectionServer};
 use tracing::*;
 
+use crate::developer_api::DeveloperApiServer;
 use crate::search_api::GrpcSearchAdapter;
 use crate::{QuickwitServices, INDEXING_GRPC_SERVER_METRICS_LAYER};
 
 /// Starts and binds gRPC services to `grpc_listen_addr`.
 pub(crate) async fn start_grpc_server(
-    grpc_listen_addr: SocketAddr,
-    max_message_size: ByteSize,
+    tcp_listener: TcpListener,
+    grpc_config: GrpcConfig,
     services: Arc<QuickwitServices>,
     readiness_trigger: BoxFutureInfaillible<()>,
     shutdown_signal: BoxFutureInfaillible<()>,
 ) -> anyhow::Result<()> {
     let mut enabled_grpc_services = BTreeSet::new();
+    let mut file_descriptor_sets = Vec::new();
     let mut server = Server::builder();
 
+    if let Some(tls_config) = grpc_config.tls {
+        let cert = std::fs::read_to_string(tls_config.cert_path)?;
+        let key = std::fs::read_to_string(tls_config.key_path)?;
+        let identity = Identity::from_pem(cert, key);
+
+        let mut tls = ServerTlsConfig::new().identity(identity);
+
+        if tls_config.validate_client {
+            let ca_cert = std::fs::read_to_string(tls_config.ca_path)?;
+            let ca_cert = Certificate::from_pem(ca_cert);
+            tls = tls.client_ca_root(ca_cert);
+        }
+        // TODO using this builtin method means we have no way of hot-reloading certificates
+        // (i.e. the process must be restarted every time its certificate expires)
+        // to do better, we'd need to wra the TcpListener with something that does (m)TLS
+        // and that we control, however it would be somewhat painful, and more error prone
+        server = server.tls_config(tls)?;
+    }
+
     let cluster_grpc_service = cluster_grpc_server(services.cluster.clone());
+    file_descriptor_sets.push(quickwit_proto::cluster::CLUSTER_PLANE_FILE_DESCRIPTOR_SET);
 
     // Mount gRPC metastore service if `QuickwitService::Metastore` is enabled on node.
     let metastore_grpc_service = if let Some(metastore_server) = &services.metastore_server_opt {
         enabled_grpc_services.insert("metastore");
-        Some(metastore_server.as_grpc_service(max_message_size))
+        file_descriptor_sets.push(quickwit_proto::metastore::METASTORE_FILE_DESCRIPTOR_SET);
+
+        Some(metastore_server.as_grpc_service(grpc_config.max_message_size))
     } else {
         None
     };
@@ -64,10 +88,12 @@ pub(crate) async fn start_grpc_server(
     {
         if let Some(indexing_service) = services.indexing_service_opt.clone() {
             enabled_grpc_services.insert("indexing");
+            file_descriptor_sets.push(quickwit_proto::indexing::INDEXING_FILE_DESCRIPTOR_SET);
+
             let indexing_service = IndexingServiceClient::tower()
                 .stack_layer(INDEXING_GRPC_SERVER_METRICS_LAYER.clone())
                 .build_from_mailbox(indexing_service);
-            Some(indexing_service.as_grpc_service(max_message_size))
+            Some(indexing_service.as_grpc_service(grpc_config.max_message_size))
         } else {
             None
         }
@@ -80,7 +106,11 @@ pub(crate) async fn start_grpc_server(
         .is_service_enabled(QuickwitService::Indexer)
     {
         enabled_grpc_services.insert("ingest-api");
-        Some(services.ingest_service.as_grpc_service(max_message_size))
+        Some(
+            services
+                .ingest_service
+                .as_grpc_service(grpc_config.max_message_size),
+        )
     } else {
         None
     };
@@ -89,36 +119,35 @@ pub(crate) async fn start_grpc_server(
         .is_service_enabled(QuickwitService::Indexer)
     {
         enabled_grpc_services.insert("ingest-router");
-        Some(
-            services
-                .ingest_router_service
-                .as_grpc_service(max_message_size),
-        )
+
+        let ingest_router_service = services
+            .ingest_router_service
+            .as_grpc_service(grpc_config.max_message_size);
+        Some(ingest_router_service)
     } else {
         None
     };
-    let ingester_grpc_service = if services
-        .node_config
-        .is_service_enabled(QuickwitService::Indexer)
-    {
+
+    let ingester_grpc_service = if let Some(ingester_service) = services.ingester_service() {
         enabled_grpc_services.insert("ingester");
-        services
-            .ingester_service_opt
-            .as_ref()
-            .map(|ingester_service| ingester_service.as_grpc_service(max_message_size))
+        file_descriptor_sets.push(quickwit_proto::ingest::INGEST_FILE_DESCRIPTOR_SET);
+        Some(ingester_service.as_grpc_service(grpc_config.max_message_size))
     } else {
         None
     };
+
     // Mount gRPC control plane service if `QuickwitService::ControlPlane` is enabled on node.
     let control_plane_grpc_service = if services
         .node_config
         .is_service_enabled(QuickwitService::ControlPlane)
     {
         enabled_grpc_services.insert("control-plane");
+        file_descriptor_sets.push(quickwit_proto::control_plane::CONTROL_PLANE_FILE_DESCRIPTOR_SET);
+
         Some(
             services
-                .control_plane_service
-                .as_grpc_service(max_message_size),
+                .control_plane_client
+                .as_grpc_service(grpc_config.max_message_size),
         )
     } else {
         None
@@ -148,12 +177,14 @@ pub(crate) async fn start_grpc_server(
         .is_service_enabled(QuickwitService::Searcher)
     {
         enabled_grpc_services.insert("search");
+        file_descriptor_sets.push(quickwit_proto::search::SEARCH_FILE_DESCRIPTOR_SET);
+
         let search_service = services.search_service.clone();
         let grpc_search_service = GrpcSearchAdapter::from(search_service);
         Some(
             SearchServiceServer::new(grpc_search_service)
-                .max_decoding_message_size(max_message_size.0 as usize)
-                .max_encoding_message_size(max_message_size.0 as usize),
+                .max_decoding_message_size(grpc_config.max_message_size.0 as usize)
+                .max_encoding_message_size(grpc_config.max_message_size.0 as usize),
         )
     } else {
         None
@@ -166,8 +197,21 @@ pub(crate) async fn start_grpc_server(
     } else {
         None
     };
+    let developer_grpc_service = {
+        enabled_grpc_services.insert("developer");
+        file_descriptor_sets.push(quickwit_proto::developer::DEVELOPER_FILE_DESCRIPTOR_SET);
+
+        let developer_service = DeveloperApiServer::from_services(&services);
+
+        DeveloperServiceClient::new(developer_service)
+            .as_grpc_service(DeveloperApiServer::MAX_GRPC_MESSAGE_SIZE)
+    };
+    let reflection_service = build_reflection_service(&file_descriptor_sets)?;
+
     let server_router = server
         .add_service(cluster_grpc_service)
+        .add_service(developer_grpc_service)
+        .add_service(reflection_service)
         .add_optional_service(control_plane_grpc_service)
         .add_optional_service(indexing_grpc_service)
         .add_optional_service(ingest_api_grpc_service)
@@ -179,13 +223,30 @@ pub(crate) async fn start_grpc_server(
         .add_optional_service(otlp_trace_grpc_service)
         .add_optional_service(search_grpc_service);
 
+    let grpc_listen_addr = tcp_listener.local_addr()?;
     info!(
         enabled_grpc_services=?enabled_grpc_services,
         grpc_listen_addr=?grpc_listen_addr,
-        "Starting gRPC server listening on {grpc_listen_addr}."
+        "starting gRPC server listening on {grpc_listen_addr}"
     );
-    let serve_fut = server_router.serve_with_shutdown(grpc_listen_addr, shutdown_signal);
+    // nodelay=true and keepalive=None are the default values for Server::builder()
+    let tcp_incoming = TcpIncoming::from_listener(tcp_listener, true, None)
+        .map_err(|err: Box<dyn Error + Send + Sync>| anyhow::anyhow!(err))?;
+    let serve_fut = server_router.serve_with_incoming_shutdown(tcp_incoming, shutdown_signal);
     let (serve_res, _trigger_res) = tokio::join!(serve_fut, readiness_trigger);
     serve_res?;
     Ok(())
+}
+
+fn build_reflection_service(
+    file_descriptor_sets: &[&[u8]],
+) -> anyhow::Result<ServerReflectionServer<impl ServerReflection>> {
+    let mut builder = tonic_reflection::server::Builder::configure();
+
+    for file_descriptor_set in file_descriptor_sets {
+        builder = builder.register_encoded_file_descriptor_set(file_descriptor_set)
+    }
+    builder
+        .build()
+        .context("failed to build reflection service")
 }

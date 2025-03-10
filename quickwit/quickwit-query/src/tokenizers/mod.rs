@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 mod chinese_compatible;
 mod code_tokenizer;
@@ -46,6 +41,12 @@ pub fn create_default_quickwit_tokenizer_manager() -> TokenizerManager {
         .build();
     tokenizer_manager.register("raw", raw_tokenizer, false);
 
+    let raw_tokenizer = TextAnalyzer::builder(RawTokenizer::default())
+        .filter(LowerCaser)
+        .filter(RemoveLongFilter::limit(DEFAULT_REMOVE_TOKEN_LENGTH))
+        .build();
+    tokenizer_manager.register("raw_lowercase", raw_tokenizer, true);
+
     let lower_case_tokenizer = TextAnalyzer::builder(RawTokenizer::default())
         .filter(LowerCaser)
         .filter(RemoveLongFilter::limit(DEFAULT_REMOVE_TOKEN_LENGTH))
@@ -71,10 +72,19 @@ pub fn create_default_quickwit_tokenizer_manager() -> TokenizerManager {
         .filter(RemoveLongFilter::limit(DEFAULT_REMOVE_TOKEN_LENGTH))
         .filter(LowerCaser)
         .build();
-    tokenizer_manager.register("chinese_compatible", chinese_tokenizer, false);
+    tokenizer_manager.register("chinese_compatible", chinese_tokenizer, true);
     tokenizer_manager.register(
         "source_code_default",
         TextAnalyzer::builder(CodeTokenizer::default())
+            .filter(RemoveLongFilter::limit(DEFAULT_REMOVE_TOKEN_LENGTH))
+            .filter(LowerCaser)
+            .filter(AsciiFoldingFilter)
+            .build(),
+        true,
+    );
+    tokenizer_manager.register(
+        "source_code_with_hex",
+        TextAnalyzer::builder(CodeTokenizer::with_hex_support())
             .filter(RemoveLongFilter::limit(DEFAULT_REMOVE_TOKEN_LENGTH))
             .filter(LowerCaser)
             .filter(AsciiFoldingFilter)
@@ -159,5 +169,21 @@ mod tests {
             tokens.push(token.text.to_string());
         }
         assert_eq!(tokens, vec!["pig", "cafe", "factory", "2"])
+    }
+
+    #[test]
+    fn test_raw_lowercase_tokenizer() {
+        let tokenizer_manager = super::create_default_quickwit_tokenizer_manager();
+        let my_long_text = "a text, that is just too long, no one will type it, no one will like \
+                            it, no one shall find it. I just need some more chars, now you may \
+                            not pass.";
+
+        let mut tokenizer = tokenizer_manager.get_tokenizer("raw_lowercase").unwrap();
+        let mut stream = tokenizer.token_stream(my_long_text);
+        assert!(stream.advance());
+        assert_eq!(stream.token().text.len(), my_long_text.len());
+        // there are non letter, so we can't check for all lowercase directly
+        assert!(stream.token().text.chars().all(|c| !c.is_uppercase()));
+        assert!(!stream.advance());
     }
 }

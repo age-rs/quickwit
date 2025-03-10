@@ -1,32 +1,30 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt;
 
 use bytes::Bytes;
+use quickwit_common::metrics::{GaugeGuard, MEMORY_METRICS};
 use quickwit_metastore::checkpoint::SourceCheckpointDelta;
 
-#[derive(Default)]
 pub struct RawDocBatch {
+    // Do not directly append documents to this vector; otherwise, in-flight metrics will be
+    // incorrect.
     pub docs: Vec<Bytes>,
     pub checkpoint_delta: SourceCheckpointDelta,
     pub force_commit: bool,
+    _gauge_guard: GaugeGuard<'static>,
 }
 
 impl RawDocBatch {
@@ -35,38 +33,24 @@ impl RawDocBatch {
         checkpoint_delta: SourceCheckpointDelta,
         force_commit: bool,
     ) -> Self {
+        let delta = docs.iter().map(|doc| doc.len() as i64).sum::<i64>();
+        let mut gauge_guard =
+            GaugeGuard::from_gauge(&MEMORY_METRICS.in_flight.doc_processor_mailbox);
+        gauge_guard.add(delta);
+
         Self {
             docs,
             checkpoint_delta,
             force_commit,
+            _gauge_guard: gauge_guard,
         }
     }
 
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            docs: Vec::with_capacity(capacity),
-            checkpoint_delta: SourceCheckpointDelta::default(),
-            force_commit: false,
-        }
-    }
-
-    pub fn num_docs(&self) -> usize {
-        self.docs.len()
-    }
-
-    #[cfg(any(test, feature = "testsuite"))]
-    pub fn for_test(docs: &[&str], range: std::ops::Range<u64>) -> Self {
-        let docs = docs
-            .iter()
-            .map(|doc| Bytes::from(doc.to_string()))
-            .collect();
+    #[cfg(test)]
+    pub fn for_test(docs: &[&[u8]], range: std::ops::Range<u64>) -> Self {
+        let docs = docs.iter().map(|doc| Bytes::from(doc.to_vec())).collect();
         let checkpoint_delta = SourceCheckpointDelta::from_range(range);
-
-        Self {
-            docs,
-            checkpoint_delta,
-            force_commit: false,
-        }
+        Self::new(docs, checkpoint_delta, false)
     }
 }
 
@@ -74,9 +58,21 @@ impl fmt::Debug for RawDocBatch {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         formatter
             .debug_struct("RawDocBatch")
-            .field("num_docs", &self.num_docs())
+            .field("num_docs", &self.docs.len())
             .field("checkpoint_delta", &self.checkpoint_delta)
             .field("force_commit", &self.force_commit)
             .finish()
+    }
+}
+
+impl Default for RawDocBatch {
+    fn default() -> Self {
+        let _gauge_guard = GaugeGuard::from_gauge(&MEMORY_METRICS.in_flight.doc_processor_mailbox);
+        Self {
+            docs: Vec::new(),
+            checkpoint_delta: SourceCheckpointDelta::default(),
+            force_commit: false,
+            _gauge_guard,
+        }
     }
 }

@@ -1,28 +1,23 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use crate::not_nan_f32::NotNaNf32;
 use crate::query_ast::field_presence::FieldPresenceQuery;
 use crate::query_ast::user_input_query::UserInputQuery;
 use crate::query_ast::{
-    BoolQuery, FullTextQuery, PhrasePrefixQuery, QueryAst, RangeQuery, TermQuery, TermSetQuery,
-    WildcardQuery,
+    BoolQuery, FullTextQuery, PhrasePrefixQuery, QueryAst, RangeQuery, RegexQuery, TermQuery,
+    TermSetQuery, WildcardQuery,
 };
 
 /// Simple trait to implement a Visitor over the QueryAst.
@@ -45,6 +40,7 @@ pub trait QueryAstVisitor<'a> {
             QueryAst::UserInput(user_text_query) => self.visit_user_text(user_text_query),
             QueryAst::FieldPresence(exists) => self.visit_exists(exists),
             QueryAst::Wildcard(wildcard) => self.visit_wildcard(wildcard),
+            QueryAst::Regex(regex) => self.visit_regex(regex),
         }
     }
 
@@ -110,5 +106,134 @@ pub trait QueryAstVisitor<'a> {
 
     fn visit_wildcard(&mut self, _wildcard_query: &'a WildcardQuery) -> Result<(), Self::Err> {
         Ok(())
+    }
+
+    fn visit_regex(&mut self, _regex_query: &'a RegexQuery) -> Result<(), Self::Err> {
+        Ok(())
+    }
+}
+
+/// Simple trait to implement a Visitor over the QueryAst.
+pub trait QueryAstTransformer {
+    type Err;
+
+    fn transform(&mut self, query_ast: QueryAst) -> Result<Option<QueryAst>, Self::Err> {
+        match query_ast {
+            QueryAst::Bool(bool_query) => self.transform_bool(bool_query),
+            QueryAst::Term(term_query) => self.transform_term(term_query),
+            QueryAst::TermSet(term_set_query) => self.transform_term_set(term_set_query),
+            QueryAst::FullText(full_text_query) => self.transform_full_text(full_text_query),
+            QueryAst::PhrasePrefix(phrase_prefix_query) => {
+                self.transform_phrase_prefix(phrase_prefix_query)
+            }
+            QueryAst::Range(range_query) => self.transform_range(range_query),
+            QueryAst::MatchAll => self.transform_match_all(),
+            QueryAst::MatchNone => self.transform_match_none(),
+            QueryAst::Boost { underlying, boost } => self.transform_boost(*underlying, boost),
+            QueryAst::UserInput(user_text_query) => self.transform_user_text(user_text_query),
+            QueryAst::FieldPresence(exists) => self.transform_exists(exists),
+            QueryAst::Wildcard(wildcard) => self.transform_wildcard(wildcard),
+            QueryAst::Regex(regex) => self.transform_regex(regex),
+        }
+    }
+
+    fn transform_bool(&mut self, mut bool_query: BoolQuery) -> Result<Option<QueryAst>, Self::Err> {
+        bool_query.must = bool_query
+            .must
+            .into_iter()
+            .filter_map(|query_ast| self.transform(query_ast).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        bool_query.should = bool_query
+            .should
+            .into_iter()
+            .filter_map(|query_ast| self.transform(query_ast).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        bool_query.must_not = bool_query
+            .must_not
+            .into_iter()
+            .filter_map(|query_ast| self.transform(query_ast).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        bool_query.filter = bool_query
+            .filter
+            .into_iter()
+            .filter_map(|query_ast| self.transform(query_ast).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Some(QueryAst::Bool(bool_query)))
+    }
+
+    fn transform_term(&mut self, term_query: TermQuery) -> Result<Option<QueryAst>, Self::Err> {
+        Ok(Some(QueryAst::Term(term_query)))
+    }
+
+    fn transform_term_set(
+        &mut self,
+        term_set: TermSetQuery,
+    ) -> Result<Option<QueryAst>, Self::Err> {
+        Ok(Some(QueryAst::TermSet(term_set)))
+    }
+
+    fn transform_full_text(
+        &mut self,
+        full_text: FullTextQuery,
+    ) -> Result<Option<QueryAst>, Self::Err> {
+        Ok(Some(QueryAst::FullText(full_text)))
+    }
+
+    fn transform_phrase_prefix(
+        &mut self,
+        phrase_query: PhrasePrefixQuery,
+    ) -> Result<Option<QueryAst>, Self::Err> {
+        Ok(Some(QueryAst::PhrasePrefix(phrase_query)))
+    }
+
+    fn transform_match_all(&mut self) -> Result<Option<QueryAst>, Self::Err> {
+        Ok(Some(QueryAst::MatchAll))
+    }
+
+    fn transform_match_none(&mut self) -> Result<Option<QueryAst>, Self::Err> {
+        Ok(Some(QueryAst::MatchNone))
+    }
+
+    fn transform_boost(
+        &mut self,
+        underlying: QueryAst,
+        boost: NotNaNf32,
+    ) -> Result<Option<QueryAst>, Self::Err> {
+        self.transform(underlying).map(|maybe_ast| {
+            maybe_ast.map(|underlying| QueryAst::Boost {
+                underlying: Box::new(underlying),
+                boost,
+            })
+        })
+    }
+
+    fn transform_range(&mut self, range_query: RangeQuery) -> Result<Option<QueryAst>, Self::Err> {
+        Ok(Some(QueryAst::Range(range_query)))
+    }
+
+    fn transform_user_text(
+        &mut self,
+        user_text_query: UserInputQuery,
+    ) -> Result<Option<QueryAst>, Self::Err> {
+        Ok(Some(QueryAst::UserInput(user_text_query)))
+    }
+
+    fn transform_exists(
+        &mut self,
+        exists_query: FieldPresenceQuery,
+    ) -> Result<Option<QueryAst>, Self::Err> {
+        Ok(Some(QueryAst::FieldPresence(exists_query)))
+    }
+
+    fn transform_wildcard(
+        &mut self,
+        wildcard_query: WildcardQuery,
+    ) -> Result<Option<QueryAst>, Self::Err> {
+        Ok(Some(QueryAst::Wildcard(wildcard_query)))
+    }
+
+    fn transform_regex(&mut self, regex_query: RegexQuery) -> Result<Option<QueryAst>, Self::Err> {
+        Ok(Some(QueryAst::Regex(regex_query)))
     }
 }

@@ -1,27 +1,27 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use once_cell::sync::OnceCell;
+use prometheus::{Gauge, IntCounter, IntGauge};
 use tokio::runtime::Runtime;
+use tokio_metrics::{RuntimeMetrics, RuntimeMonitor};
+
+use crate::metrics::{new_counter, new_float_gauge, new_gauge};
 
 static RUNTIMES: OnceCell<HashMap<RuntimeType, tokio::runtime::Runtime>> = OnceCell::new();
 
@@ -63,7 +63,7 @@ impl RuntimesConfig {
     }
 
     pub fn with_num_cpus(num_cpus: usize) -> Self {
-        // Non blocking task are supposed to be io intensive, and  not require many threads...
+        // Non blocking task are supposed to be io intensive, and not require many threads...
         let num_threads_non_blocking = if num_cpus > 6 { 2 } else { 1 };
         // On the other hand the blocking actors are cpu intensive. We allocate
         // almost all of the threads to them.
@@ -77,14 +77,21 @@ impl RuntimesConfig {
 
 impl Default for RuntimesConfig {
     fn default() -> Self {
-        let num_cpus = num_cpus::get();
+        let num_cpus = crate::num_cpus();
         Self::with_num_cpus(num_cpus)
     }
 }
 
 fn start_runtimes(config: RuntimesConfig) -> HashMap<RuntimeType, Runtime> {
-    let mut runtimes = HashMap::default();
-    let blocking_runtime = tokio::runtime::Builder::new_multi_thread()
+    let mut runtimes = HashMap::with_capacity(2);
+
+    let disable_lifo_slot = crate::get_bool_from_env("QW_DISABLE_TOKIO_LIFO_SLOT", false);
+
+    let mut blocking_runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    if disable_lifo_slot {
+        blocking_runtime_builder.disable_lifo_slot();
+    }
+    let blocking_runtime = blocking_runtime_builder
         .worker_threads(config.num_threads_blocking)
         .thread_name_fn(|| {
             static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
@@ -94,7 +101,10 @@ fn start_runtimes(config: RuntimesConfig) -> HashMap<RuntimeType, Runtime> {
         .enable_all()
         .build()
         .unwrap();
+
+    scrape_tokio_runtime_metrics(blocking_runtime.handle(), "blocking");
     runtimes.insert(RuntimeType::Blocking, blocking_runtime);
+
     let non_blocking_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.num_threads_non_blocking)
         .thread_name_fn(|| {
@@ -105,7 +115,10 @@ fn start_runtimes(config: RuntimesConfig) -> HashMap<RuntimeType, Runtime> {
         .enable_all()
         .build()
         .unwrap();
+
+    scrape_tokio_runtime_metrics(non_blocking_runtime.handle(), "non_blocking");
     runtimes.insert(RuntimeType::NonBlocking, non_blocking_runtime);
+
     runtimes
 }
 
@@ -132,6 +145,69 @@ impl RuntimeType {
             .unwrap()
             .handle()
             .clone()
+    }
+}
+
+/// Spawns a background task
+pub fn scrape_tokio_runtime_metrics(handle: &tokio::runtime::Handle, label: &'static str) {
+    let runtime_monitor = RuntimeMonitor::new(handle);
+    handle.spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut prometheus_runtime_metrics = PrometheusRuntimeMetrics::new(label);
+
+        for tokio_runtime_metrics in runtime_monitor.intervals() {
+            interval.tick().await;
+            prometheus_runtime_metrics.update(&tokio_runtime_metrics);
+        }
+    });
+}
+
+struct PrometheusRuntimeMetrics {
+    scheduled_tasks: IntGauge,
+    worker_busy_duration_milliseconds_total: IntCounter,
+    worker_busy_ratio: Gauge,
+    worker_threads: IntGauge,
+}
+
+impl PrometheusRuntimeMetrics {
+    pub fn new(label: &'static str) -> Self {
+        Self {
+            scheduled_tasks: new_gauge(
+                "tokio_scheduled_tasks",
+                "The total number of tasks currently scheduled in workers' local queues.",
+                "runtime",
+                &[("runtime_type", label)],
+            ),
+            worker_busy_duration_milliseconds_total: new_counter(
+                "tokio_worker_busy_duration_milliseconds_total",
+                " The total amount of time worker threads were busy.",
+                "runtime",
+                &[("runtime_type", label)],
+            ),
+            worker_busy_ratio: new_float_gauge(
+                "tokio_worker_busy_ratio",
+                "The ratio of time worker threads were busy since the last time runtime metrics \
+                 were collected.",
+                "runtime",
+                &[("runtime_type", label)],
+            ),
+            worker_threads: new_gauge(
+                "tokio_worker_threads",
+                "The number of worker threads used by the runtime.",
+                "runtime",
+                &[("runtime_type", label)],
+            ),
+        }
+    }
+
+    pub fn update(&mut self, runtime_metrics: &RuntimeMetrics) {
+        self.scheduled_tasks
+            .set(runtime_metrics.total_local_queue_depth as i64);
+        self.worker_busy_duration_milliseconds_total
+            .inc_by(runtime_metrics.total_busy_duration.as_millis() as u64);
+        self.worker_busy_ratio.set(runtime_metrics.busy_ratio());
+        self.worker_threads
+            .set(runtime_metrics.workers_count as i64);
     }
 }
 

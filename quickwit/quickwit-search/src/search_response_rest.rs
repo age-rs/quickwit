@@ -1,34 +1,46 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::convert::TryFrom;
+use std::io;
 
 use quickwit_common::truncate_str;
 use quickwit_proto::search::SearchResponse;
+use quickwit_query::query_ast::QueryAst;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::error::SearchError;
 
+/// A lightweight serializable representation of aggregation results.
+///
+/// We use `serde_json_borrow` here to avoid unnecessary
+/// allocations. On large aggregation results with tens of thousands of
+/// entries this has a significant impact compared to `serde_json`.
+#[derive(Serialize, PartialEq, Debug)]
+pub struct AggregationResults(serde_json_borrow::OwnedValue);
+
+impl AggregationResults {
+    /// Parse an aggregation result form a serialized JSON string.
+    pub fn from_json(json_str: &str) -> io::Result<Self> {
+        serde_json_borrow::OwnedValue::from_str(json_str).map(Self)
+    }
+}
+
 /// SearchResponseRest represents the response returned by the REST search API
 /// and is meant to be serialized into JSON.
-#[derive(Serialize, Deserialize, PartialEq, Debug, utoipa::ToSchema)]
+#[derive(Serialize, PartialEq, Debug, utoipa::ToSchema)]
 pub struct SearchResponseRest {
     /// Overall number of documents matching the query.
     pub num_hits: u64,
@@ -46,7 +58,7 @@ pub struct SearchResponseRest {
     /// Aggregations.
     #[schema(value_type = Object)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub aggregations: Option<JsonValue>,
+    pub aggregations: Option<AggregationResults>,
 }
 
 impl TryFrom<SearchResponse> for SearchResponseRest {
@@ -83,7 +95,7 @@ impl TryFrom<SearchResponse> for SearchResponseRest {
         };
 
         let aggregations_opt = if let Some(aggregation_json) = search_response.aggregation {
-            let aggregation: JsonValue = serde_json::from_str(&aggregation_json)
+            let aggregation = AggregationResults::from_json(&aggregation_json)
                 .map_err(|err| SearchError::Internal(err.to_string()))?;
             Some(aggregation)
         } else {
@@ -99,4 +111,40 @@ impl TryFrom<SearchResponse> for SearchResponseRest {
             aggregations: aggregations_opt,
         })
     }
+}
+
+/// Details on how a query would be executed.
+#[derive(Serialize, Deserialize, PartialEq, Debug, utoipa::ToSchema)]
+pub struct SearchPlanResponseRest {
+    /// Quickwit AST of the query.
+    #[schema(value_type = Object)]
+    pub quickwit_ast: QueryAst,
+    /// Resolved Tantivy AST of the query, according to the latest docmapping.
+    ///
+    /// It's possible older splits actually resolve to a different ast.
+    pub tantivy_ast: String,
+    /// List of splits that would be searched by this query
+    pub searched_splits: Vec<String>,
+    /// Requests expected for each split
+    #[schema(value_type = Object)]
+    pub storage_requests: StorageRequestCount,
+}
+
+/// Number of expected storage requests, per request kind.
+///
+/// These figures do not take in account whether the data is already cached or not.
+#[derive(Serialize, Deserialize, PartialEq, Debug, Default)]
+pub struct StorageRequestCount {
+    /// Number of split footer downloaded, always 1
+    pub footer: usize,
+    /// Number of fastfields downloaded
+    pub fastfield: usize,
+    /// Number of fieldnorm downloaded
+    pub fieldnorm: usize,
+    /// Number of sstable downloaded
+    pub sstable: usize,
+    /// Number of posting list downloaded
+    pub posting: usize,
+    /// Number of position list downloaded
+    pub position: usize,
 }

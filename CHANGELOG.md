@@ -22,6 +22,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 --->
 
+# [0.9.0]
+
+### Added
+- Add Ingest V2 (#5600, #5566, #5463, #5375, #5350, #5252 #5202)
+- Add SQS source (#5374, #5335, #5148)
+- Disable control plane check for searcher (#5599, #5360)
+- Partially implement `_elastic/_cluster/health` (#5595)
+- Make Jaeger span attribute-to-tag conversion exhaustive (#5574)
+- Use `content_length_limit` for ES bulk limit (#5573)
+- Limit and monitor warmup memory usage (#5568)
+- Add eviction metrics to caches (#5523)
+- Record object storage request latencies (#5521)
+- Add some kind of throttling on the janitor to prevent it from overloading (#5510)
+- Prevent single split searches from different `leaf_search` from interleaving (#5509)
+- Retry on S3 internal error (#5504)
+- Allow specifying OTEL index ID in header (#5503)
+- Add a metric to count storage errors and their error code (#5497)
+- Add support for concatenated fields (#4773, #5369, #5331) 
+- Add number of splits per root/leaf search histograms (#5472)
+- Introduce a searcher config option to timeout get requests (#5467)
+- Add fingerprint to task in cluster state (#5464)
+- Enrich root/leaf search spans with number of docs and splits (#5450)
+- Add some additional search metrics (#5447)
+- Improve GC resilience and add metrics (#5420)
+- Enable force shutdown with 2nd Ctrl+C (#5414)
+- Add request_timeout_secs config to searcher config (#5402)
+- Memoize S3 client (#5377)
+- Add more env var config for Postgres (#5365)
+- Enable str fast field range queries (#5324)
+- Allow querying non-existing fields (#5308)
+- Support updating doc mapper through api (#5253) 
+- Add optional special handling for hex in code tokenizer (#5200)
+- Added a circuit breaker layer (#5134)
+- Various performance optimizations in Tantivy (https://github.com/quickwit-oss/tantivy/blob/main/CHANGELOG.md)
+
+### Changed
+- Parse datetimes and timestamps with leading and/or trailing whitespace (#5544)
+- Restrict maturity period to retention (#5543)
+- Wait for merge at end of local ingest (#5542)
+- Log PostgreSQL metastore error (#5530)
+- Update azure multipart policy (#5553)
+- Stop relying on our own version of pulsar-rs (#5487)
+- Handle nested OTLP values in attributes and log bodies (#5485)
+- Improve merge pipeline finalization (#5475)
+- Allow failed splits in root search (#5440)
+- Batch delete from GC (#5404, #5380)
+- Make some S3 errors retryable (#5384)
+- Change default timestamps in OTEL logs (#5366)
+- Only return root spans for Jaeger HTTP API (#5358)
+- Share aggregation limit on node (#5357)
+
+### Fixed
+- Fix existence queries for nested fields (#5581)
+- Fix lenient option with wildcard queries (#5575)
+- Fix incompatible ES Java date format (#5462)
+- Fix bulk api response order (#5434)
+- Fix pulsar finalize (#5471)
+- Fix pulsar URI scheme (#5470)
+- Fix grafana searchers dashboard (#5455)
+- Fix jaeger http endpoint (#5378)
+- Fix file re-ingestion after EOF (#5330)
+- Fix source path in Lambda distrib (#5327)
+- Fix configuration interpolation (#5403)
+- Fix jaeger duration parse error (#5518)
+- Fix unit conversion in jaeger http search endpoint (#5519)
+
+### Removed
+- Remove support for 2-digit years in java datetime parser (#5596)
+- Remove DocMapper trait (#5508)
+
+
+# [0.8.1]
+
+### Fixed
+
+- Bug in the chitchat digest message serialization (chitchat#144)
+
+## [0.8.0]
+
+### Added
+
+- Remove some noisy logs (#4447)
+- Add `/{index}/_stats` and `/_stats` ES API (#4442)
+- Use `search_after` in ES scroll API (#4280)
+- Add support for wildcard exclusion in index patterns (#4458)
+- Add `.` support in DSL indentifiers (#3989)
+- Add cat indices ES API (#4465)
+- Limit concurrent merges (#4473)
+- Add Index Template API and auto create index (#4456) (only available with ingest V2)
+- Add support for compressed ES `_bulk` requests (#4506)
+- Add support for slash `/` character in field names (#4510)
+- Handle SIGTERM shutdown signal (#4539)
+- Add `start_timestamp` and `end_timestamp` filter to ES `_field_caps` API (#4547)
+- Limit the number of merge pipelines that can be spawned concurrently (#4574)
+- Add support for `_source_excludes` and `_source_includes` query parameters in ES API (#4572)
+- Add gRPC metrics layer to clients and servers (#4591)
+- Add additional cluster metrics (#4597)
+- Add index patterns query param on GET `/indexes` endpoint (#4600)
+- Add support for GCS file backed metastore (#4604)
+- Add default search fields for OTEL traces index (#4602)
+- Add support for delete index in ES API (#4606)
+- Add a handler to dynamically change the log level (#4662)
+- Add REST endpoint to parse a query into a query AST (#4652)
+- Add postgresql index and use `IN` instead of many `OR` (#4670)
+- Add support for `_source_excludes`, `_source_includes`, `extra_filters` in `_msearch` ES API (#4696)
+- Handle `track_total_size` on request ES body (#4710)
+- Add a metric for the number number of indexes (#4711)
+- Add various performance optimizations in Quickwit and Tantivy
+
+More details in tantivy's [changelog](https://github.com/quickwit-oss/tantivy/blob/main/CHANGELOG.md).
+
+### Fixed
+
+- Fix aggregation result on empty index (#4449)
+- Fix Gzip file source (#4457)
+- Rate limit noisy logs (#4483)
+- Prevent the exponential backoff from overflowing after 64 attempts (#4501)
+- Remove field presence in ES `_field_caps` API (#4492)
+- Remove `source` in ES parameter, remove unsupported field `fields` in response (#4590)
+- Fix aggregation `split_size` parameter, add docs and test (#4627)
+- Various fixes in chitchat (gossip): more details in [chitchat commit history](https://github.com/quickwit-oss/chitchat/commits/main/?since=2024-01-08&until=2024-03-13)
+- Various fixes in mrecordlog (WAL): more details in [mrecordlog commit history](https://github.com/quickwit-oss/mrecordlog/commits/main/?since=2024-01-08&until=2024-03-13)
+
+### Changed
+
+- (Breaking) [Add ZSTD compression to chitchat's Deltas](https://github.com/quickwit-oss/chitchat/pull/112)
+
+### Removed
+
+### Migration from 0.7.x to 0.8.0
+
+To deploy Quickwit 0.8.0, you must either:
+- **shutdown down** your cluster **entirely** before deploying, or
+- **restart all** the nodes of your cluster after deploying.
+
+Because we made some breaking changes in the gossip protocol (chitchat), nodes running different versions of Quickwit cannot communicate with each other and crash upon receiving messages that do not match their release version. The new protocol is now versioned, and future updates of the gossip protocol will be backward compatible.
+
+
 ## [0.7.1]
 
 ### Added
@@ -38,7 +176,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Allow $ and @ characters in field names (#4413)
 
 ### Fixed
-- Assign all sources/shards, even if this requires exceeding the indexer #4363 
+- Assign all sources/shards, even if this requires exceeding the indexer #4363
 - Fix traces doc mapping (service name set as  fast) and update default otel logs index ID to `otel-logs-v0_7` (#4401)
 - Fix parsing multi-line queries (#4409)
 - Fix range query for optional fast field panics with Index out of bounds (#4362)

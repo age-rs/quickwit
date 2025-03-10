@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![allow(dead_code)]
 
@@ -24,11 +19,21 @@ use std::str::FromStr;
 
 use quickwit_proto::ingest::{Shard, ShardState};
 use quickwit_proto::metastore::{DeleteQuery, DeleteTask, MetastoreError, MetastoreResult};
-use quickwit_proto::types::{IndexUid, ShardId, SourceId};
+use quickwit_proto::types::{DocMappingUid, IndexId, IndexUid, ShardId, SourceId, SplitId};
 use sea_query::{Iden, Write};
 use tracing::error;
 
 use crate::{IndexMetadata, Split, SplitMetadata, SplitState};
+
+#[derive(Iden, Clone, Copy)]
+#[allow(dead_code)]
+pub enum Indexes {
+    Table,
+    IndexUid,
+    IndexId,
+    IndexMetadataJson,
+    CreateTimestamp,
+}
 
 /// A model structure for handling index metadata in a database.
 #[derive(sqlx::FromRow)]
@@ -38,7 +43,7 @@ pub(super) struct PgIndex {
     #[sqlx(try_from = "String")]
     pub index_uid: IndexUid,
     /// Index ID. The index ID is used to resolve user queries.
-    pub index_id: String,
+    pub index_id: IndexId,
     // A JSON string containing all of the IndexMetadata.
     pub index_metadata_json: String,
     /// Timestamp for tracking when the split was created.
@@ -81,6 +86,7 @@ pub enum Splits {
     Tags,
     SplitMetadataJson,
     IndexUid,
+    NodeId,
     DeleteOpstamp,
 }
 
@@ -96,7 +102,7 @@ impl Iden for ToTimestampFunc {
 #[derive(sqlx::FromRow)]
 pub(super) struct PgSplit {
     /// Split ID.
-    pub split_id: String,
+    pub split_id: SplitId,
     /// The state of the split. With `update_timestamp`, this is the only mutable attribute of the
     /// split.
     pub split_state: String,
@@ -258,21 +264,26 @@ pub(super) struct PgShard {
     pub leader_id: String,
     pub follower_id: Option<String>,
     pub shard_state: PgShardState,
+    #[sqlx(try_from = "String")]
+    pub doc_mapping_uid: DocMappingUid,
     pub publish_position_inclusive: String,
     pub publish_token: Option<String>,
+    pub update_timestamp: sqlx::types::time::PrimitiveDateTime,
 }
 
 impl From<PgShard> for Shard {
     fn from(pg_shard: PgShard) -> Self {
         Shard {
-            index_uid: pg_shard.index_uid.into(),
+            index_uid: Some(pg_shard.index_uid),
             source_id: pg_shard.source_id,
             shard_id: Some(pg_shard.shard_id),
             shard_state: ShardState::from(pg_shard.shard_state) as i32,
             leader_id: pg_shard.leader_id,
             follower_id: pg_shard.follower_id,
+            doc_mapping_uid: Some(pg_shard.doc_mapping_uid),
             publish_position_inclusive: Some(pg_shard.publish_position_inclusive.into()),
             publish_token: pg_shard.publish_token,
+            update_timestamp: pg_shard.update_timestamp.assume_utc().unix_timestamp(),
         }
     }
 }

@@ -43,7 +43,6 @@ runs:
         QW_COMMIT_DATE: ${{ env.QW_COMMIT_DATE }}
         QW_COMMIT_HASH: ${{ env.QW_COMMIT_HASH }}
         QW_COMMIT_TAGS: ${{ env.QW_COMMIT_TAGS }}
-
       working-directory: ./quickwit
     - name: Bundle archive
       run: |
@@ -51,7 +50,7 @@ runs:
           BINARY_VERSION=${{ inputs.version }} ARCHIVE_NAME=${{ env.ASSET_FULL_NAME }}
       shell: bash
     - name: Save binary archive for three days
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4.4.0
       with:
         name: ${{ env.ASSET_FULL_NAME }}.tar.gz
         path: ./${{ env.ASSET_FULL_NAME }}.tar.gz

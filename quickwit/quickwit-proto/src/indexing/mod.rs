@@ -1,140 +1,97 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::ops::{Add, Mul, Sub};
-use std::{fmt, io};
 
-use anyhow::anyhow;
+use bytesize::ByteSize;
 use quickwit_actors::AskError;
 use quickwit_common::pubsub::Event;
-use quickwit_common::tower::RpcName;
+use quickwit_common::rate_limited_error;
+use quickwit_common::tower::{MakeLoadShedError, RpcName, TimeoutExceeded};
 use serde::{Deserialize, Serialize};
 use thiserror;
 
-use crate::types::{IndexUid, PipelineUid, Position, ShardId, SourceId, SourceUid};
-use crate::{ServiceError, ServiceErrorCode};
+use crate::metastore::MetastoreError;
+use crate::types::{IndexUid, NodeId, PipelineUid, Position, ShardId, SourceId, SourceUid};
+use crate::{GrpcServiceError, ServiceError, ServiceErrorCode};
 
 include!("../codegen/quickwit/quickwit.indexing.rs");
 
+pub const INDEXING_FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!("../codegen/quickwit/indexing_descriptor.bin");
+
 pub type IndexingResult<T> = std::result::Result<T, IndexingError>;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IndexingError {
-    #[error("indexing pipeline `{pipeline_uid}` does not exist")]
-    MissingPipeline { pipeline_uid: PipelineUid },
-    #[error("indexing merge pipeline `{merge_pipeline_id}` does not exist")]
-    MissingMergePipeline { merge_pipeline_id: String },
-    #[error(
-        "pipeline #{pipeline_uid} for index `{index_id}` and source `{source_id}` already exists"
-    )]
-    PipelineAlreadyExists {
-        index_id: String,
-        source_id: SourceId,
-        pipeline_uid: PipelineUid,
-    },
-    #[error("I/O error `{0}`")]
-    Io(io::Error),
-    #[error("invalid params `{0}`")]
-    InvalidParams(anyhow::Error),
-    #[error("Spanw pipelines errors `{pipeline_ids:?}`")]
-    SpawnPipelinesError {
-        pipeline_ids: Vec<IndexingPipelineId>,
-    },
-    #[error("a metastore error occurred: {0}")]
-    MetastoreError(String),
-    #[error("a storage resolver error occurred: {0}")]
-    StorageResolverError(String),
-    #[error("an internal error occurred: {0}")]
+    #[error("internal error: {0}")]
     Internal(String),
-    #[error("indexing service is unavailable")]
-    Unavailable,
+    #[error("metastore error: {0}")]
+    Metastore(#[from] MetastoreError),
+    #[error("request timed out: {0}")]
+    Timeout(String),
+    #[error("too many requests")]
+    TooManyRequests,
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
 }
-
-impl From<IndexingError> for tonic::Status {
-    fn from(error: IndexingError) -> Self {
-        match error {
-            IndexingError::MissingPipeline { pipeline_uid } => {
-                tonic::Status::not_found(format!("missing pipeline `{pipeline_uid}`"))
-            }
-            IndexingError::MissingMergePipeline { merge_pipeline_id } => {
-                tonic::Status::not_found(format!("missing merge pipeline `{merge_pipeline_id}`"))
-            }
-            IndexingError::PipelineAlreadyExists {
-                index_id,
-                source_id,
-                pipeline_uid,
-            } => tonic::Status::already_exists(format!(
-                "pipeline {index_id}/{source_id} {pipeline_uid} already exists "
-            )),
-            IndexingError::Io(error) => tonic::Status::internal(error.to_string()),
-            IndexingError::InvalidParams(error) => {
-                tonic::Status::invalid_argument(error.to_string())
-            }
-            IndexingError::SpawnPipelinesError { pipeline_ids } => {
-                tonic::Status::internal(format!("error spawning pipelines {:?}", pipeline_ids))
-            }
-            IndexingError::Internal(string) => tonic::Status::internal(string),
-            IndexingError::MetastoreError(string) => tonic::Status::internal(string),
-            IndexingError::StorageResolverError(string) => tonic::Status::internal(string),
-            IndexingError::Unavailable => {
-                tonic::Status::unavailable("indexing service is unavailable")
-            }
-        }
-    }
-}
-
-impl From<tonic::Status> for IndexingError {
-    fn from(status: tonic::Status) -> Self {
-        match status.code() {
-            tonic::Code::InvalidArgument => {
-                IndexingError::InvalidParams(anyhow!(status.message().to_string()))
-            }
-            tonic::Code::NotFound => IndexingError::MissingPipeline {
-                pipeline_uid: PipelineUid::default(),
-            },
-            tonic::Code::AlreadyExists => IndexingError::PipelineAlreadyExists {
-                index_id: "".to_string(),
-                source_id: "".to_string(),
-                pipeline_uid: PipelineUid::default(),
-            },
-            tonic::Code::Unavailable => IndexingError::Unavailable,
-            _ => IndexingError::InvalidParams(anyhow!(status.message().to_string())),
-        }
+impl From<TimeoutExceeded> for IndexingError {
+    fn from(_timeout_exceeded: TimeoutExceeded) -> Self {
+        Self::Timeout("tower layer timeout".to_string())
     }
 }
 
 impl ServiceError for IndexingError {
     fn error_code(&self) -> ServiceErrorCode {
         match self {
-            Self::MissingPipeline { .. } => ServiceErrorCode::NotFound,
-            Self::MissingMergePipeline { .. } => ServiceErrorCode::NotFound,
-            Self::PipelineAlreadyExists { .. } => ServiceErrorCode::BadRequest,
-            Self::InvalidParams(_) => ServiceErrorCode::BadRequest,
-            Self::SpawnPipelinesError { .. } => ServiceErrorCode::Internal,
-            Self::Io(_) => ServiceErrorCode::Internal,
-            Self::Internal(_) => ServiceErrorCode::Internal,
-            Self::MetastoreError(_) => ServiceErrorCode::Internal,
-            Self::StorageResolverError(_) => ServiceErrorCode::Internal,
-            Self::Unavailable => ServiceErrorCode::Unavailable,
+            Self::Internal(err_msg) => {
+                rate_limited_error!(limit_per_min = 6, "indexing error: {err_msg}");
+                ServiceErrorCode::Internal
+            }
+            Self::Metastore(metastore_error) => metastore_error.error_code(),
+            Self::Timeout(_) => ServiceErrorCode::Timeout,
+            Self::TooManyRequests => ServiceErrorCode::TooManyRequests,
+            Self::Unavailable(_) => ServiceErrorCode::Unavailable,
         }
+    }
+}
+
+impl GrpcServiceError for IndexingError {
+    fn new_internal(message: String) -> Self {
+        Self::Internal(message)
+    }
+
+    fn new_timeout(message: String) -> Self {
+        Self::Timeout(message)
+    }
+
+    fn new_too_many_requests() -> Self {
+        Self::TooManyRequests
+    }
+
+    fn new_unavailable(message: String) -> Self {
+        Self::Unavailable(message)
+    }
+}
+
+impl MakeLoadShedError for IndexingError {
+    fn make_load_shed_error() -> Self {
+        Self::TooManyRequests
     }
 }
 
@@ -142,25 +99,55 @@ impl From<AskError<IndexingError>> for IndexingError {
     fn from(error: AskError<IndexingError>) -> Self {
         match error {
             AskError::ErrorReply(error) => error,
-            AskError::MessageNotDelivered => IndexingError::Unavailable,
-            AskError::ProcessMessageError => IndexingError::Internal(
-                "an error occurred while processing the request".to_string(),
-            ),
+            AskError::MessageNotDelivered => {
+                Self::new_unavailable("request could not be delivered to actor".to_string())
+            }
+            AskError::ProcessMessageError => {
+                Self::new_internal("an error occurred while processing the request".to_string())
+            }
         }
     }
 }
 
+/// Uniquely identifies an indexing pipeline. There can be multiple indexing pipelines per
+/// source `(index_uid, source_id)` running simultaneously on an indexer.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct IndexingPipelineId {
-    pub node_id: String,
+    pub node_id: NodeId,
     pub index_uid: IndexUid,
     pub source_id: SourceId,
     pub pipeline_uid: PipelineUid,
 }
 
+impl IndexingPipelineId {
+    pub fn merge_pipeline_id(&self) -> MergePipelineId {
+        MergePipelineId {
+            node_id: self.node_id.clone(),
+            index_uid: self.index_uid.clone(),
+            source_id: self.source_id.clone(),
+        }
+    }
+}
+
 impl Display for IndexingPipelineId {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "{}:{}", self.index_uid, &self.source_id)
+    }
+}
+
+/// Uniquely identifies a merge pipeline. There exists at most one merge pipeline per
+/// `(index_uid, source_id)` running on indexer at any given time fed by one or more indexing
+/// pipelines.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct MergePipelineId {
+    pub node_id: NodeId,
+    pub index_uid: IndexUid,
+    pub source_id: SourceId,
+}
+
+impl Display for MergePipelineId {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "merge:{}:{}", self.index_uid, &self.source_id)
     }
 }
 
@@ -183,19 +170,30 @@ impl Hash for IndexingTask {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct PipelineMetrics {
-    pub cpu_millis: CpuCapacity,
+    pub cpu_load: CpuCapacity,
+    // Indexing throughput (when the CPU is working).
+    // This measure the theoretical maximum number of MB/s a full indexing pipeline could process
+    // provided enough data was being ingested.
     pub throughput_mb_per_sec: u16,
 }
 
 impl Display for PipelineMetrics {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{},{}MB/s", self.cpu_millis, self.throughput_mb_per_sec)
+        write!(f, "{},{}MB/s", self.cpu_load, self.throughput_mb_per_sec)
     }
 }
 
 /// One full pipeline (including merging) is assumed to consume 4 CPU threads.
-/// The actual number somewhere between 3 and 4.
+/// The actual number somewhere between 3 and 4. Quickwit is not super sensitive to this number.
+///
+/// It simply impacts the point where we prefer to work on balancing the load over the different
+/// indexers and the point where we prefer improving other feature of the system (shard locality,
+/// grouping pipelines associated to a given index on the same node, etc.).
 pub const PIPELINE_FULL_CAPACITY: CpuCapacity = CpuCapacity::from_cpu_millis(4_000u32);
+
+/// One full pipeline (including merging) is supposed to have the capacity to index at least 20mb/s.
+/// This is a defensive value: In reality, this is typically above 30mb/s.
+pub const PIPELINE_THROUGHPUT: ByteSize = ByteSize::mb(20);
 
 /// The CpuCapacity represents an amount of CPU resource available.
 ///
@@ -337,13 +335,6 @@ pub struct ShardPositionsUpdate {
 }
 
 impl Event for ShardPositionsUpdate {}
-
-impl IndexingTask {
-    pub fn pipeline_uid(&self) -> PipelineUid {
-        self.pipeline_uid
-            .expect("`pipeline_uid` should be a required field")
-    }
-}
 
 impl RpcName for ApplyIndexingPlanRequest {
     fn rpc_name() -> &'static str {

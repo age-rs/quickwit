@@ -1,28 +1,25 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 pub mod scheduling_logic;
 pub mod scheduling_logic_model;
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 
 use fnv::{FnvHashMap, FnvHashSet};
+use quickwit_common::rate_limited_debug;
 use quickwit_proto::indexing::{CpuCapacity, IndexingTask};
 use quickwit_proto::types::{PipelineUid, ShardId, SourceUid};
 use scheduling_logic_model::{IndexerOrd, SourceOrd};
@@ -32,6 +29,7 @@ use crate::indexing_plan::PhysicalIndexingPlan;
 use crate::indexing_scheduler::scheduling::scheduling_logic_model::{
     IndexerAssignment, SchedulingProblem, SchedulingSolution,
 };
+use crate::model::ShardLocations;
 
 /// If we have several pipelines below this threshold we
 /// reduce the number of pipelines.
@@ -156,6 +154,7 @@ fn convert_physical_plan_to_solution(
 pub struct SourceToSchedule {
     pub source_uid: SourceUid,
     pub source_type: SourceToScheduleType,
+    pub params_fingerprint: u64,
 }
 
 #[derive(Debug)]
@@ -237,11 +236,18 @@ fn convert_scheduling_solution_to_physical_plan_single_node_single_source(
                     .cloned()
                     .collect();
                 remaining_num_shards_to_schedule_on_node -= shard_ids.len() as u32;
+                let pipeline_uid = if previous_task.params_fingerprint == source.params_fingerprint
+                {
+                    previous_task.pipeline_uid
+                } else {
+                    Some(PipelineUid::random())
+                };
                 let new_task = IndexingTask {
                     index_uid: previous_task.index_uid.clone(),
                     source_id: previous_task.source_id.clone(),
-                    pipeline_uid: previous_task.pipeline_uid,
+                    pipeline_uid,
                     shard_ids,
+                    params_fingerprint: source.params_fingerprint,
                 };
                 new_tasks.push(new_task);
                 if new_tasks.len() >= max_num_pipelines as usize {
@@ -260,12 +266,19 @@ fn convert_scheduling_solution_to_physical_plan_single_node_single_source(
                 .take(remaining_num_shards_to_schedule_on_node as usize)
                 .map(|task| (*task).clone())
                 .collect();
+            for indexing_task in &mut indexing_tasks {
+                if indexing_task.params_fingerprint != source.params_fingerprint {
+                    indexing_task.params_fingerprint = source.params_fingerprint;
+                    indexing_task.pipeline_uid = Some(PipelineUid::random());
+                }
+            }
             indexing_tasks.resize_with(remaining_num_shards_to_schedule_on_node as usize, || {
                 IndexingTask {
                     index_uid: Some(source.source_uid.index_uid.clone()),
                     source_id: source.source_uid.source_id.clone(),
-                    pipeline_uid: Some(PipelineUid::new()),
+                    pipeline_uid: Some(PipelineUid::random()),
                     shard_ids: Vec::new(),
+                    params_fingerprint: source.params_fingerprint,
                 }
             });
             indexing_tasks
@@ -274,14 +287,20 @@ fn convert_scheduling_solution_to_physical_plan_single_node_single_source(
             // Ingest V1 is simple. One pipeline per indexer node.
             if let Some(indexing_task) = previous_tasks.first() {
                 // The pipeline already exists, let's reuse it.
-                vec![(*indexing_task).clone()]
+                let mut indexing_task = (*indexing_task).clone();
+                if indexing_task.params_fingerprint != source.params_fingerprint {
+                    indexing_task.params_fingerprint = source.params_fingerprint;
+                    indexing_task.pipeline_uid = Some(PipelineUid::random());
+                }
+                vec![indexing_task]
             } else {
                 // The source is new, we need to create a new task.
                 vec![IndexingTask {
                     index_uid: Some(source.source_uid.index_uid.clone()),
                     source_id: source.source_uid.source_id.clone(),
-                    pipeline_uid: Some(PipelineUid::new()),
+                    pipeline_uid: Some(PipelineUid::random()),
                     shard_ids: Vec::new(),
+                    params_fingerprint: source.params_fingerprint,
                 }]
             }
         }
@@ -289,7 +308,7 @@ fn convert_scheduling_solution_to_physical_plan_single_node_single_source(
 }
 
 fn convert_scheduling_solution_to_physical_plan_single_node(
-    indexer_assigment: &IndexerAssignment,
+    indexer_assignment: &IndexerAssignment,
     previous_tasks: &[IndexingTask],
     sources: &[SourceToSchedule],
     id_to_ord_map: &IdToOrdMap,
@@ -298,7 +317,7 @@ fn convert_scheduling_solution_to_physical_plan_single_node(
     for source in sources {
         let source_num_shards =
             if let Some(source_ord) = id_to_ord_map.source_ord(&source.source_uid) {
-                indexer_assigment.num_shards(source_ord)
+                indexer_assignment.num_shards(source_ord)
             } else {
                 // This can happen for IngestV1
                 1u32
@@ -326,12 +345,6 @@ fn convert_scheduling_solution_to_physical_plan_single_node(
     tasks
 }
 
-fn pick_indexer(capacity_per_node: &[(String, u32)]) -> impl Iterator<Item = &str> {
-    capacity_per_node.iter().flat_map(|(node_id, capacity)| {
-        std::iter::repeat(node_id.as_str()).take(*capacity as usize)
-    })
-}
-
 /// This function takes a scheduling solution (which abstracts the notion of pipelines,
 /// and shard ids) and builds a physical plan, attempting to make as little change as possible
 /// to the existing pipelines.
@@ -343,6 +356,7 @@ fn convert_scheduling_solution_to_physical_plan(
     id_to_ord_map: &IdToOrdMap,
     sources: &[SourceToSchedule],
     previous_plan_opt: Option<&PhysicalIndexingPlan>,
+    shard_locations: &ShardLocations,
 ) -> PhysicalIndexingPlan {
     let mut indexer_assignments = solution.indexer_assignments.clone();
     let mut new_physical_plan = PhysicalIndexingPlan::with_indexer_ids(&id_to_ord_map.indexer_ids);
@@ -375,7 +389,8 @@ fn convert_scheduling_solution_to_physical_plan(
         };
         let source_ord = id_to_ord_map.source_ord(&source.source_uid).unwrap();
         let mut scheduled_shards: FnvHashSet<ShardId> = FnvHashSet::default();
-        let mut remaining_capacity_per_node: Vec<(String, u32)> = Vec::default();
+        let mut remaining_num_shards_per_node: HashMap<String, NonZeroU32> =
+            HashMap::with_capacity(new_physical_plan.num_indexers());
         for (indexer, indexing_tasks) in new_physical_plan.indexing_tasks_per_indexer_mut() {
             let indexer_ord = id_to_ord_map.indexer_ord(indexer).unwrap();
             let mut num_shards_for_indexer_source: u32 =
@@ -398,29 +413,37 @@ fn convert_scheduling_solution_to_physical_plan(
                     num_shards_for_indexer_source -= indexing_task.shard_ids.len() as u32;
                 }
             }
-            remaining_capacity_per_node.push((indexer.to_string(), num_shards_for_indexer_source));
+            if let Some(num_shards_for_indexer_source_non_zero) =
+                NonZeroU32::new(num_shards_for_indexer_source)
+            {
+                remaining_num_shards_per_node
+                    .insert(indexer.clone(), num_shards_for_indexer_source_non_zero);
+            }
         }
 
         // Missing shards is an iterator over the shards that are not scheduled into a pipeline yet.
-        let missing_shards = shard_ids
+        let missing_shards: Vec<ShardId> = shard_ids
             .iter()
             .filter(|shard_id| !scheduled_shards.contains(shard_id))
-            .cloned();
+            .cloned()
+            .collect();
 
         // Let's assign the missing shards.
-
-        // TODO that's the logic that has to change. Eventually we want to remove shards that
-        // were previously allocated and create new shards to replace them.
         let max_shard_per_pipeline = compute_max_num_shards_per_pipeline(&source.source_type);
-        for (missing_shard, indexer_str) in
-            missing_shards.zip(pick_indexer(&remaining_capacity_per_node))
-        {
+
+        let shard_to_indexer: HashMap<ShardId, String> = assign_shards(
+            missing_shards,
+            remaining_num_shards_per_node,
+            shard_locations,
+        );
+        for (shard_id, indexer) in shard_to_indexer {
             add_shard_to_indexer(
-                missing_shard,
-                indexer_str,
+                shard_id,
+                indexer,
                 &source.source_uid,
                 max_shard_per_pipeline,
                 &mut new_physical_plan,
+                source.params_fingerprint,
             );
         }
     }
@@ -428,6 +451,78 @@ fn convert_scheduling_solution_to_physical_plan(
     new_physical_plan.normalize();
 
     new_physical_plan
+}
+
+/// This function is meant to be called after we have solved the scheduling
+/// problem, so we already know the number of shards to be assigned on each indexer node.
+/// We now need to precisely where each shard should be assigned.
+///
+/// It assigns the missing shards for a given source to the indexers, given:
+/// - the total number of shards that are to be scheduled on each nodes
+/// - the shard locations
+///
+/// This function will assign shards on a node hosting them in priority.
+///
+/// The current implementation is a heuristic.
+/// In the first pass, we attempt to assign as many shards as possible on the
+/// node hosting them.
+fn assign_shards(
+    missing_shards: Vec<ShardId>,
+    mut remaining_num_shards_per_node: HashMap<String, NonZeroU32>,
+    shard_locations: &ShardLocations,
+) -> HashMap<ShardId, String> {
+    let mut shard_to_indexer: HashMap<ShardId, String> =
+        HashMap::with_capacity(missing_shards.len());
+
+    // In a first pass we first assign as many shards on the their hosting nodes as possible.
+    let mut remaining_missing_shards: Vec<ShardId> = Vec::new();
+    for shard_id in missing_shards {
+        // As a heuristic, we pick the first node hosting the shard that is available.
+        let indexer_hosting_shard: Option<(NonZeroU32, &str)> = shard_locations
+            .get_shard_locations(&shard_id)
+            .iter()
+            .map(|node_id| node_id.as_str())
+            .flat_map(|node_id| {
+                let num_shards = remaining_num_shards_per_node.get(node_id)?;
+                Some((*num_shards, node_id))
+            })
+            .min_by_key(|(num_shards, _node_id)| *num_shards);
+        if let Some((_num_shards, indexer)) = indexer_hosting_shard {
+            decrement_num_shards(indexer, &mut remaining_num_shards_per_node);
+            shard_to_indexer.insert(shard_id, indexer.to_string());
+        } else {
+            remaining_missing_shards.push(shard_id);
+        }
+    }
+
+    for shard_id in remaining_missing_shards {
+        let indexer = remaining_num_shards_per_node
+            .keys()
+            .next()
+            .expect("failed to assign all shards. please report")
+            .to_string();
+        decrement_num_shards(&indexer, &mut remaining_num_shards_per_node);
+        shard_to_indexer.insert(shard_id, indexer.to_string());
+    }
+    assert!(remaining_num_shards_per_node.is_empty());
+
+    shard_to_indexer
+}
+
+fn decrement_num_shards(
+    node_id: &str,
+    remaining_num_shards_to_schedule_per_indexers: &mut HashMap<String, NonZeroU32>,
+) {
+    {
+        let previous_num_shards = remaining_num_shards_to_schedule_per_indexers
+            .get_mut(node_id)
+            .unwrap();
+        if let Some(new_num_shards) = NonZeroU32::new(previous_num_shards.get() - 1) {
+            *previous_num_shards = new_num_shards;
+            return;
+        }
+    }
+    remaining_num_shards_to_schedule_per_indexers.remove(node_id);
 }
 
 // Checks that's the physical solution indeed matches the scheduling solution.
@@ -446,14 +541,15 @@ fn assert_post_condition_physical_plan_match_solution(
 
 fn add_shard_to_indexer(
     missing_shard: ShardId,
-    indexer: &str,
+    indexer: String,
     source_uid: &SourceUid,
     max_shard_per_pipeline: NonZeroU32,
     new_physical_plan: &mut PhysicalIndexingPlan,
+    params_fingerprint: u64,
 ) {
     let indexer_tasks = new_physical_plan
         .indexing_tasks_per_indexer_mut()
-        .entry(indexer.to_string())
+        .entry(indexer)
         .or_default();
 
     let indexing_task_opt = indexer_tasks
@@ -473,8 +569,9 @@ fn add_shard_to_indexer(
         indexer_tasks.push(IndexingTask {
             index_uid: Some(source_uid.index_uid.clone()),
             source_id: source_uid.source_id.clone(),
-            pipeline_uid: Some(PipelineUid::new()),
+            pipeline_uid: Some(PipelineUid::random()),
             shard_ids: vec![missing_shard],
+            params_fingerprint,
         });
     }
 }
@@ -487,10 +584,26 @@ fn inflate_node_capacities_if_necessary(problem: &mut SchedulingProblem) {
     else {
         return;
     };
+
+    // We first artificially scale down the node capacities.
+    //
+    // The node capacity is an estimate of the amount of CPU available on a given indexer node.
+    // It has two purpose,
+    // - under a lot of load, indexer will receive work proportional to their relative capacity.
+    // - under low load, the absolute magnitude will be used by the scheduler, to decide whether
+    // to prefer having a balanced workload over other criteria (all pipeline from a same index on
+    // the same node, indexing local shards, etc.).
+    //
+    // The default CPU capacity is detected from the OS. Using these values directly leads
+    // a non uniform distribution of the load which is very confusing for users. We artificially
+    // scale down the indexer capacities.
+    problem.scale_node_capacities(0.3f32);
+
     let min_indexer_capacity = (0..problem.num_indexers())
         .map(|indexer_ord| problem.indexer_cpu_capacity(indexer_ord))
         .min()
         .expect("At least one indexer is required");
+
     assert_ne!(min_indexer_capacity.cpu_millis(), 0);
     if min_indexer_capacity.cpu_millis() < largest_shard_load.get() {
         let scaling_factor =
@@ -515,14 +628,13 @@ fn inflate_node_capacities_if_necessary(problem: &mut SchedulingProblem) {
 /// to transform scheduling into a math problem.
 ///
 /// This function implementation therefore goes
-/// - 1) transform our problem into a scheduling problem. Something closer to a well-defined
-/// optimization problem. In particular this step removes:
-///   - the notion of shard ids, and only considers a number of shards being allocated.
-///   - node_ids and shard ids. These are replaced by integers.
-/// - 2) convert the current situation of the cluster into something a previous scheduling
-/// solution.
-/// - 3) compute the new scheduling solution.
-/// - 4) convert the new scheduling solution back to the real world by reallocating the shard ids.
+/// 1) transform our problem into a scheduling problem. Something closer to a well-defined
+///    optimization problem. In particular this step removes:
+///    - the notion of shard ids, and only considers a number of shards being allocated.
+///    - node_ids and shard ids. These are replaced by integers.
+/// 2) convert the current situation of the cluster into something a previous scheduling solution.
+/// 3) compute the new scheduling solution.
+/// 4) convert the new scheduling solution back to the real world by reallocating the shard ids.
 ///
 /// TODO cut into pipelines.
 /// Panics if any sources has no shards.
@@ -530,15 +642,63 @@ pub fn build_physical_indexing_plan(
     sources: &[SourceToSchedule],
     indexer_id_to_cpu_capacities: &FnvHashMap<String, CpuCapacity>,
     previous_plan_opt: Option<&PhysicalIndexingPlan>,
+    shard_locations: &ShardLocations,
 ) -> PhysicalIndexingPlan {
+    // Asserts that the source are valid.
+    check_sources(sources);
+
+    // We convert our problem into a simplified scheduling problem.
+    // In this simplified version, nodes and sources are just ids.
+    // Instead of individual shard ids, we just keep count of shards.
+    // Similarly, instead of accurate locality, we just keep the number of shards local
+    // to an indexer.
+    let (id_to_ord_map, problem) =
+        convert_to_simplified_problem(indexer_id_to_cpu_capacities, sources, shard_locations);
+
+    // Populate the previous solution, if any.
+    let mut previous_solution = problem.new_solution();
+    if let Some(previous_plan) = previous_plan_opt {
+        convert_physical_plan_to_solution(previous_plan, &id_to_ord_map, &mut previous_solution);
+    }
+
+    // Compute the new scheduling solution using a heuristic.
+    let new_solution = scheduling_logic::solve(problem, previous_solution);
+
+    // Convert the new scheduling solution back to a physical plan.
+    let new_physical_plan = convert_scheduling_solution_to_physical_plan(
+        &new_solution,
+        &id_to_ord_map,
+        sources,
+        previous_plan_opt,
+        shard_locations,
+    );
+
+    assert_post_condition_physical_plan_match_solution(
+        &new_physical_plan,
+        &new_solution,
+        &id_to_ord_map,
+    );
+
+    new_physical_plan
+}
+
+/// Makes any checks on the sources.
+/// Sharded sources are not allowed to have no shards.
+fn check_sources(sources: &[SourceToSchedule]) {
     for source in sources {
         if let SourceToScheduleType::Sharded { shard_ids, .. } = &source.source_type {
             assert!(!shard_ids.is_empty())
         }
     }
+}
 
+fn convert_to_simplified_problem<'a>(
+    indexer_id_to_cpu_capacities: &'a FnvHashMap<String, CpuCapacity>,
+    sources: &'a [SourceToSchedule],
+    shard_locations: &ShardLocations,
+) -> (IdToOrdMap<'a>, SchedulingProblem) {
     // Convert our problem to a scheduling problem.
-    let mut id_to_ord_map = IdToOrdMap::default();
+    let mut id_to_ord_map: IdToOrdMap<'a> = IdToOrdMap::default();
 
     // We use a Vec as a `IndexOrd` -> Max load map.
     let mut indexer_cpu_capacities: Vec<CpuCapacity> =
@@ -554,46 +714,40 @@ pub fn build_physical_indexing_plan(
     for source in sources {
         if let Some(source_ord) = populate_problem(source, &mut problem) {
             let registered_source_ord = id_to_ord_map.add_source(source);
+            if let SourceToScheduleType::Sharded { shard_ids, .. } = &source.source_type {
+                for shard_id in shard_ids {
+                    for &indexer in shard_locations.get_shard_locations(shard_id) {
+                        let Some(indexer_ord) = id_to_ord_map.indexer_ord(indexer.as_str()) else {
+                            // This happens if the ingester is unavailable.
+                            rate_limited_debug!(
+                                limit_per_min = 10,
+                                "failed to find indexer ord for indexer {indexer}"
+                            );
+                            continue;
+                        };
+                        problem.inc_affinity(source_ord, indexer_ord);
+                    }
+                }
+            }
             assert_eq!(source_ord, registered_source_ord);
         }
     }
-
-    // Populate the previous solution.
-    let mut previous_solution = problem.new_solution();
-    if let Some(previous_plan) = previous_plan_opt {
-        convert_physical_plan_to_solution(previous_plan, &id_to_ord_map, &mut previous_solution);
-    }
-
-    // Compute the new scheduling solution
-    let new_solution = scheduling_logic::solve(problem, previous_solution);
-
-    // Convert the new scheduling solution back to a physical plan.
-    let new_physical_plan = convert_scheduling_solution_to_physical_plan(
-        &new_solution,
-        &id_to_ord_map,
-        sources,
-        previous_plan_opt,
-    );
-
-    assert_post_condition_physical_plan_match_solution(
-        &new_physical_plan,
-        &new_solution,
-        &id_to_ord_map,
-    );
-
-    new_physical_plan
+    (id_to_ord_map, problem)
 }
 
 #[cfg(test)]
 mod tests {
 
+    use std::collections::{HashMap, HashSet};
     use std::num::NonZeroU32;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use fnv::FnvHashMap;
+    use itertools::Itertools;
     use quickwit_proto::indexing::{mcpu, CpuCapacity, IndexingTask};
-    use quickwit_proto::types::{IndexUid, PipelineUid, ShardId, SourceUid};
+    use quickwit_proto::types::{IndexUid, NodeId, PipelineUid, ShardId, SourceUid};
+    use rand::seq::SliceRandom;
 
     use super::{
         build_physical_indexing_plan,
@@ -601,10 +755,13 @@ mod tests {
         SourceToScheduleType,
     };
     use crate::indexing_plan::PhysicalIndexingPlan;
+    use crate::indexing_scheduler::get_shard_locality_metrics;
+    use crate::indexing_scheduler::scheduling::assign_shards;
+    use crate::model::ShardLocations;
 
     fn source_id() -> SourceUid {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let index = IndexUid::from_parts("test_index", 0);
+        let index = IndexUid::for_test("test_index", 0);
         let source_id = COUNTER.fetch_add(1, Ordering::SeqCst);
         SourceUid {
             index_uid: index,
@@ -634,6 +791,7 @@ mod tests {
                 ],
                 load_per_shard: NonZeroU32::new(1_000).unwrap(),
             },
+            params_fingerprint: 0,
         };
         let source_1 = SourceToSchedule {
             source_uid: source_uid1.clone(),
@@ -641,18 +799,22 @@ mod tests {
                 num_pipelines: 2,
                 load_per_pipeline: NonZeroU32::new(3_200).unwrap(),
             },
+            params_fingerprint: 0,
         };
         let source_2 = SourceToSchedule {
             source_uid: source_uid2.clone(),
             source_type: SourceToScheduleType::IngestV1,
+            params_fingerprint: 0,
         };
         let mut indexer_id_to_cpu_capacities = FnvHashMap::default();
         indexer_id_to_cpu_capacities.insert(indexer1.clone(), mcpu(16_000));
         indexer_id_to_cpu_capacities.insert(indexer2.clone(), mcpu(16_000));
+        let shard_locations = ShardLocations::default();
         let indexing_plan = build_physical_indexing_plan(
             &[source_0, source_1, source_2],
             &indexer_id_to_cpu_capacities,
             None,
+            &shard_locations,
         );
         assert_eq!(indexing_plan.indexing_tasks_per_indexer().len(), 2);
 
@@ -670,21 +832,68 @@ mod tests {
 
         assert_eq!(node2_plan.len(), 4);
         assert_eq!(&node2_plan[0].source_id, &source_uid0.source_id);
-        assert_eq!(
-            &node2_plan[0].shard_ids,
-            &[ShardId::from(0), ShardId::from(1), ShardId::from(2)]
-        );
+
+        let mut shard_ids: HashSet<ShardId> = HashSet::default();
+        let mut shard_lens = Vec::new();
+        shard_lens.push(node2_plan[0].shard_ids.len());
+        shard_ids.extend(node2_plan[0].shard_ids.iter().cloned());
         assert_eq!(&node2_plan[1].source_id, &source_uid0.source_id);
-        assert_eq!(
-            &node2_plan[1].shard_ids,
-            &[ShardId::from(3), ShardId::from(4), ShardId::from(5)]
-        );
+        shard_lens.push(node2_plan[1].shard_ids.len());
+        shard_ids.extend(node2_plan[1].shard_ids.iter().cloned());
         assert_eq!(&node2_plan[2].source_id, &source_uid0.source_id);
-        assert_eq!(
-            &node2_plan[2].shard_ids,
-            &[ShardId::from(6), ShardId::from(7)]
-        );
+        shard_lens.push(node2_plan[2].shard_ids.len());
+        shard_ids.extend(node2_plan[2].shard_ids.iter().cloned());
+        assert_eq!(shard_ids.len(), 8);
         assert_eq!(&node2_plan[3].source_id, &source_uid2.source_id);
+        shard_lens.sort();
+        assert_eq!(&shard_lens[..], &[2, 3, 3]);
+    }
+
+    #[test]
+    fn test_build_physical_plan_with_locality() {
+        let num_indexers = 10;
+        let num_shards: usize = 1000;
+        let indexers: Vec<NodeId> = (0..num_indexers)
+            .map(|indexer_id| NodeId::new(format!("indexer{indexer_id}")))
+            .collect();
+        let source_uids: Vec<SourceUid> = std::iter::repeat_with(source_id).take(1_000).collect();
+        let shard_ids: Vec<ShardId> = (0..num_shards as u64).map(ShardId::from).collect();
+        let sources: Vec<SourceToSchedule> = (0..num_shards)
+            .map(|i| SourceToSchedule {
+                source_uid: source_uids[i].clone(),
+                source_type: SourceToScheduleType::Sharded {
+                    shard_ids: vec![shard_ids[i].clone()],
+                    load_per_shard: NonZeroU32::new(250).unwrap(),
+                },
+                params_fingerprint: 0,
+            })
+            .collect();
+
+        let mut indexer_id_to_cpu_capacities = FnvHashMap::default();
+        for indexer in &indexers {
+            indexer_id_to_cpu_capacities.insert(indexer.as_str().to_string(), mcpu(16_000));
+        }
+        let mut rng = rand::thread_rng();
+
+        let mut shard_locations = ShardLocations::default();
+        for shard_id in &shard_ids {
+            let indexer = indexers[..].choose(&mut rng).unwrap();
+            shard_locations.add_location(shard_id, indexer);
+        }
+
+        let plan = build_physical_indexing_plan(
+            &sources,
+            &indexer_id_to_cpu_capacities,
+            None,
+            &shard_locations,
+        );
+        assert_eq!(plan.indexing_tasks_per_indexer().len(), num_indexers);
+        let metrics = get_shard_locality_metrics(&plan, &shard_locations);
+        assert_eq!(
+            metrics.num_remote_shards + metrics.num_local_shards,
+            num_shards
+        );
+        assert!(metrics.num_remote_shards < 10);
     }
 
     #[tokio::test]
@@ -696,15 +905,18 @@ mod tests {
                 num_pipelines: 2,
                 load_per_pipeline: NonZeroU32::new(1000).unwrap(),
             },
+            params_fingerprint: 0,
         };
         let sources = vec![source_1];
 
         let indexer1 = "indexer1".to_string();
         let mut indexer_max_loads = FnvHashMap::default();
+        let shard_locations = ShardLocations::default();
         {
             indexer_max_loads.insert(indexer1.clone(), mcpu(1_999));
             // This test what happens when there isn't enough capacity on the cluster.
-            let physical_plan = build_physical_indexing_plan(&sources, &indexer_max_loads, None);
+            let physical_plan =
+                build_physical_indexing_plan(&sources, &indexer_max_loads, None, &shard_locations);
             assert_eq!(physical_plan.indexing_tasks_per_indexer().len(), 1);
             let expected_tasks = physical_plan.indexer(&indexer1).unwrap();
             assert_eq!(expected_tasks.len(), 2);
@@ -713,7 +925,8 @@ mod tests {
         {
             indexer_max_loads.insert(indexer1.clone(), mcpu(2_000));
             // This test what happens when there isn't enough capacity on the cluster.
-            let physical_plan = build_physical_indexing_plan(&sources, &indexer_max_loads, None);
+            let physical_plan =
+                build_physical_indexing_plan(&sources, &indexer_max_loads, None, &shard_locations);
             assert_eq!(physical_plan.indexing_tasks_per_indexer().len(), 1);
             let expected_tasks = physical_plan.indexer(&indexer1).unwrap();
             assert_eq!(expected_tasks.len(), 2);
@@ -735,6 +948,7 @@ mod tests {
                 source_id: source_uid.source_id.clone(),
                 pipeline_uid: Some(*pipeline_uid),
                 shard_ids: shard_ids.to_vec(),
+                params_fingerprint: 0,
             });
         }
         plan
@@ -747,11 +961,11 @@ mod tests {
             &source_uid,
             &[
                 (
-                    PipelineUid::from_u128(1u128),
+                    PipelineUid::for_test(1u128),
                     &[ShardId::from(1), ShardId::from(2)],
                 ),
                 (
-                    PipelineUid::from_u128(2u128),
+                    PipelineUid::for_test(2u128),
                     &[ShardId::from(3), ShardId::from(4), ShardId::from(5)],
                 ),
             ],
@@ -768,6 +982,7 @@ mod tests {
                 ],
                 load_per_shard: NonZeroU32::new(1_000).unwrap(),
             },
+            params_fingerprint: 0,
         }];
         let mut indexer_id_to_cpu_capacities = FnvHashMap::default();
         indexer_id_to_cpu_capacities.insert("node1".to_string(), mcpu(10_000));
@@ -775,10 +990,12 @@ mod tests {
         for indexing_task in indexing_tasks {
             indexing_plan.add_indexing_task("node1", indexing_task);
         }
+        let shard_locations = ShardLocations::default();
         let new_plan = build_physical_indexing_plan(
             &sources,
             &indexer_id_to_cpu_capacities,
             Some(&indexing_plan),
+            &shard_locations,
         );
         let indexing_tasks = new_plan.indexer("node1").unwrap();
         assert_eq!(indexing_tasks.len(), 2);
@@ -805,6 +1022,7 @@ mod tests {
                 shard_ids: shard_ids.iter().copied().map(ShardId::from).collect(),
                 load_per_shard: NonZeroU32::new(load_per_shard.cpu_millis()).unwrap(),
             },
+            params_fingerprint: 0,
         }];
         const NODE: &str = "node1";
         let mut indexer_id_to_cpu_capacities = FnvHashMap::default();
@@ -813,12 +1031,17 @@ mod tests {
         for indexing_task in indexing_tasks {
             indexing_plan.add_indexing_task(NODE, indexing_task);
         }
+        let shard_locations = ShardLocations::default();
         let new_plan = build_physical_indexing_plan(
             &sources,
             &indexer_id_to_cpu_capacities,
             Some(&indexing_plan),
+            &shard_locations,
         );
         let mut indexing_tasks = new_plan.indexer(NODE).unwrap().to_vec();
+        for indexing_task in &mut indexing_tasks {
+            indexing_task.shard_ids.sort();
+        }
         // We sort indexing tasks for normalization purpose
         indexing_tasks.sort_by_key(|task| task.shard_ids[0].clone());
         indexing_tasks
@@ -842,23 +1065,12 @@ mod tests {
             mcpu(400),
         );
         assert_eq!(indexing_tasks_1.len(), 2);
-        assert_eq!(
-            &indexing_tasks_1[0].shard_ids,
-            &[
-                ShardId::from(0),
-                ShardId::from(1),
-                ShardId::from(2),
-                ShardId::from(3),
-                ShardId::from(4),
-                ShardId::from(5),
-                ShardId::from(6),
-                ShardId::from(7)
-            ]
-        );
-        assert_eq!(
-            &indexing_tasks_1[1].shard_ids,
-            &[ShardId::from(8), ShardId::from(9), ShardId::from(10)]
-        );
+        let indexing_tasks_len_1: Vec<usize> = indexing_tasks_1
+            .iter()
+            .map(|task| task.shard_ids.len())
+            .sorted()
+            .collect();
+        assert_eq!(&indexing_tasks_len_1, &[3, 8]);
 
         let pipeline_tasks1: Vec<(PipelineUid, &[ShardId])> = indexing_tasks_1
             .iter()
@@ -873,27 +1085,12 @@ mod tests {
             mcpu(600),
         );
         assert_eq!(indexing_tasks_2.len(), 3);
-        assert_eq!(
-            &indexing_tasks_2[0].shard_ids,
-            &[
-                ShardId::from(0),
-                ShardId::from(1),
-                ShardId::from(2),
-                ShardId::from(3),
-                ShardId::from(4)
-            ]
-        );
-        assert_eq!(
-            &indexing_tasks_2[1].shard_ids,
-            &[
-                ShardId::from(5),
-                ShardId::from(6),
-                ShardId::from(8),
-                ShardId::from(9),
-                ShardId::from(10)
-            ]
-        );
-        assert_eq!(&indexing_tasks_2[2].shard_ids, &[ShardId::from(7)]);
+        let indexing_tasks_len_2: Vec<usize> = indexing_tasks_2
+            .iter()
+            .map(|task| task.shard_ids.len())
+            .sorted()
+            .collect();
+        assert_eq!(&indexing_tasks_len_2, &[1, 5, 5]);
 
         // Now the load comes back to normal
         // The hysteresis takes effect. We do not switch back to 2 pipelines.
@@ -922,27 +1119,12 @@ mod tests {
             mcpu(200),
         );
         assert_eq!(indexing_tasks_4.len(), 2);
-        assert_eq!(
-            &indexing_tasks_4[0].shard_ids,
-            &[
-                ShardId::from(0),
-                ShardId::from(1),
-                ShardId::from(2),
-                ShardId::from(3),
-                ShardId::from(4),
-                ShardId::from(7)
-            ]
-        );
-        assert_eq!(
-            &indexing_tasks_4[1].shard_ids,
-            &[
-                ShardId::from(5),
-                ShardId::from(6),
-                ShardId::from(8),
-                ShardId::from(9),
-                ShardId::from(10)
-            ]
-        );
+        let indexing_tasks_len_4: Vec<usize> = indexing_tasks_4
+            .iter()
+            .map(|task| task.shard_ids.len())
+            .sorted()
+            .collect();
+        assert_eq!(&indexing_tasks_len_4, &[5, 6]);
     }
 
     /// We want to make sure for small pipelines, we still reschedule them with the same
@@ -950,7 +1132,7 @@ mod tests {
     #[test]
     fn test_group_shards_into_pipeline_single_small_pipeline() {
         let source_uid = source_id();
-        let pipeline_uid = PipelineUid::from_u128(1u128);
+        let pipeline_uid = PipelineUid::for_test(1u128);
         let indexing_tasks = group_shards_into_pipelines_aux(
             &source_uid,
             &[12],
@@ -964,17 +1146,49 @@ mod tests {
     }
 
     #[test]
-    fn test_pick_indexer_for_shard() {
-        let indexer_capacity = vec![
-            ("node1".to_string(), 1),
-            ("node2".to_string(), 0),
-            ("node3".to_string(), 2),
-            ("node4".to_string(), 2),
-            ("node5".to_string(), 0),
-            ("node6".to_string(), 0),
+    fn test_assign_missing_shards() {
+        let shard0 = ShardId::from(0);
+        let shard1 = ShardId::from(1);
+        let shard2 = ShardId::from(2);
+        let shard3 = ShardId::from(3);
+
+        let missing_shards = vec![
+            shard0.clone(),
+            shard1.clone(),
+            shard2.clone(),
+            shard3.clone(),
         ];
-        let indexers: Vec<&str> = super::pick_indexer(&indexer_capacity).collect();
-        assert_eq!(indexers, &["node1", "node3", "node3", "node4", "node4"]);
+        let node1 = NodeId::new("node1".to_string());
+        let node2 = NodeId::new("node2".to_string());
+        // This node is missing from the capacity map.
+        // It should not be assigned any task despite being present in shard locations.
+        let node_missing = NodeId::new("node_missing".to_string());
+        let mut remaining_num_shards_per_node = HashMap::default();
+        remaining_num_shards_per_node
+            .insert(node1.as_str().to_string(), NonZeroU32::new(3).unwrap());
+        remaining_num_shards_per_node
+            .insert(node2.as_str().to_string(), NonZeroU32::new(1).unwrap());
+
+        let mut shard_locations: ShardLocations = ShardLocations::default();
+        // shard1 on 1
+        shard_locations.add_location(&shard1, &node1);
+        // shard2 on 2
+        shard_locations.add_location(&shard2, &node2);
+        // shard3 on both 1 and 2
+        shard_locations.add_location(&shard3, &node1);
+        shard_locations.add_location(&shard3, &node2);
+        shard_locations.add_location(&shard0, &node_missing);
+
+        let shard_to_indexer = assign_shards(
+            missing_shards,
+            remaining_num_shards_per_node,
+            &shard_locations,
+        );
+        assert_eq!(shard_to_indexer.len(), 4);
+        assert_eq!(shard_to_indexer.get(&shard1).unwrap(), "node1");
+        assert_eq!(shard_to_indexer.get(&shard2).unwrap(), "node2");
+        assert_eq!(shard_to_indexer.get(&shard3).unwrap(), "node1");
+        assert_eq!(shard_to_indexer.get(&shard0).unwrap(), "node1");
     }
 
     #[test]
@@ -987,6 +1201,7 @@ mod tests {
                     source_id: "_ingest-api-source".to_string(),
                 },
                 source_type: SourceToScheduleType::IngestV1,
+                params_fingerprint: 0,
             },
             SourceToSchedule {
                 source_uid: SourceUid {
@@ -1000,11 +1215,13 @@ mod tests {
                     shard_ids: vec![ShardId::from(1)],
                     load_per_shard: NonZeroU32::new(250).unwrap(),
                 },
+                params_fingerprint: 0,
             },
         ];
         let mut capacities = FnvHashMap::default();
         capacities.insert("indexer-1".to_string(), CpuCapacity::from_cpu_millis(8000));
-        build_physical_indexing_plan(&sources_to_schedule, &capacities, None);
+        let shard_locations = ShardLocations::default();
+        build_physical_indexing_plan(&sources_to_schedule, &capacities, None, &shard_locations);
     }
 
     #[test]
@@ -1016,13 +1233,14 @@ mod tests {
         let previous_task1 = IndexingTask {
             index_uid: Some(source_uid.index_uid.clone()),
             source_id: source_uid.source_id.to_string(),
-            pipeline_uid: Some(PipelineUid::new()),
+            pipeline_uid: Some(PipelineUid::random()),
             shard_ids: vec![ShardId::from(1), ShardId::from(4), ShardId::from(5)],
+            params_fingerprint: 0,
         };
         let previous_task2 = IndexingTask {
             index_uid: Some(source_uid.index_uid.clone()),
             source_id: source_uid.source_id.to_string(),
-            pipeline_uid: Some(PipelineUid::new()),
+            pipeline_uid: Some(PipelineUid::random()),
             shard_ids: vec![
                 ShardId::from(6),
                 ShardId::from(7),
@@ -1030,6 +1248,7 @@ mod tests {
                 ShardId::from(9),
                 ShardId::from(10),
             ],
+            params_fingerprint: 0,
         };
         {
             let sharded_source = SourceToSchedule {
@@ -1043,6 +1262,7 @@ mod tests {
                     ],
                     load_per_shard: NonZeroU32::new(1_000).unwrap(),
                 },
+                params_fingerprint: 0,
             };
             let tasks = convert_scheduling_solution_to_physical_plan_single_node_single_source(
                 4,
@@ -1068,6 +1288,7 @@ mod tests {
                     ],
                     load_per_shard: NonZeroU32::new(250).unwrap(),
                 },
+                params_fingerprint: 0,
             };
             let tasks = convert_scheduling_solution_to_physical_plan_single_node_single_source(
                 4,
@@ -1086,19 +1307,21 @@ mod tests {
             index_uid: IndexUid::new_with_random_ulid("testindex"),
             source_id: "testsource".to_string(),
         };
-        let pipeline_uid1 = PipelineUid::new();
+        let pipeline_uid1 = PipelineUid::random();
         let previous_task1 = IndexingTask {
             index_uid: Some(source_uid.index_uid.clone()),
             source_id: source_uid.source_id.to_string(),
             pipeline_uid: Some(pipeline_uid1),
             shard_ids: Vec::new(),
+            params_fingerprint: 0,
         };
-        let pipeline_uid2 = PipelineUid::new();
+        let pipeline_uid2 = PipelineUid::random();
         let previous_task2 = IndexingTask {
             index_uid: Some(source_uid.index_uid.clone()),
             source_id: source_uid.source_id.to_string(),
             pipeline_uid: Some(pipeline_uid2),
             shard_ids: Vec::new(),
+            params_fingerprint: 0,
         };
         {
             let sharded_source = SourceToSchedule {
@@ -1107,6 +1330,7 @@ mod tests {
                     num_pipelines: 1,
                     load_per_pipeline: NonZeroU32::new(4000).unwrap(),
                 },
+                params_fingerprint: 0,
             };
             let tasks = convert_scheduling_solution_to_physical_plan_single_node_single_source(
                 1,
@@ -1125,6 +1349,7 @@ mod tests {
                     num_pipelines: 0,
                     load_per_pipeline: NonZeroU32::new(1_000).unwrap(),
                 },
+                params_fingerprint: 0,
             };
             let tasks = convert_scheduling_solution_to_physical_plan_single_node_single_source(
                 0,
@@ -1140,6 +1365,7 @@ mod tests {
                     num_pipelines: 2,
                     load_per_pipeline: NonZeroU32::new(1_000).unwrap(),
                 },
+                params_fingerprint: 0,
             };
             let tasks = convert_scheduling_solution_to_physical_plan_single_node_single_source(
                 2,
@@ -1161,6 +1387,7 @@ mod tests {
                     num_pipelines: 2,
                     load_per_pipeline: NonZeroU32::new(1_000).unwrap(),
                 },
+                params_fingerprint: 0,
             };
             let tasks = convert_scheduling_solution_to_physical_plan_single_node_single_source(
                 2,

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 import { Cluster, Index, IndexMetadata, QuickwitBuildInfo, SearchRequest, SearchResponse, SplitMetadata } from "../utils/models";
 import { serializeSortByField } from "../utils/urls";
@@ -35,13 +30,14 @@ export class Client {
     return this._host + "/api/v1/";
   }
 
-  async search(request: SearchRequest): Promise<SearchResponse> {
+  async search(request: SearchRequest, timestamp_field: string | null): Promise<SearchResponse> {
     // TODO: improve validation of request.
     if (request.indexId === null || request.indexId === undefined) {
       throw Error("Search request must have and index id.")
     }
-    const url = this.buildSearchUrl(request);
-    return this.fetch(url.toString(), this.defaultGetRequestParams());
+    const url = `${this.apiRoot()}${request.indexId}/search`;
+    const body = this.buildSearchBody(request, timestamp_field);
+    return this.fetch(url, this.defaultGetRequestParams(), body);
   }
 
   async cluster(): Promise<Cluster> {
@@ -85,7 +81,12 @@ export class Client {
     return this.fetch(`${this.apiRoot()}indexes`, {});
   }
 
-  async fetch<T>(url: string, params: RequestInit): Promise<T> {
+  async fetch<T>(url: string, params: RequestInit, body: string|null = null): Promise<T> {
+    if (body !== null) {
+      params.method = "POST";
+      params.body = body;
+      params.headers = {...params.headers, "content-type": "application/json"};
+    }
     const response = await fetch(url, params);
     if (response.ok) {
       return response.json() as Promise<T>;
@@ -101,34 +102,90 @@ export class Client {
     return {
       method: "GET",
       headers: { Accept: "application/json" },
-      mode: "no-cors",
+      mode: "cors",
       cache: "default",
     }
   }
 
-  buildSearchUrl(request: SearchRequest): URL {
-    const url: URL = new URL(`${request.indexId}/search`, this.apiRoot());
-    // TODO: the trim should be done in the backend.
-    url.searchParams.append("query", request.query.trim() || "*");
-    url.searchParams.append("max_hits", "20");
+  buildSearchBody(request: SearchRequest, timestamp_field: string | null): string {
+    /* eslint-disable  @typescript-eslint/no-explicit-any */
+    const body: any = {
+      // TODO: the trim should be done in the backend.
+      query: request.query.trim() || "*",
+    };
+
+    if (request.aggregation) {
+      const qw_aggregation = this.buildAggregation(request, timestamp_field);
+      body["aggs"] = qw_aggregation;
+      body["max_hits"] = 0;
+    } else {
+      body["max_hits"] = 20;
+    }
     if (request.startTimestamp) {
-      url.searchParams.append(
-        "start_timestamp",
-        request.startTimestamp.toString()
-      );
+      body["start_timestamp"] = request.startTimestamp;
     }
     if (request.endTimestamp) {
-      url.searchParams.append(
-        "end_timestamp",
-        request.endTimestamp.toString()
-      );
+      body["end_timestamp"] = request.endTimestamp;
     }
     if (request.sortByField) {
-      url.searchParams.append(
-        "sort_by_field",
-        serializeSortByField(request.sortByField)
-      );
+      body["sort_by_field"] = serializeSortByField(request.sortByField);
     }
-    return url;
+    return JSON.stringify(body);
+  }
+
+  /* eslint-disable  @typescript-eslint/no-explicit-any */
+  buildAggregation(request: SearchRequest, timestamp_field: string | null): any {
+    let aggregation = undefined;
+    if (request.aggregationConfig.metric) {
+      const metric = request.aggregationConfig.metric;
+      aggregation = {
+        metric: {
+          [metric.type]: {
+            field: metric.field
+          }
+        }
+      }
+    }
+    if (request.aggregationConfig.histogram && timestamp_field) {
+      const histogram = request.aggregationConfig.histogram;
+      const interval = histogram.interval
+      let extended_bounds;
+      if (request.startTimestamp && request.endTimestamp) {
+        extended_bounds = {
+          min: request.startTimestamp,
+          max: request.endTimestamp,
+        };
+      } else {
+        extended_bounds = undefined;
+      }
+      aggregation = {
+        histo_agg: {
+          aggs: aggregation,
+          date_histogram: {
+            field: timestamp_field,
+            fixed_interval: interval,
+            min_doc_count: 0,
+            extended_bounds: extended_bounds,
+          }
+        }
+      }
+    }
+    if (request.aggregationConfig.term) {
+      const term = request.aggregationConfig.term;
+      aggregation = {
+        term_agg: {
+          aggs: aggregation,
+          terms: {
+            field: term.field,
+            size: term.size,
+            order: {
+              _count: "desc"
+            },
+            min_doc_count: 1,
+          }
+        }
+      }
+    }
+    return aggregation;
   }
 }

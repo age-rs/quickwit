@@ -1,38 +1,34 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 use std::ops::{Range, RangeInclusive};
 
-use quickwit_proto::types::IndexUid;
+use quickwit_proto::types::{DocMappingUid, IndexUid, SplitId};
 use serde::{Deserialize, Serialize};
 
 use crate::split_metadata::{utc_now_timestamp, SplitMaturity};
 use crate::SplitMetadata;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
-pub(crate) struct SplitMetadataV0_7 {
+pub(crate) struct SplitMetadataV0_8 {
     /// Split ID. Joined with the index URI (<index URI>/<split ID>), this ID
     /// should be enough to uniquely identify a split.
     /// In reality, some information may be implicitly configured
     /// in the storage resolver: for instance, the Amazon S3 region.
-    pub split_id: String,
+    #[schema(value_type = String)]
+    pub split_id: SplitId,
 
     /// Uid of the index this split belongs to.
     #[schema(value_type = String)]
@@ -91,13 +87,18 @@ pub(crate) struct SplitMetadataV0_7 {
 
     #[serde(default)]
     num_merge_ops: usize,
+
+    // we default fill with zero: we don't know the right uid, and it's correct to assume all
+    // splits before when updates first appeared are compatible with each other.
+    #[serde(default)]
+    doc_mapping_uid: DocMappingUid,
 }
 
-impl From<SplitMetadataV0_7> for SplitMetadata {
-    fn from(v6: SplitMetadataV0_7) -> Self {
-        let source_id = v6.source_id.unwrap_or_else(|| "unknown".to_string());
+impl From<SplitMetadataV0_8> for SplitMetadata {
+    fn from(v8: SplitMetadataV0_8) -> Self {
+        let source_id = v8.source_id.unwrap_or_else(|| "unknown".to_string());
 
-        let node_id = if let Some(node_id) = v6.node_id {
+        let node_id = if let Some(node_id) = v8.node_id {
             // The previous version encoded `v1.node_id` as `{node_id}/{pipeline_ord}`.
             // Since pipeline_ord is no longer needed, we only extract the `node_id` portion
             // to keep backward compatibility.  This has the advantage of avoiding a
@@ -112,27 +113,28 @@ impl From<SplitMetadataV0_7> for SplitMetadata {
         };
 
         SplitMetadata {
-            split_id: v6.split_id,
-            index_uid: v6.index_uid,
-            partition_id: v6.partition_id,
+            split_id: v8.split_id,
+            index_uid: v8.index_uid,
+            partition_id: v8.partition_id,
             source_id,
             node_id,
-            delete_opstamp: v6.delete_opstamp,
-            num_docs: v6.num_docs,
-            uncompressed_docs_size_in_bytes: v6.uncompressed_docs_size_in_bytes,
-            time_range: v6.time_range,
-            create_timestamp: v6.create_timestamp,
-            maturity: v6.maturity,
-            tags: v6.tags,
-            footer_offsets: v6.footer_offsets,
-            num_merge_ops: v6.num_merge_ops,
+            delete_opstamp: v8.delete_opstamp,
+            num_docs: v8.num_docs,
+            uncompressed_docs_size_in_bytes: v8.uncompressed_docs_size_in_bytes,
+            time_range: v8.time_range,
+            create_timestamp: v8.create_timestamp,
+            maturity: v8.maturity,
+            tags: v8.tags,
+            footer_offsets: v8.footer_offsets,
+            num_merge_ops: v8.num_merge_ops,
+            doc_mapping_uid: v8.doc_mapping_uid,
         }
     }
 }
 
-impl From<SplitMetadata> for SplitMetadataV0_7 {
+impl From<SplitMetadata> for SplitMetadataV0_8 {
     fn from(split: SplitMetadata) -> Self {
-        SplitMetadataV0_7 {
+        SplitMetadataV0_8 {
             split_id: split.split_id,
             index_uid: split.index_uid,
             partition_id: split.partition_id,
@@ -147,6 +149,7 @@ impl From<SplitMetadata> for SplitMetadataV0_7 {
             tags: split.tags,
             footer_offsets: split.footer_offsets,
             num_merge_ops: split.num_merge_ops,
+            doc_mapping_uid: split.doc_mapping_uid,
         }
     }
 }
@@ -154,24 +157,23 @@ impl From<SplitMetadata> for SplitMetadataV0_7 {
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "version")]
 pub(crate) enum VersionedSplitMetadata {
-    #[serde(rename = "0.7")]
+    #[serde(rename = "0.9")]
     // Retro compatibility.
-    #[serde(alias = "0.6")]
-    #[serde(alias = "0.5")]
-    #[serde(alias = "0.4")]
-    V0_7(SplitMetadataV0_7),
+    #[serde(alias = "0.8")]
+    #[serde(alias = "0.7")]
+    V0_8(SplitMetadataV0_8),
 }
 
 impl From<VersionedSplitMetadata> for SplitMetadata {
     fn from(versioned_helper: VersionedSplitMetadata) -> Self {
         match versioned_helper {
-            VersionedSplitMetadata::V0_7(v0_6) => v0_6.into(),
+            VersionedSplitMetadata::V0_8(v0_8) => v0_8.into(),
         }
     }
 }
 
 impl From<SplitMetadata> for VersionedSplitMetadata {
     fn from(split_metadata: SplitMetadata) -> Self {
-        VersionedSplitMetadata::V0_7(split_metadata.into())
+        VersionedSplitMetadata::V0_8(split_metadata.into())
     }
 }

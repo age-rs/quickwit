@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 use std::fmt::Display;
@@ -118,6 +113,7 @@ fn extract_unsimplified_tags_filter_ast(query_ast: QueryAst) -> UnsimplifiedTagF
             panic!("Extract unsimplified should only be called on AST without UserInputQuery.");
         }
         QueryAst::FieldPresence(_) => UnsimplifiedTagFilterAst::Uninformative,
+        QueryAst::Regex(_) => UnsimplifiedTagFilterAst::Uninformative,
     }
 }
 
@@ -145,11 +141,7 @@ enum UnsimplifiedTagFilterAst {
 enum TermFilterAst {
     And(Vec<TermFilterAst>),
     Or(Vec<TermFilterAst>),
-    Term {
-        is_present: bool,
-        field: String,
-        value: String,
-    },
+    Term { field: String, value: String },
 }
 
 /// Records terms into a set of tags.
@@ -266,12 +258,18 @@ fn simplify_ast(ast: UnsimplifiedTagFilterAst) -> Option<TermFilterAst> {
             is_present,
             field,
             value,
-        } => TermFilterAst::Term {
-            is_present,
-            field,
-            value,
+        } => {
+            if is_present {
+                Some(TermFilterAst::Term { field, value })
+            } else {
+                // we can't do tag pruning on negative filters. If `field` can be one of 1 or 2,
+                // and we search for not(1), we don't want to remove a split where
+                // tags=[1,2] (which is_present: false does). It's even more problematic if some
+                // documents have `field` unset, because we don't record that at all, so can't
+                // even reject a split based on it having tags=[1].
+                None
+            }
         }
-        .into(),
         UnsimplifiedTagFilterAst::Uninformative => None,
     }
 }
@@ -294,17 +292,13 @@ fn expand_to_tag_ast(terms_filter_ast: TermFilterAst) -> TagFilterAst {
         TermFilterAst::Or(children) => {
             TagFilterAst::Or(children.into_iter().map(expand_to_tag_ast).collect())
         }
-        TermFilterAst::Term {
-            is_present,
-            field,
-            value,
-        } => {
+        TermFilterAst::Term { field, value } => {
             let field_is_tag = TagFilterAst::Tag {
                 is_present: false,
                 tag: field_tag(&field),
             };
             let term_tag = TagFilterAst::Tag {
-                is_present,
+                is_present: true,
                 tag: term_tag(&field, &value),
             };
             TagFilterAst::Or(vec![field_is_tag, term_tag])
@@ -400,6 +394,7 @@ mod test {
             user_text: user_query.to_string(),
             default_fields: None,
             default_operator: BooleanOperand::Or,
+            lenient: false,
         }
         .into();
         let parsed_query_ast = query_ast.parse_user_query(&[]).unwrap();
@@ -470,21 +465,18 @@ mod test {
 
     #[test]
     fn test_disjunction_of_tag_disjunction_with_not_clause() {
-        assert_eq!(
-            extract_tags_from_query_helper("(user:bart -lang:fr)")
-                .unwrap()
-                .to_string(),
-            "((¬user! ∨ user:bart) ∨ (¬lang! ∨ ¬lang:fr))"
-        );
+        // ORed negative tags make the result inconclusive. See simplify_ast() for details
+        assert!(extract_tags_from_query_helper("(user:bart -lang:fr)").is_none());
     }
 
     #[test]
     fn test_disjunction_of_tag_conjunction_with_not_clause() {
+        // negative tags are removed from AND clauses. See simplify_ast() for details
         assert_eq!(
             &extract_tags_from_query_helper("user:bart AND NOT lang:fr")
                 .unwrap()
                 .to_string(),
-            "(¬user! ∨ user:bart) ∧ (¬lang! ∨ ¬lang:fr)"
+            "(¬user! ∨ user:bart)"
         );
     }
 

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashSet;
 use std::ops::AddAssign;
@@ -67,18 +62,21 @@ impl CatIndexQueryParams {
                         "Format {:?} is not supported. Only format=json is supported.",
                         format
                     ),
+                    None,
                 ));
             }
         } else {
             return Err(ElasticsearchError::new(
                 StatusCode::BAD_REQUEST,
                 "Only format=json is supported.".to_string(),
+                None,
             ));
         }
         let unsupported_parameter_error = |field: &str| {
             ElasticsearchError::new(
                 StatusCode::BAD_REQUEST,
                 format!("Parameter {:?} is not supported.", field),
+                None,
             )
         };
         if self.bytes.is_some() {
@@ -90,7 +88,6 @@ impl CatIndexQueryParams {
         if self.s.is_some() {
             return Err(unsupported_parameter_error("s"));
         }
-
         Ok(())
     }
 }
@@ -171,6 +168,29 @@ impl From<SplitMetadata> for ElasticsearchCatIndexResponse {
             rep: "1".to_string(),
             docs_count: split_metadata.as_split_info().num_docs as u64,
             ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ElasticsearchResolveIndexResponse {
+    pub indices: Vec<ElasticsearchResolveIndexEntryResponse>,
+    // Unused for the moment.
+    pub aliases: Vec<serde_json::Value>,
+    pub data_streams: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ElasticsearchResolveIndexEntryResponse {
+    pub name: String,
+    pub attributes: Vec<Status>,
+}
+
+impl From<IndexMetadata> for ElasticsearchResolveIndexEntryResponse {
+    fn from(index_metadata: IndexMetadata) -> Self {
+        ElasticsearchResolveIndexEntryResponse {
+            name: index_metadata.index_config.index_id.to_string(),
+            attributes: vec![Status::Open],
         }
     }
 }

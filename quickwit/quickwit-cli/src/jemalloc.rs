@@ -1,65 +1,61 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::time::Duration;
 
-use quickwit_common::metrics::new_gauge;
+use quickwit_common::metrics::MEMORY_METRICS;
 use tikv_jemallocator::Jemalloc;
 use tracing::error;
 
 #[global_allocator]
 pub static GLOBAL: Jemalloc = Jemalloc;
 
-pub const JEMALLOC_METRICS_POLLING_INTERVAL: Duration = Duration::from_secs(1);
+const JEMALLOC_METRICS_POLLING_INTERVAL: Duration = Duration::from_secs(1);
 
 pub async fn jemalloc_metrics_loop() -> tikv_jemalloc_ctl::Result<()> {
-    let allocated_gauge = new_gauge(
-        "allocated_num_bytes",
-        "Number of bytes allocated memory, as reported by jemallocated.",
-        "quickwit",
-    );
+    let memory_metrics = MEMORY_METRICS.clone();
 
-    // Obtain a MIB for the `epoch`, `stats.allocated`, and
-    // `atats.resident` keys:
-    let epoch_management_information_base = tikv_jemalloc_ctl::epoch::mib()?;
-    let allocated = tikv_jemalloc_ctl::stats::allocated::mib()?;
+    // Obtain a MIB for the `epoch`, `stats.active`, `stats.allocated`, and `stats.resident` keys:
+    let epoch_mib = tikv_jemalloc_ctl::epoch::mib()?;
+    let active_mib = tikv_jemalloc_ctl::stats::active::mib()?;
+    let allocated_mib = tikv_jemalloc_ctl::stats::allocated::mib()?;
+    let resident_mib = tikv_jemalloc_ctl::stats::resident::mib()?;
 
     let mut poll_interval = tokio::time::interval(JEMALLOC_METRICS_POLLING_INTERVAL);
 
     loop {
         poll_interval.tick().await;
 
-        // Many statistics are cached and only updated
-        // when the epoch is advanced:
-        epoch_management_information_base.advance()?;
+        // Many statistics are cached and only updated when the epoch is advanced:
+        epoch_mib.advance()?;
 
-        // Read statistics using MIB key:
-        let allocated = allocated.read()?;
+        // Read statistics using MIB keys:
+        let active = active_mib.read()?;
+        memory_metrics.active_bytes.set(active as i64);
 
-        allocated_gauge.set(allocated as i64);
+        let allocated = allocated_mib.read()?;
+        memory_metrics.allocated_bytes.set(allocated as i64);
+
+        let resident = resident_mib.read()?;
+        memory_metrics.resident_bytes.set(resident as i64);
     }
 }
 
 pub fn start_jemalloc_metrics_loop() {
     tokio::task::spawn(async {
-        if let Err(jemalloc_metrics_err) = jemalloc_metrics_loop().await {
-            error!(err=?jemalloc_metrics_err, "failed to gather metrics from jemalloc");
+        if let Err(error) = jemalloc_metrics_loop().await {
+            error!(%error, "failed to collect metrics from jemalloc");
         }
     });
 }

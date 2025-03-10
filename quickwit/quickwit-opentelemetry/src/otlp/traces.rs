@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
 use std::collections::{btree_set, BTreeSet, HashMap};
@@ -23,11 +18,12 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use prost::Message;
+use quickwit_common::thread_pool::run_cpu_intensive;
 use quickwit_common::uri::Uri;
 use quickwit_config::{load_index_config_from_user_config, ConfigFormat, IndexConfig};
-use quickwit_ingest::{
-    CommitType, DocBatch, DocBatchBuilder, IngestRequest, IngestService, IngestServiceClient,
-};
+use quickwit_ingest::{CommitType, JsonDocBatchV2Builder};
+use quickwit_proto::ingest::router::IngestRouterServiceClient;
+use quickwit_proto::ingest::DocBatchV2;
 use quickwit_proto::opentelemetry::proto::collector::trace::v1::trace_service_server::TraceService;
 use quickwit_proto::opentelemetry::proto::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
@@ -37,7 +33,7 @@ use quickwit_proto::opentelemetry::proto::resource::v1::Resource as OtlpResource
 use quickwit_proto::opentelemetry::proto::trace::v1::span::Link as OtlpLink;
 use quickwit_proto::opentelemetry::proto::trace::v1::status::StatusCode as OtlpStatusCode;
 use quickwit_proto::opentelemetry::proto::trace::v1::{Span as OtlpSpan, Status as OtlpStatus};
-use quickwit_proto::types::IndexId;
+use quickwit_proto::types::{DocUidGenerator, IndexId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tonic::{Request, Response, Status};
@@ -45,17 +41,17 @@ use tracing::field::Empty;
 use tracing::{error, instrument, warn, Span as RuntimeSpan};
 
 use super::{
-    extract_otel_index_id_from_metadata, is_zero, OtelSignal, TryFromSpanIdError,
-    TryFromTraceIdError,
+    extract_otel_index_id_from_metadata, ingest_doc_batch_v2, is_zero, OtelSignal,
+    TryFromSpanIdError, TryFromTraceIdError,
 };
 use crate::otlp::metrics::OTLP_SERVICE_METRICS;
 use crate::otlp::{extract_attributes, SpanId, TraceId};
 
-pub const OTEL_TRACES_INDEX_ID: &str = "otel-traces-v0_7";
+pub const OTEL_TRACES_INDEX_ID: &str = "otel-traces-v0_9";
 pub const OTEL_TRACES_INDEX_ID_PATTERN: &str = "otel-traces-v0_*";
 
 const OTEL_TRACES_INDEX_CONFIG: &str = r#"
-version: 0.7
+version: 0.8
 
 index_id: ${INDEX_ID}
 
@@ -143,6 +139,10 @@ doc_mapping:
       input_format: hex
       output_format: hex
       indexed: false
+    - name: is_root
+      type: bool
+      indexed: true
+      stored: false
     - name: events
       type: array<json>
       tokenizer: raw
@@ -169,10 +169,10 @@ search_settings:
 "#;
 
 #[derive(Debug, thiserror::Error)]
-pub enum OtlpTraceError {
-    #[error("failed to deserialize JSON span: `{0}`")]
+pub enum OtlpTracesError {
+    #[error("failed to deserialize JSON spans: `{0}`")]
     Json(#[from] serde_json::Error),
-    #[error("failed to deserialize Protobuf span: `{0}`")]
+    #[error("failed to deserialize Protobuf spans: `{0}`")]
     Protobuf(#[from] prost::DecodeError),
     #[error("failed to parse span: `{0}`")]
     SpanId(#[from] TryFromSpanIdError),
@@ -230,6 +230,8 @@ pub struct Span {
     pub span_status: SpanStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_span_id: Option<SpanId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_root: Option<bool>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<Event>,
@@ -246,7 +248,7 @@ impl Span {
         span: OtlpSpan,
         resource: &Resource,
         scope: &Scope,
-    ) -> Result<Self, OtlpTraceError> {
+    ) -> Result<Self, OtlpTracesError> {
         let trace_id = TraceId::try_from(span.trace_id)?;
         let span_id = SpanId::try_from(span.span_id)?;
         let parent_span_id = if !span.parent_span_id.is_empty() {
@@ -311,6 +313,7 @@ impl Span {
             span_dropped_events_count: span.dropped_events_count,
             span_dropped_links_count: span.dropped_links_count,
             span_status: span.status.map(SpanStatus::from_otlp).unwrap_or_default(),
+            is_root: Some(parent_span_id.is_none()),
             parent_span_id,
             events,
             event_names,
@@ -629,7 +632,7 @@ pub struct Link {
 }
 
 impl Link {
-    fn try_from_otlp(link: OtlpLink) -> Result<Link, OtlpTraceError> {
+    fn try_from_otlp(link: OtlpLink) -> Result<Link, OtlpTracesError> {
         let link_trace_id = TraceId::try_from(link.trace_id)?;
         let link_span_id = SpanId::try_from(link.span_id)?;
         let link = Link {
@@ -649,7 +652,7 @@ impl Link {
 
 fn parse_otlp_spans(
     request: ExportTraceServiceRequest,
-) -> Result<BTreeSet<OrdSpan>, OtlpTraceError> {
+) -> Result<BTreeSet<OrdSpan>, OtlpTracesError> {
     let mut spans = BTreeSet::new();
 
     for resource_spans in request.resource_spans {
@@ -669,7 +672,7 @@ fn parse_otlp_spans(
 }
 
 struct ParsedSpans {
-    doc_batch: DocBatch,
+    doc_batch: DocBatchV2,
     num_spans: u64,
     num_parse_errors: u64,
     error_message: String,
@@ -677,14 +680,17 @@ struct ParsedSpans {
 
 #[derive(Debug, Clone)]
 pub struct OtlpGrpcTracesService {
-    ingest_service: IngestServiceClient,
+    ingest_router: IngestRouterServiceClient,
     commit_type: CommitType,
 }
 
 impl OtlpGrpcTracesService {
-    pub fn new(ingest_service: IngestServiceClient, commit_type_opt: Option<CommitType>) -> Self {
+    pub fn new(
+        ingest_router: IngestRouterServiceClient,
+        commit_type_opt: Option<CommitType>,
+    ) -> Self {
         Self {
-            ingest_service,
+            ingest_router,
             commit_type: commit_type_opt.unwrap_or_default(),
         }
     }
@@ -711,23 +717,23 @@ impl OtlpGrpcTracesService {
             num_spans,
             num_parse_errors,
             error_message,
-        } = tokio::task::spawn_blocking({
+        } = run_cpu_intensive({
             let parent_span = RuntimeSpan::current();
-            || Self::parse_spans(request, parent_span, index_id)
+            || Self::parse_spans(request, parent_span)
         })
         .await
         .map_err(|join_error| {
-            error!(join_error=?join_error, "failed to parse spans");
-            Status::internal("Failed to parse spans.")
+            error!(error=%join_error, "failed to parse spans");
+            Status::internal("failed to parse spans")
         })??;
         if num_spans == 0 {
-            return Err(tonic::Status::invalid_argument("The request is empty."));
+            return Err(tonic::Status::invalid_argument("request is empty"));
         }
         if num_spans == num_parse_errors {
             return Err(tonic::Status::internal(error_message));
         }
         let num_bytes = doc_batch.num_bytes() as u64;
-        self.store_spans(doc_batch).await?;
+        self.store_spans(index_id, doc_batch).await?;
 
         OTLP_SERVICE_METRICS
             .ingested_spans_total
@@ -752,16 +758,17 @@ impl OtlpGrpcTracesService {
     fn parse_spans(
         request: ExportTraceServiceRequest,
         parent_span: RuntimeSpan,
-        index_id: IndexId,
     ) -> tonic::Result<ParsedSpans> {
         let spans = parse_otlp_spans(request)?;
         let num_spans = spans.len() as u64;
         let mut num_parse_errors = 0;
         let mut error_message = String::new();
 
-        let mut doc_batch_builder = DocBatchBuilder::new(index_id).json_writer();
+        let mut doc_batch_builder = JsonDocBatchV2Builder::default();
+        let mut doc_uid_generator = DocUidGenerator::default();
         for span in spans {
-            if let Err(error) = doc_batch_builder.ingest_doc(&span.0) {
+            let doc_uid = doc_uid_generator.next_doc_uid();
+            if let Err(error) = doc_batch_builder.add_doc(doc_uid, span.0) {
                 error!(error=?error, "failed to JSON serialize span");
                 error_message = format!("failed to JSON serialize span: {error:?}");
                 num_parse_errors += 1;
@@ -783,12 +790,18 @@ impl OtlpGrpcTracesService {
     }
 
     #[instrument(skip_all, fields(num_bytes = doc_batch.num_bytes()))]
-    async fn store_spans(&mut self, doc_batch: DocBatch) -> Result<(), tonic::Status> {
-        let ingest_request = IngestRequest {
-            doc_batches: vec![doc_batch],
-            commit: self.commit_type.into(),
-        };
-        self.ingest_service.ingest(ingest_request).await?;
+    async fn store_spans(
+        &mut self,
+        index_id: String,
+        doc_batch: DocBatchV2,
+    ) -> Result<(), tonic::Status> {
+        ingest_doc_batch_v2(
+            self.ingest_router.clone(),
+            index_id,
+            doc_batch,
+            self.commit_type,
+        )
+        .await?;
         Ok(())
     }
 
@@ -843,7 +856,7 @@ impl TraceService for OtlpGrpcTracesService {
     }
 }
 
-/// An JSON span iterator for use in the doc processor.
+/// An iterator of JSON OTLP spans for use in the doc processor.
 pub struct JsonSpanIterator {
     spans: btree_set::IntoIter<OrdSpan>,
     current_span_idx: usize,
@@ -886,13 +899,15 @@ impl Iterator for JsonSpanIterator {
     }
 }
 
-pub fn parse_otlp_spans_json(payload_json: &[u8]) -> Result<JsonSpanIterator, OtlpTraceError> {
+pub fn parse_otlp_spans_json(payload_json: &[u8]) -> Result<JsonSpanIterator, OtlpTracesError> {
     let request: ExportTraceServiceRequest = serde_json::from_slice(payload_json)?;
     let spans = parse_otlp_spans(request)?;
     Ok(JsonSpanIterator::new(spans, payload_json.len()))
 }
 
-pub fn parse_otlp_spans_protobuf(payload_proto: &[u8]) -> Result<JsonSpanIterator, OtlpTraceError> {
+pub fn parse_otlp_spans_protobuf(
+    payload_proto: &[u8],
+) -> Result<JsonSpanIterator, OtlpTracesError> {
     let request = ExportTraceServiceRequest::decode(payload_proto)?;
     let spans = parse_otlp_spans(request)?;
     Ok(JsonSpanIterator::new(spans, payload_proto.len()))
@@ -922,7 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_index() {
-        let mut metastore = metastore_for_test();
+        let metastore = metastore_for_test();
         let index_config =
             OtlpGrpcTracesService::index_config(&Uri::for_test("ram:///indexes")).unwrap();
         let create_index_request =
@@ -1265,6 +1280,7 @@ mod tests {
                 span_dropped_links_count: 0,
                 span_status: SpanStatus::default(),
                 parent_span_id: None,
+                is_root: Some(true),
                 events: Vec::new(),
                 event_names: Vec::new(),
                 links: Vec::new(),
@@ -1307,6 +1323,7 @@ mod tests {
                     message: None,
                 },
                 parent_span_id: Some(SpanId::new([3; 8])),
+                is_root: Some(false),
                 events: vec![Event {
                     event_timestamp_nanos: 1,
                     event_name: "event_name".to_string(),
@@ -1360,6 +1377,7 @@ mod tests {
             span_dropped_links_count: 0,
             span_status: SpanStatus::default(),
             parent_span_id: None,
+            is_root: Some(true),
             events: Vec::new(),
             event_names: Vec::new(),
             links: Vec::new(),

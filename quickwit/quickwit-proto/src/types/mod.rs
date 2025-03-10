@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::borrow::Borrow;
 use std::convert::Infallible;
@@ -25,17 +20,25 @@ use std::ops::Deref;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 pub use ulid::Ulid;
 
+mod doc_mapping_uid;
+mod doc_uid;
 mod index_uid;
 mod pipeline_uid;
 mod position;
 mod shard_id;
 
+pub use doc_mapping_uid::DocMappingUid;
+pub use doc_uid::{DocUid, DocUidGenerator};
 pub use index_uid::IndexUid;
 pub use pipeline_uid::PipelineUid;
 pub use position::Position;
 pub use shard_id::ShardId;
+
+/// The size of an ULID in bytes. Use `ULID_LEN` for the length of Base32 encoded ULID strings.
+pub(crate) const ULID_SIZE: usize = 16;
 
 pub type IndexId = String;
 
@@ -56,6 +59,15 @@ pub fn queue_id(index_uid: &IndexUid, source_id: &str, shard_id: &ShardId) -> Qu
 }
 
 pub fn split_queue_id(queue_id: &str) -> Option<(IndexUid, SourceId, ShardId)> {
+    let parts_opt = split_queue_id_inner(queue_id);
+
+    if parts_opt.is_none() {
+        warn!("failed to parse queue ID `{queue_id}`: this should never happen, please report");
+    }
+    parts_opt
+}
+
+fn split_queue_id_inner(queue_id: &str) -> Option<(IndexUid, SourceId, ShardId)> {
     let mut parts = queue_id.split('/');
     let index_uid = parts.next()?;
     let source_id = parts.next()?;
@@ -83,12 +95,6 @@ impl Display for SourceUid {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(String);
-
-// #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-// pub struct GenerationId(u64);
-
-// #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-// pub struct NodeUid(NodeId, GenerationId);
 
 impl NodeId {
     /// Constructs a new [`NodeId`].
@@ -220,6 +226,12 @@ impl Borrow<str> for NodeIdRef {
     }
 }
 
+impl Display for NodeIdRef {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{}", &self.0)
+    }
+}
+
 impl<'a> From<&'a str> for &'a NodeIdRef {
     fn from(node_id: &'a str) -> &'a NodeIdRef {
         NodeIdRef::from_str(node_id)
@@ -261,6 +273,13 @@ impl ToOwned for NodeIdRef {
 
     fn to_owned(&self) -> Self::Owned {
         NodeId(self.0.to_string())
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl From<&NodeId> for sea_query::Value {
+    fn from(node_id: &NodeId) -> Self {
+        node_id.to_string().into()
     }
 }
 

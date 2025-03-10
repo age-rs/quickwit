@@ -12,8 +12,12 @@ DEFAULT_LAMBDA_MEMORY_SIZE = 3008
 
 
 def extract_local_env() -> dict[str, str]:
-    """Extracts local environment variables that start with QW_LAMBDA_"""
-    return {k: os.environ[k] for k in os.environ.keys() if k.startswith("QW_LAMBDA_")}
+    """Extracts local environment variables QW_LAMBDA_* and QW_DISABLE_TELEMETRY"""
+    return {
+        k: os.environ[k]
+        for k in os.environ.keys()
+        if (k.startswith("QW_LAMBDA_") or k == "QW_DISABLE_TELEMETRY")
+    }
 
 
 class QuickwitService(Construct):
@@ -28,6 +32,8 @@ class QuickwitService(Construct):
         indexer_package_location: str,
         indexer_memory_size: int = DEFAULT_LAMBDA_MEMORY_SIZE,
         indexer_environment: dict[str, str] = {},
+        # small default timeout to avoid unexpected costs and hanging indexers
+        indexer_timeout: aws_cdk.Duration = aws_cdk.Duration.minutes(1),
         searcher_memory_size: int = DEFAULT_LAMBDA_MEMORY_SIZE,
         searcher_environment: dict[str, str] = {},
         **kwargs,
@@ -51,6 +57,7 @@ class QuickwitService(Construct):
             index_config_bucket=index_config_bucket,
             index_config_key=index_config_key,
             memory_size=indexer_memory_size,
+            timeout=indexer_timeout,
             environment=indexer_environment,
             asset_path=indexer_package_location,
         )
